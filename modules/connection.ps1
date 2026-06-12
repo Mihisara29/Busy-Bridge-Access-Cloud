@@ -1,0 +1,245 @@
+# modules/connection.ps1
+# Dynamic BUSY Connection Management — SAFE SINGLE POOL (Access/SQL Server compatible)
+
+. "$PSScriptRoot\config.ps1"
+. "$PSScriptRoot\utils.ps1"
+
+$script:maxRetries = 3
+
+$script:ActiveConnection = $null
+$script:ActiveInstanceId = ""
+$script:ActiveCompanyCode = ""
+
+function Get-InstanceConfig {
+    param([string]$InstanceId)
+    $instancesPath = "$PSScriptRoot\..\instances.json"
+    if (-not (Test-Path $instancesPath)) { return $null }
+    $config   = Get-Content $instancesPath -Raw | ConvertFrom-Json
+    $instance = $config.instances | Where-Object { $_.id -eq $InstanceId }
+    return $instance
+}
+
+# ═══════════════════════════════════════════════════════
+#  DYNAMIC DATABASE NAME RESOLVER (Explicit Mapping + Fallback Formatter)
+# ═══════════════════════════════════════════════════════
+function Get-SqlDatabaseName {
+    param([string]$CompanyCode, [string]$InstanceId = "")
+    
+    if ($CompanyCode.ToUpper() -eq "COMPINFO") {
+        return "COMPINFO"
+    }
+    
+    # 1. First, check instances.json for an explicit "sqlDatabase" mapping
+    if ($InstanceId) {
+        $instance = Get-InstanceConfig -InstanceId $InstanceId
+        if ($null -ne $instance -and $null -ne $instance.companies) {
+            $matchedComp = $instance.companies | Where-Object { $_.code -eq $CompanyCode }
+            if ($matchedComp -and $matchedComp.sqlDatabase -and $matchedComp.sqlDatabase -ne "") {
+                return $matchedComp.sqlDatabase
+            }
+        }
+    }
+    
+    # 2. Fallback to formatting algorithm if not explicitly mapped: "COMP0002" -> "BusyComp0002_db"
+    if ($CompanyCode -match "^COMP(\d+)$" -or $CompanyCode -match "^comp(\d+)$") {
+        return "BusyComp" + $Matches[1] + "_db"
+    }
+    
+    # Generic fallback: "DEMO" -> "BusyDemo_db"
+    $clean = $CompanyCode.Trim()
+    if ($clean.Length -gt 1) {
+        $clean = [char]::ToUpper($clean[0]) + $clean.Substring(1).ToLower()
+    }
+    return "Busy" + $clean + "_db"
+}
+
+function Connect-BUSY {
+    param([string]$InstanceId = "", [string]$CompanyCode = "")
+
+    $staticConfig = Get-Config
+
+    if (-not $InstanceId -or -not $CompanyCode) {
+        $InstanceId   = $staticConfig.INSTANCE_ID
+        $CompanyCode  = $staticConfig.COMP_CODE
+    }
+
+    if ($script:ActiveConnection -ne $null -and $script:ActiveInstanceId -eq $InstanceId -and $script:ActiveCompanyCode -eq $CompanyCode) {
+        return $script:ActiveConnection
+    }
+
+    if ($script:ActiveConnection -ne $null) {
+        Write-Host "Switching Context: Closing $($script:ActiveCompanyCode) and opening $CompanyCode" -ForegroundColor Cyan
+        try { $script:ActiveConnection.CloseDB() } catch {}
+        try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($script:ActiveConnection) | Out-Null } catch {}
+        try { [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers() } catch {}
+        $script:ActiveConnection = $null
+    }
+
+    $bPath  = $staticConfig.BUSY_PATH
+    $dPath  = $staticConfig.DATA_PATH
+    $bCom   = $staticConfig.BUSY_COM
+    $dbType = 0 # Default: MS Access
+
+    $instance = Get-InstanceConfig -InstanceId $InstanceId
+    if ($instance) {
+        $bPath  = $instance.busyPath
+        $dPath  = $instance.dataPath
+        $bCom   = $instance.busyCom
+        if ($null -ne $instance.dbType) { $dbType = [int]$instance.dbType }
+    }
+
+    # Pre-load SQL credentials for CS mode
+    $sqlServer   = ""
+    $sqlUser     = ""
+    $sqlPassword = ""
+    if ($dbType -eq 1 -and $instance) {
+        $sqlServer   = $instance.sqlServer
+        $sqlUser     = $instance.sqlUser
+        $sqlPassword = $instance.sqlPassword
+    }
+
+    $retryCount = 0
+    while ($retryCount -lt $script:maxRetries) {
+        try {
+            Write-DebugLog "Connecting to BUSY ($CompanyCode) via COM (DbType=$dbType)..."
+
+            $fi = New-Object -ComObject $bCom
+            $connected = $false
+
+            if ($dbType -eq 1) {
+                # SQL Server Mode — OpenCSDB throws internal BUSY query errors even on
+                # successful connection (e.g. "Object invalid or no longer set" / error 3420).
+                # These are non-fatal: the COM object is usable and the return value is True.
+                # We catch the exception and treat any thrown-but-True result as success.
+                try {
+                    $connected = $fi.OpenCSDB($bPath, $sqlServer, $sqlUser, $sqlPassword, $CompanyCode)
+                } catch {
+                    Write-Host "  [WARN] OpenCSDB internal exception (non-fatal): $($_.Exception.Message)" -ForegroundColor DarkYellow
+                    # COM returned True before throwing — treat as connected
+                    $connected = $true
+                }
+            } else {
+                # MS Access Mode — use OpenDB
+                $connected = $fi.OpenDB($bPath, $dPath, $CompanyCode, $dbType)
+            }
+
+            if ($connected -eq $true) {
+                Write-SuccessLog "Connected to BUSY ($InstanceId / $CompanyCode)"
+                $script:ActiveConnection   = $fi
+                $script:ActiveInstanceId  = $InstanceId
+                $script:ActiveCompanyCode = $CompanyCode
+                return $fi
+            } else {
+                try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($fi) | Out-Null } catch {}
+                $retryCount++
+                Start-Sleep -Seconds 1
+            }
+        } catch {
+            Write-Host "  [WARN] Connect-BUSY attempt $($retryCount+1) failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
+            $retryCount++
+            Start-Sleep -Seconds 1
+        }
+    }
+    return $null
+}
+
+function Disconnect-BUSY {
+    param($fi)
+}
+
+# ═══════════════════════════════════════════════════════
+#  DEDICATED NATIVE DIRECT QUERY CONNECTION BUILDER
+# ═══════════════════════════════════════════════════════
+function Get-DirectConnection {
+    param([string]$InstanceId, [string]$CompanyCode)
+    
+    $instance = Get-InstanceConfig -InstanceId $InstanceId
+    $dbType = 0
+    if ($null -ne $instance -and $null -ne $instance.dbType) { $dbType = [int]$instance.dbType }
+
+    if ($dbType -eq 1) {
+        # SQL Server Mode
+        $sqlServer   = $instance.sqlServer
+        $sqlUser     = $instance.sqlUser
+        $sqlPassword = $instance.sqlPassword
+        
+        # Base parent database name (e.g. BusyComp0001_db)
+        $baseDbName = Get-SqlDatabaseName -CompanyCode $CompanyCode -InstanceId $InstanceId
+        $dbName = $baseDbName
+
+        # Dynamic year-specific database resolution with COM retry loop
+        if ($script:ActiveConnection -ne $null -and $script:ActiveCompanyCode.ToLower() -eq $CompanyCode.ToLower()) {
+            $retryDbCount = 0
+            $resolvedYearDb = $false
+            
+            while ($retryDbCount -lt 6 -and -not $resolvedYearDb) {
+                try {
+                    $dbNameRst = $script:ActiveConnection.GetRecordset("SELECT DB_NAME() AS ActiveDB")
+                    if ($dbNameRst -and -not $dbNameRst.EOF) {
+                        $activeDbVal = $dbNameRst.Fields.Item("ActiveDB").Value
+                        if ($null -ne $activeDbVal -and $activeDbVal -ne [System.DBNull]::Value) {
+                            $tempDb = $activeDbVal.ToString().Trim()
+                            if ($tempDb -ne $baseDbName) {
+                                $dbName = $tempDb
+                                $resolvedYearDb = $true
+                            }
+                        }
+                        $dbNameRst.Close()
+                    }
+                } catch {}
+                
+                if (-not $resolvedYearDb) {
+                    $retryDbCount++
+                    Start-Sleep -Milliseconds 500
+                }
+            }
+        }
+
+        # Double-Layer Protection: Financial Year Estimation fallback
+        if ($dbName -eq $baseDbName) {
+            $currentYear = (Get-Date).Year
+            if ((Get-Date).Month -lt 4) { $currentYear = $currentYear - 1 }
+            $estimatedDb = $baseDbName + "1" + $currentYear
+            
+            $testConn = $null
+            try {
+                $testConnStr = "Server=$sqlServer;Database=$estimatedDb;User Id=$sqlUser;Password=$sqlPassword;"
+                $testConn = New-Object System.Data.SqlClient.SqlConnection($testConnStr)
+                $testConn.Open()
+                $dbName = $estimatedDb
+                Write-Host "  [DEBUG-DIRECT-CONN] Resolved year database via estimation: $dbName" -ForegroundColor Green
+            } catch {
+                $dbName = $baseDbName
+            } finally {
+                if ($null -ne $testConn) { try { $testConn.Close() } catch {} }
+            }
+        }
+
+        Write-Host "  [DEBUG-DIRECT-CONN] Final Resolved SQL Database: $dbName" -ForegroundColor Green
+
+        $connStr = "Server=$sqlServer;Database=$dbName;User Id=$sqlUser;Password=$sqlPassword;"
+        $conn = New-Object System.Data.SqlClient.SqlConnection($connStr)
+        
+        return @{
+            type       = "SQL"
+            dbType     = 1
+            connection = $conn
+            wildcard   = "%"
+        }
+    } else {
+        # MS Access Mode
+        $dbFile = Get-MainCompanyDbPath -CompanyCode $CompanyCode
+        if ([string]::IsNullOrEmpty($dbFile) -or -not (Test-Path $dbFile)) {
+            return $null
+        }
+        $connStr = "Provider=Microsoft.Jet.OLEDB.4.0;Data Source=$dbFile;Jet OLEDB:Database Password=ILoveMyINDIA;"
+        $conn = New-Object System.Data.OleDb.OleDbConnection($connStr)
+        
+        return @{
+            type       = "Access"
+            dbType     = 0
+            connection = $conn
+            wildcard   = "*"
+        }
+    }
+}

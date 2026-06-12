@@ -1,0 +1,34 @@
+{
+  "instances": [
+    {
+      "id": "instance_1",
+      "displayName": "Enterprise02 (Access)",
+      "busyCom": "Busy2L21.CFixedInterface",
+      "busyPath": "C:\\Enterprise02",
+      "dataPath": "C:\\Enterprise02\\DATA",
+      "dbType": 0,
+      "sqlServer": "",
+      "sqlUser": "",
+      "sqlPassword": "",
+      "companies": [
+        { "code": "Comp0001", "name": "Company One (Access)" },
+        { "code": "Comp0002", "name": "Company Two (Access)" },
+        { "code": "Comp0003", "name": "Company Three (Access)" }
+      ]
+    },
+    {
+      "id": "instance_2",
+      "displayName": "BusyWin01 (SQL Server)",
+      "busyCom": "Busy2L21.CFixedInterface",
+      "busyPath": "C:\\BusyWin",
+      "dataPath": "C:\\Program Files\\Microsoft SQL Server\\MSSQL17.MSSQLSERVER\\MSSQL\\DATA",
+      "dbType": 1,
+      "sqlServer": "LAPTOP-05EHV9DD",
+      "sqlUser": "SA",
+      "sqlPassword": "23122",
+      "companies": [
+        { "code": "Comp0001", "name": "Company One (SQL)", "sqlDatabase": "BusyComp0001_db" }
+      ]
+    }
+  ]
+}

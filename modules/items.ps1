@@ -1,0 +1,706 @@
+# modules/items.ps1
+# Item & Item Group Management (Access & SQL Server Dialect Compatible)
+
+. "$PSScriptRoot\connection.ps1"
+. "$PSScriptRoot\utils.ps1"
+
+function ConvertTo-ItemXmlSafe {
+    param([string]$Value)
+    if ([string]::IsNullOrEmpty($Value)) { return "" }
+    $Value = $Value -replace '&',  '&amp;' -replace '<',  '&lt;' -replace '>',  '&gt;' -replace '"',  '&quot;' -replace "'",  '&apos;'
+    return $Value
+}
+
+function Clear-ItemCaches {
+    param([string]$InstanceId = "", [string]$CompanyCode = "")
+    $prefix = "$InstanceId|$CompanyCode|"
+    Clear-Cache "${prefix}item-groups"; Clear-Cache "${prefix}items-all"
+    if ($null -ne $script:_cache) {
+        $keysToRemove = @(); foreach ($k in $script:_cache.Keys) { if ($k -like "${prefix}items|*" -or $k -like "${prefix}item|*") { $keysToRemove += $k } }
+        foreach ($k in $keysToRemove) { $script:_cache.Remove($k) }
+    }
+}
+
+function Get-Items {
+    param(
+        [string]$Category    = "",
+        [string]$Search      = "",
+        [string]$InstanceId  = "",
+        [string]$CompanyCode = "",
+        [int]$Page           = 1,
+        [int]$PageSize       = 30
+    )
+
+    if ($Page -lt 1)     { $Page = 1 }
+    if ($PageSize -lt 1) { $PageSize = 30 }
+
+    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $fi) { return @{ success = $false; error = "BUSY connection failed" } }
+
+    try {
+        # Dynamically resolve dialect wildcard matching (% for SQL, * for Access)
+        $dbType = 0
+        if ($script:ActiveConnection -ne $null) {
+            $instance = Get-InstanceConfig -InstanceId $script:ActiveInstanceId
+            if ($null -ne $instance -and $null -ne $instance.dbType) {
+                $dbType = [int]$instance.dbType
+            }
+        }
+        $wildcard = if ($dbType -eq 1) { "%" } else { "*" }
+
+        $where = "MasterType = 6"
+        if ($Category -ne "") {
+            $safeCat = $Category -replace "'", "''"
+            $where += " AND ParentGrp = (SELECT Code FROM Master1 WHERE Name = '$safeCat' AND MasterType = 5)"
+        }
+        if ($Search -ne "") {
+            $safeSearch = $Search -replace "'", "''"
+            $where += " AND (Name LIKE '$wildcard$safeSearch$wildcard' OR Alias LIKE '$wildcard$safeSearch$wildcard')"
+        }
+
+        $countRst = $fi.GetRecordset("SELECT COUNT(*) AS TotalCount FROM Master1 WHERE $where")
+        $totalRecords = 0
+        if ($countRst -and -not $countRst.EOF) {
+            $totalRecords = [int]$countRst.Fields.Item("TotalCount").Value
+            try { $countRst.Close() } catch {}
+        }
+        $totalPages = [Math]::Max(1, [Math]::Ceiling($totalRecords / $PageSize))
+
+        if ($totalRecords -eq 0) {
+            return @{ success = $true; total = 0; page = $Page; pageSize = $PageSize; totalPages = 1; data = @() }
+        }
+
+        $offset  = ($Page - 1) * $PageSize
+        $pageQry = "SELECT TOP $($offset + $PageSize) Master1.Code FROM Master1 WHERE $where ORDER BY Master1.Name"
+        $pageRst = $fi.GetRecordset($pageQry)
+
+        $pageCodes = [System.Collections.Generic.List[int]]::new()
+        if ($pageRst -and $pageRst.RecordCount -gt 0) {
+            $pageRst.MoveFirst()
+            $skip = 0
+            while (-not $pageRst.EOF) {
+                if ($skip -lt $offset) { $skip++; $pageRst.MoveNext(); continue }
+                $cRaw = $pageRst.Fields.Item("Code").Value
+                if ($cRaw -ne [System.DBNull]::Value) { $pageCodes.Add([int][string]$cRaw) }
+                $pageRst.MoveNext()
+            }
+            try { $pageRst.Close() } catch {}
+        }
+
+        if ($pageCodes.Count -eq 0) {
+            return @{ success = $true; total = $totalRecords; page = $Page; pageSize = $PageSize; totalPages = $totalPages; data = @() }
+        }
+
+        $inList = $pageCodes -join ","
+
+        $mcNameMap = @{}
+        try {
+            $mcRst = $fi.GetRecordset("SELECT Code, Name FROM Master1 WHERE MasterType = 11")
+            if ($mcRst -and $mcRst.RecordCount -gt 0) {
+                $mcRst.MoveFirst()
+                while (-not $mcRst.EOF) {
+                    $c = $mcRst.Fields.Item("Code").Value
+                    $n = $mcRst.Fields.Item("Name").Value
+                    if ($c -ne [System.DBNull]::Value) {
+                        $mcNameMap[$c.ToString().Trim()] = if ($n -ne [System.DBNull]::Value) { $n.ToString().Trim() } else { "" }
+                    }
+                    $mcRst.MoveNext()
+                }
+                try { $mcRst.Close() } catch {}
+            }
+        } catch {}
+
+        $opStockMap = @{}
+        try {
+            $opRst = $fi.GetRecordset(
+                "SELECT MasterCode1 AS ItemCode, MasterCode2 AS MCCode, D1 AS OpQty FROM Tran4 WHERE RecType = 0 AND MasterCode1 IN ($inList)"
+            )
+            if ($opRst -and $opRst.RecordCount -gt 0) {
+                $opRst.MoveFirst()
+                while (-not $opRst.EOF) {
+                    $iRaw = $opRst.Fields.Item("ItemCode").Value
+                    if ($iRaw -ne [System.DBNull]::Value) {
+                        $iCode  = [int][string]$iRaw
+                        $mcCode = ""
+                        $mcRaw  = $opRst.Fields.Item("MCCode").Value
+                        if ($mcRaw -ne [System.DBNull]::Value) { $mcCode = $mcRaw.ToString().Trim() }
+                        $mcName = if ($mcNameMap.ContainsKey($mcCode)) { $mcNameMap[$mcCode] } else { "Default" }
+                        if ([string]::IsNullOrEmpty($mcName)) { $mcName = "Default" }
+                        $qty = 0.0
+                        $qRaw = $opRst.Fields.Item("OpQty").Value
+                        if ($qRaw -ne [System.DBNull]::Value) {
+                            [double]::TryParse($qRaw.ToString(), [System.Globalization.NumberStyles]::Any,
+                                [System.Globalization.CultureInfo]::InvariantCulture, [ref]$qty) | Out-Null
+                        }
+                        if (-not $opStockMap.ContainsKey($iCode)) { $opStockMap[$iCode] = @{ total = 0.0; mcMap = @{} } }
+                        $opStockMap[$iCode].total += $qty
+                        if (-not $opStockMap[$iCode].mcMap.ContainsKey($mcName)) { $opStockMap[$iCode].mcMap[$mcName] = 0.0 }
+                        $opStockMap[$iCode].mcMap[$mcName] += $qty
+                    }
+                    $opRst.MoveNext()
+                }
+                try { $opRst.Close() } catch {}
+            }
+        } catch {}
+
+        $txnMap = @{}
+        try {
+            $txnRst = $fi.GetRecordset(
+                "SELECT MasterCode1 AS ItemCode, MasterCode2 AS MCCode, SUM(Value1) AS NetQty FROM Tran2 WHERE RecType = 2 AND MasterCode1 IN ($inList) GROUP BY MasterCode1, MasterCode2"
+            )
+            if ($txnRst -and $txnRst.RecordCount -gt 0) {
+                $txnRst.MoveFirst()
+                while (-not $txnRst.EOF) {
+                    $iRaw = $txnRst.Fields.Item("ItemCode").Value
+                    if ($iRaw -ne [System.DBNull]::Value) {
+                        $iCode  = [int][string]$iRaw
+                        $mcCode = ""
+                        $mcRaw  = $txnRst.Fields.Item("MCCode").Value
+                        if ($mcRaw -ne [System.DBNull]::Value) { $mcCode = $mcRaw.ToString().Trim() }
+                        $mcName = if ($mcNameMap.ContainsKey($mcCode)) { $mcNameMap[$mcCode] } else { "Unknown" }
+                        if ([string]::IsNullOrEmpty($mcName)) { $mcName = "Unknown" }
+                        $qty = 0.0
+                        $qRaw = $txnRst.Fields.Item("NetQty").Value
+                        if ($qRaw -ne [System.DBNull]::Value) {
+                            [double]::TryParse($qRaw.ToString(), [System.Globalization.NumberStyles]::Any,
+                                [System.Globalization.CultureInfo]::InvariantCulture, [ref]$qty) | Out-Null
+                        }
+                        if (-not $txnMap.ContainsKey($iCode)) { $txnMap[$iCode] = @{} }
+                        if (-not $txnMap[$iCode].ContainsKey($mcName)) { $txnMap[$iCode][$mcName] = 0.0 }
+                        $txnMap[$iCode][$mcName] += $qty
+                    }
+                    $txnRst.MoveNext()
+                }
+                try { $txnRst.Close() } catch {}
+            }
+        } catch {}
+
+        $altUnitCodes = [System.Collections.Generic.HashSet[int]]::new()
+        try {
+            $auRst = $fi.GetRecordset(
+                "SELECT Code FROM Master1 WHERE MasterType = 6 AND CM2 IS NOT NULL AND CM2 <> 0 AND Code IN ($inList)"
+            )
+            if ($auRst -and $auRst.RecordCount -gt 0) {
+                $auRst.MoveFirst()
+                while (-not $auRst.EOF) {
+                    $cRaw = $auRst.Fields.Item("Code").Value
+                    if ($cRaw -ne [System.DBNull]::Value) { [void]$altUnitCodes.Add([int][string]$cRaw) }
+                    $auRst.MoveNext()
+                }
+                try { $auRst.Close() } catch {}
+            }
+        } catch {}
+
+        $detailQry = "SELECT Master1.Code, Master1.Name, Master1.Alias,
+                        Master1.D2 AS MRP,
+                        Master1.D3 AS SalePrice,
+                        Master1.D4 AS PurchasePrice,
+                        (SELECT M1.Name FROM Master1 M1 WHERE M1.Code = Master1.ParentGrp) AS GroupName,
+                        (SELECT M1.Name FROM Master1 M1 WHERE M1.Code = Master1.CM1) AS UnitName
+                      FROM Master1
+                      WHERE Master1.Code IN ($inList)
+                      ORDER BY Master1.Name"
+
+        $rst   = $fi.GetRecordset($detailQry)
+        $items = [System.Collections.Generic.List[object]]::new()
+
+        if ($rst -and $rst.RecordCount -gt 0) {
+            $rst.MoveFirst()
+            while (-not $rst.EOF) {
+                $codeRaw = $rst.Fields.Item("Code").Value
+                $codeOut = [int][string]$codeRaw
+
+                $altUnitReq      = $false
+                $altUnit         = ""
+                $convFactor      = 1.0
+                $convType        = 1
+                $salePriceDU     = 0.0
+                $purchasePriceDU = 0.0
+
+                if ($altUnitCodes.Contains($codeOut)) {
+                    try {
+                        $xmlStr = $fi.GetMasterXML($codeOut)
+                        if ($xmlStr) {
+                            $xmlDoc = [xml]$xmlStr
+                            if ([string]$xmlDoc.Item.AltUnitReq -eq "True") {
+                                $altUnitReq  = $true
+                                $altUnit     = [string]$xmlDoc.Item.AltUnit
+                                $convType    = [int]$xmlDoc.Item.ConFactorType
+                                $convFactor  = [Convert]::ToDouble(
+                                    $xmlDoc.Item.ConversionFactor.ToString(),
+                                    [System.Globalization.CultureInfo]::InvariantCulture
+                                )
+                                if ($xmlDoc.Item.SalePriceDU -and [string]$xmlDoc.Item.SalePriceDU -ne "") {
+                                    $salePriceDU = [double]$xmlDoc.Item.SalePriceDU
+                                }
+                                if ($xmlDoc.Item.PurchasePriceDU -and [string]$xmlDoc.Item.PurchasePriceDU -ne "") {
+                                    $purchasePriceDU = [double]$xmlDoc.Item.PurchasePriceDU
+                                }
+                            }
+                        }
+                    } catch {}
+                }
+
+                $itemMcMap = @{}
+                $opTotal   = 0.0
+                if ($opStockMap.ContainsKey($codeOut)) {
+                    $opTotal = $opStockMap[$codeOut].total
+                    foreach ($k in $opStockMap[$codeOut].mcMap.Keys) {
+                        $itemMcMap[$k] = $opStockMap[$codeOut].mcMap[$k]
+                    }
+                }
+                $netTxn = 0.0
+                if ($txnMap.ContainsKey($codeOut)) {
+                    foreach ($mName in $txnMap[$codeOut].Keys) {
+                        $q = $txnMap[$codeOut][$mName]
+                        $netTxn += $q
+                        if (-not $itemMcMap.ContainsKey($mName)) { $itemMcMap[$mName] = 0.0 }
+                        $itemMcMap[$mName] += $q
+                    }
+                }
+
+                $mcStockArr = foreach ($k in $itemMcMap.Keys) {
+                    @{ mcName = $k; stock = [Math]::Round($itemMcMap[$k], 3) }
+                }
+
+                $mrpOut = 0.0; $spOut = 0.0; $ppOut = 0.0
+
+                $mrpVal = $rst.Fields.Item("MRP").Value
+                $spVal  = $rst.Fields.Item("SalePrice").Value
+                $ppVal  = $rst.Fields.Item("PurchasePrice").Value
+
+                if ($mrpVal -ne [System.DBNull]::Value) {
+                    [double]::TryParse($mrpVal.ToString(), [System.Globalization.NumberStyles]::Any,
+                        [System.Globalization.CultureInfo]::InvariantCulture, [ref]$mrpOut) | Out-Null
+                }
+                if ($spVal -ne [System.DBNull]::Value) {
+                    [double]::TryParse($spVal.ToString(), [System.Globalization.NumberStyles]::Any,
+                        [System.Globalization.CultureInfo]::InvariantCulture, [ref]$spOut) | Out-Null
+                }
+                if ($ppVal -ne [System.DBNull]::Value) {
+                    [double]::TryParse($ppVal.ToString(), [System.Globalization.NumberStyles]::Any,
+                        [System.Globalization.CultureInfo]::InvariantCulture, [ref]$ppOut) | Out-Null
+                }
+
+                $nameVal  = $rst.Fields.Item("Name").Value
+                $aliasVal = $rst.Fields.Item("Alias").Value
+                $grpVal   = $rst.Fields.Item("GroupName").Value
+                $unitVal  = $rst.Fields.Item("UnitName").Value
+
+                $items.Add(@{
+                    code             = $codeOut
+                    name             = if ($nameVal  -ne [System.DBNull]::Value) { $nameVal.ToString()  } else { "" }
+                    alias            = if ($aliasVal -ne [System.DBNull]::Value) { $aliasVal.ToString() } else { "" }
+                    group            = if ($grpVal   -ne [System.DBNull]::Value) { $grpVal.ToString()   } else { "" }
+                    unit             = if ($unitVal  -ne [System.DBNull]::Value) { $unitVal.ToString()  } else { "Pcs." }
+                    salePrice        = $spOut
+                    mrp              = $mrpOut
+                    purchasePrice    = $ppOut
+                    stock            = [Math]::Round($opTotal + $netTxn, 3)
+                    mcStock          = @($mcStockArr)
+                    altUnitReq       = $altUnitReq
+                    altUnit          = $altUnit
+                    conversionFactor = $convFactor
+                    conversionType   = $convType
+                    salePriceDU      = $salePriceDU
+                    purchasePriceDU  = $purchasePriceDU
+                })
+
+                $rst.MoveNext()
+            }
+            try { $rst.Close() } catch {}
+        }
+
+        return @{
+            success    = $true
+            total      = $totalRecords
+            page       = $Page
+            pageSize   = $PageSize
+            totalPages = $totalPages
+            data       = $items.ToArray()
+        }
+
+    } catch {
+        return @{ success = $false; error = $_.Exception.Message }
+    } finally {
+        Disconnect-BUSY $fi
+    }
+}
+
+# ═══════════════════════════════════════════════════════
+#  GET ITEMS FOR VOUCHER FORM (High-Speed Dynamic Limit)
+# ═══════════════════════════════════════════════════════
+function Get-ItemsForVoucher {
+    param(
+        [string]$Search      = "",
+        [string]$InstanceId  = "",
+        [string]$CompanyCode = ""
+    )
+
+    # Dynamic limit: 5 items when searching, 30 items when empty
+    $limit = if ($Search -and $Search -ne "") { 5 } else { 30 }
+
+    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $fi) { return @{ success = $false; error = "BUSY connection failed" } }
+
+    try {
+        # Dynamically resolve dialect wildcard matching (% for SQL, * for Access)
+        $dbType = 0
+        if ($script:ActiveConnection -ne $null) {
+            $instance = Get-InstanceConfig -InstanceId $script:ActiveInstanceId
+            if ($null -ne $instance -and $null -ne $instance.dbType) {
+                $dbType = [int]$instance.dbType
+            }
+        }
+        $wildcard = if ($dbType -eq 1) { "%" } else { "*" }
+
+        $where = "Master1.MasterType = 6"
+        if ($Search -and $Search -ne "") {
+            $safeSearch = $Search -replace "'", "''"
+            $where += " AND (Master1.Name LIKE '$wildcard$safeSearch$wildcard' OR Master1.Alias LIKE '$wildcard$safeSearch$wildcard')"
+        }
+
+        $qry = "SELECT Master1.Code, Master1.Name, Master1.Alias, Master1.D2 AS MRP, Master1.D3 AS SalePrice, Master1.D4 AS PurchasePrice, (SELECT M1.Name FROM Master1 M1 WHERE M1.Code = Master1.ParentGrp) AS GroupName, (SELECT M1.Name FROM Master1 M1 WHERE M1.Code = Master1.CM1) AS UnitName FROM Master1 WHERE $where ORDER BY Master1.Name"
+        $rst = $fi.GetRecordset($qry)
+        $items = @()
+
+        $altUnitCodes = [System.Collections.Generic.HashSet[int]]::new()
+        $auRst = $fi.GetRecordset("SELECT Code FROM Master1 WHERE MasterType = 6 AND CM2 IS NOT NULL AND CM2 <> 0")
+        if ($auRst -and $auRst.RecordCount -gt 0) {
+            $auRst.MoveFirst()
+            while (-not $auRst.EOF) {
+                $cRaw = $auRst.Fields.Item("Code").Value
+                if ($cRaw -ne [System.DBNull]::Value) { [void]$altUnitCodes.Add([int][string]$cRaw) }
+                $auRst.MoveNext()
+            }
+            $auRst.Close()
+        }
+
+        $currentIndex = 0
+        if ($rst -and $rst.RecordCount -ne 0) {
+            $rst.MoveFirst()
+            while (-not $rst.EOF -and $currentIndex -lt $limit) {
+                $codeRaw = $rst.Fields.Item("Code").Value
+                $codeOut = [int][string]$codeRaw
+
+                $altUnitReq      = $false
+                $altUnit         = ""
+                $convFactor      = 1.0
+                $convType        = 1
+                $salePriceDU     = 0.0
+                $purchasePriceDU = 0.0
+
+                if ($altUnitCodes.Contains($codeOut)) {
+                    try {
+                        $xmlStr = $fi.GetMasterXML($codeOut)
+                        if ($xmlStr) {
+                            $xmlDoc = [xml]$xmlStr
+                            if ([string]$xmlDoc.Item.AltUnitReq -eq "True") {
+                                $altUnitReq = $true
+                                $altUnit    = [string]$xmlDoc.Item.AltUnit
+                                $convType   = [int]$xmlDoc.Item.ConFactorType
+                                $convFactor = [Convert]::ToDouble($xmlDoc.Item.ConversionFactor.ToString(), [System.Globalization.CultureInfo]::InvariantCulture)
+                                if ($xmlDoc.Item.SalePriceDU     -and [string]$xmlDoc.Item.SalePriceDU     -ne "") { $salePriceDU     = [double]$xmlDoc.Item.SalePriceDU }
+                                if ($xmlDoc.Item.PurchasePriceDU -and [string]$xmlDoc.Item.PurchasePriceDU -ne "") { $purchasePriceDU = [double]$xmlDoc.Item.PurchasePriceDU }
+                            }
+                        }
+                    } catch {}
+                }
+
+                $nameVal  = $rst.Fields.Item("Name").Value
+                $aliasVal = $rst.Fields.Item("Alias").Value
+                $grpVal   = $rst.Fields.Item("GroupName").Value
+                $unitVal  = $rst.Fields.Item("UnitName").Value
+                $spVal    = $rst.Fields.Item("SalePrice").Value
+                $mrpVal   = $rst.Fields.Item("MRP").Value
+                $ppVal    = $rst.Fields.Item("PurchasePrice").Value
+
+                $spOut  = 0.0; if ($spVal  -ne [System.DBNull]::Value) { $d = 0.0; if ([double]::TryParse($spVal.ToString(), [ref]$d)) { $spOut  = $d } }
+                $mrpOut = 0.0; if ($mrpVal -ne [System.DBNull]::Value) { $d = 0.0; if ([double]::TryParse($mrpVal.ToString(), [ref]$d)) { $mrpOut = $d } }
+                $ppOut  = 0.0; if ($ppVal  -ne [System.DBNull]::Value) { $d = 0.0; if ([double]::TryParse($ppVal.ToString(), [ref]$d)) { $ppOut  = $d } }
+
+                $items += @{
+                    code             = $codeOut
+                    name             = if ($nameVal -ne [System.DBNull]::Value) { $nameVal.ToString() } else { "" }
+                    alias            = if ($aliasVal -ne [System.DBNull]::Value) { $aliasVal.ToString() } else { "" }
+                    group            = if ($grpVal -ne [System.DBNull]::Value) { $grpVal.ToString() } else { "" }
+                    unit             = if ($unitVal -ne [System.DBNull]::Value) { $unitVal.ToString() } else { "Pcs." }
+                    salePrice        = $spOut
+                    mrp              = $mrpOut
+                    purchasePrice    = $ppOut
+                    stock            = 0.0
+                    mcStock          = @()
+                    altUnitReq       = $altUnitReq
+                    altUnit          = $altUnit
+                    conversionFactor = $convFactor
+                    conversionType   = $convType
+                    salePriceDU      = $salePriceDU
+                    purchasePriceDU  = $purchasePriceDU
+                }
+
+                $currentIndex++
+                $rst.MoveNext()
+            }
+            $rst.Close()
+        }
+
+        # Calculate stocks dynamically ONLY for the 5/30 output items [1.1.2]
+        if ($items.Count -gt 0) {
+            $mcNameMap = @{}
+            $mcRst = $fi.GetRecordset("SELECT Code, Name FROM Master1 WHERE MasterType = 11")
+            if ($mcRst -and $mcRst.RecordCount -gt 0) {
+                $mcRst.MoveFirst()
+                while (-not $mcRst.EOF) {
+                    $mcNameMap[$mcRst.Fields.Item("Code").Value.ToString().Trim()] = $mcRst.Fields.Item("Name").Value.ToString().Trim()
+                    $mcRst.MoveNext()
+                }
+                $mcRst.Close()
+            }
+
+            foreach ($item in $items) {
+                $iCode = $item.code
+                $opTotal = 0.0
+                $netTxnQty = 0.0
+                $itemMcStockMap = @{}
+
+                $opRst = $fi.GetRecordset("SELECT MasterCode2 AS MCCode, D1 AS OpQty FROM Tran4 WHERE RecType = 0 AND MasterCode1 = $iCode")
+                if ($opRst -and $opRst.RecordCount -gt 0) {
+                    $opRst.MoveFirst()
+                    while (-not $opRst.EOF) {
+                        $mcCode = $opRst.Fields.Item("MCCode").Value.ToString().Trim()
+                        $mcName = if ($mcNameMap.ContainsKey($mcCode)) { $mcNameMap[$mcCode] } else { $mcCode }
+                        $q = [double]$opRst.Fields.Item("OpQty").Value
+                        $opTotal += $q
+                        $itemMcStockMap[$mcName] = $q
+                        $opRst.MoveNext()
+                    }
+                    $opRst.Close()
+                }
+
+                $txnRst = $fi.GetRecordset("SELECT MasterCode2 AS MCCode, SUM(Value1) AS NetQty FROM Tran2 WHERE RecType = 2 AND MasterCode1 = $iCode GROUP BY MasterCode2")
+                if ($txnRst -and $txnRst.RecordCount -gt 0) {
+                    $txnRst.MoveFirst()
+                    while (-not $txnRst.EOF) {
+                        $mcCode = $txnRst.Fields.Item("MCCode").Value.ToString().Trim()
+                        $mcName = if ($mcNameMap.ContainsKey($mcCode)) { $mcNameMap[$mcCode] } else { $mcCode }
+                        $q = [double]$txnRst.Fields.Item("NetQty").Value
+                        $netTxnQty += $q
+                        if (-not $itemMcStockMap.ContainsKey($mcName)) { $itemMcStockMap[$mcName] = 0.0 }
+                        $itemMcStockMap[$mcName] += $q
+                        $txnRst.MoveNext()
+                    }
+                    $txnRst.Close()
+                }
+
+                $mcStockArr = @()
+                foreach ($k in $itemMcStockMap.Keys) { $mcStockArr += @{ mcName = $k; stock = [Math]::Round($itemMcStockMap[$k], 3) } }
+
+                $item.stock = [Math]::Round($opTotal + $netTxnQty, 3)
+                $item.mcStock = @($mcStockArr)
+            }
+        }
+
+        return @{ success = $true; total = $items.Count; data = @($items) }
+    } catch {
+        return @{ success = $false; error = $_.Exception.Message }
+    } finally { Disconnect-BUSY $fi }
+}
+
+function Get-ItemDetail {
+    param([int]$Code, [string]$InstanceId = "",[string]$CompanyCode = "")
+    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode; if (-not $fi) { return @{ success = $false; error = "BUSY failed" } }
+    try {
+        $xmlStr = $fi.GetMasterXML($Code); if (-not $xmlStr) { return @{ success = $false; error = "Not found" } }
+        $xml = [xml]$xmlStr
+
+        $altReq = $(if ([string]$xml.Item.AltUnitReq -eq "True") { $true } else { $false })
+        $convF = 1.0; $convT = 1
+        if ($altReq) {
+            $convT = [int]$xml.Item.ConFactorType; $rawF =[double]$xml.Item.ConversionFactor
+            $convF = [Math]::Round($(if ($convT -eq 2 -and $rawF -gt 0) { 1 / $rawF } else { $rawF }), 3)
+        }
+
+        $mcLvlMap = @{}
+        if ($xml.Item.MCWiseCriticalLevel -and $xml.Item.MCWiseCriticalLevel.MCWiseCriticalInfo) {
+            foreach ($mci in $xml.Item.MCWiseCriticalLevel.MCWiseCriticalInfo) {
+                $mcLvlMap[[string]$mci.MCNameCL] = @{ minL = $mci.MinimumLevelMCWise; minD = $mci.MinimumDaysMCWise; reoL = $mci.ReorderLevelMCWise; reoD = $mci.ReorderDaysMCWise; maxL = $mci.MaximumLevelMCWise; maxD = $mci.MaximumDaysMCWise }
+            }
+        }
+
+        $mcs = @()
+        if ($xml.Item.OPStockDetails) {
+            foreach ($d in $xml.Item.OPStockDetails.OPMCStockDetail) {
+                $mname = [string]$d.MCName; $lvls = $mcLvlMap[$mname]
+                $mcs += @{ name = $mname; opStock = [double]$d.OPStockMainUnit; opAmount = [double]$d.Amount; minimumLevel = $lvls.minL; minimumDays = $lvls.minD; reorderLevel = $lvls.reoL; reorderDays = $lvls.reoD; maximumLevel = $lvls.maxL; maximumDays = $lvls.maxD }
+            }
+        }
+
+        $data = @{
+            code = $Code; name =[string]$xml.Item.Name; printName = [string]$xml.Item.PrintName; alias =[string]$xml.Item.Alias; group = [string]$xml.Item.ParentGroup; unit =[string]$xml.Item.MainUnit
+            opStock = [double]$xml.Item.OPStockInMainUnit; opAmount = [double]$xml.Item.OPAmount
+            salePrice = [double]$xml.Item.SalePrice; purchasePrice = [double]$xml.Item.PurchasePrice; mrp = [double]$xml.Item.MRP
+            minSalePrice = [double]$xml.Item.MinSalePrice; salesDiscount = [double]$xml.Item.SalesDiscount; purcDiscount = [double]$xml.Item.PurcDiscount; stockValPrice =[double]$xml.Item.StockValPrice
+            altUnitReq = $altReq; altUnit =[string]$xml.Item.AltUnit; conversionFactor = $convF; conversionType = $convT; salePriceDU =[double]$xml.Item.SalePriceDU; purchasePriceDU = [double]$xml.Item.PurchasePriceDU
+            taxCategory = [string]$xml.Item.TaxCategory; taxRateLocal = [double]$xml.Item.TaxRateLocal; taxInclSalePrice = ([string]$xml.Item.TaxInclSalePrice -eq "True"); taxInclPurcPrice = ([string]$xml.Item.TaxInclPurcPrice -eq "True")
+            hsnCode = [string]$xml.Item.HSNCode; description = "$($xml.Item.Address.Address1)`n$($xml.Item.Address.Address2)`n$($xml.Item.Address.Address3)".Trim()
+            purchaseAccount = [string]$xml.Item.PurchaseAccount; salesAccount = [string]$xml.Item.SalesAccount
+            minimumLevel = $xml.Item.MinimumLevel; minimumDays = $xml.Item.MinimumDays; reorderLevel = $xml.Item.ReorderLevel; reorderDays = $xml.Item.ReorderDays; maximumLevel = $xml.Item.MaximumLevel; maximumDays = $xml.Item.MaximumDays
+            materialCenters = @($mcs)
+        }
+        return @{ success = $true; data = $data }
+    } catch { return @{ success = $false; error = $_.Exception.Message } } finally { Disconnect-BUSY $fi }
+}
+
+function Build-ItemXml {
+    param($Data, [string]$OriginalName = "")
+    $itemName = ConvertTo-ItemXmlSafe $(if ($OriginalName -ne "") { $OriginalName } else { [string]$Data.name })
+    $altReq = $(if ($Data.altUnitReq -eq $true -or [string]$Data.altUnitReq -eq "True") { $true } else { $false })
+    $apiF = 1.0; $cType = 1
+    if ($altReq) { $cType = [int]$Data.conversionType; $uiF = [double]$Data.conversionFactor; $apiF = $(if ($cType -eq 2 -and $uiF -gt 0) { 1 / $uiF } else { $uiF }) }
+    $gStock = [double]$Data.opStock; $gAlt = [Math]::Round($gStock * $apiF, 3)
+
+    $xml = "<Item><Name>$itemName</Name><PrintName>$(ConvertTo-ItemXmlSafe $Data.printName)</PrintName><Alias>$(ConvertTo-ItemXmlSafe $Data.alias)</Alias><ParentGroup>$(ConvertTo-ItemXmlSafe $Data.group)</ParentGroup><MainUnit>$(ConvertTo-ItemXmlSafe $Data.unit)</MainUnit><OPStockInMainUnit>$gStock</OPStockInMainUnit><OPAmount>$([double]$Data.opAmount)</OPAmount>"
+    if ($altReq) { $xml += "<AltUnitReq>True</AltUnitReq><AltUnit>$(ConvertTo-ItemXmlSafe $Data.altUnit)</AltUnit><OPStockInAltUnit>$gAlt</OPStockInAltUnit><ConversionFactor>$apiF</ConversionFactor><ConFactorType>$cType</ConFactorType><SalePriceDU>$([double]$Data.salePriceDU)</SalePriceDU><PurchasePriceDU>$([double]$Data.purchasePriceDU)</PurchasePriceDU><DefaultPricesAppliedOnSales>2</DefaultPricesAppliedOnSales><DefaultPricesAppliedOnPurc>2</DefaultPricesAppliedOnPurc>" }
+    $xml += "<SalePrice>$([double]$Data.salePrice)</SalePrice><PurchasePrice>$([double]$Data.purchasePrice)</PurchasePrice><MRP>$([double]$Data.mrp)</MRP><MinSalePrice>$([double]$Data.minSalePrice)</MinSalePrice><SalesDiscount>$([double]$Data.salesDiscount)</SalesDiscount><PurcDiscount>$([double]$Data.purcDiscount)</PurcDiscount><StockValPrice>$([double]$Data.stockValPrice)</StockValPrice><PackingUnitName>$(ConvertTo-ItemXmlSafe $Data.unit)</PackingUnitName><ConFactorPU>1</ConFactorPU><StockValMethod>5</StockValMethod><ItemSrNoType>1</ItemSrNoType><OPStockDetails>"
+    
+    $sr = 1; $sumAlt = 0.0; $mcCount = $Data.materialCenters.Count
+    foreach ($mc in $Data.materialCenters) {
+        $s = [double]$mc.opStock; $altVal = [Math]::Round($s * $apiF, 3)
+        if ($sr -eq $mcCount) { $altVal =[Math]::Round($gAlt - $sumAlt, 3) } else { $sumAlt += $altVal }
+        $xml += "<OPMCStockDetail><SrNo>$sr</SrNo><MCName>$($mc.name)</MCName><OPStockMainUnit>$s</OPStockMainUnit><OPStockAltUnit>$altVal</OPStockAltUnit><Amount>$([double]$mc.opAmount)</Amount></OPMCStockDetail>"
+        $sr++
+    }
+    $xml += "</OPStockDetails>"
+
+    if ($Data.minimumLevel -ne $null -and $Data.minimumLevel -ne "") { $xml += "<CriticalLevels>True</CriticalLevels><MinimumLevel>$([double]$Data.minimumLevel)</MinimumLevel><MinimumDays>$([int]$Data.minimumDays)</MinimumDays><ReorderLevel>$([double]$Data.reorderLevel)</ReorderLevel><ReorderDays>$([int]$Data.reorderDays)</ReorderDays><MaximumLevel>$([double]$Data.maximumLevel)</MaximumLevel><MaximumDays>$([int]$Data.maximumDays)</MaximumDays>" }
+    $xml += "<MCWiseCriticalLevel>"
+    foreach ($mc in $Data.materialCenters) {
+        if ($mc.minimumLevel -ne $null -and $mc.minimumLevel -ne "") { $xml += "<MCWiseCriticalInfo><MCNameCL>$($mc.name)</MCNameCL><MinimumLevelMCWise>$([double]$mc.minimumLevel)</MinimumLevelMCWise><MinimumDaysMCWise>$([int]$mc.minimumDays)</MinimumDaysMCWise><ReorderLevelMCWise>$([double]$mc.reorderLevel)</ReorderLevelMCWise><ReorderDaysMCWise>$([int]$mc.reorderDays)</ReorderDaysMCWise><MaximumLevelMCWise>$([double]$mc.maximumLevel)</MaximumLevelMCWise><MaximumDaysMCWise>$([int]$mc.maximumDays)</MaximumDaysMCWise></MCWiseCriticalInfo>" }
+    }
+    $xml += "</MCWiseCriticalLevel><TaxCategory>$(ConvertTo-ItemXmlSafe $Data.taxCategory)</TaxCategory><TaxRateLocal>$([double]$Data.taxRateLocal)</TaxRateLocal><PercentOfAmount>100</PercentOfAmount><TaxInclSalePrice>$(if($Data.taxInclSalePrice){'True'}else{'False'})</TaxInclSalePrice><TaxInclPurcPrice>$(if($Data.taxInclPurcPrice){'True'}else{'False'})</TaxInclPurcPrice><HSNCode>$(ConvertTo-ItemXmlSafe $Data.hsnCode)</HSNCode><SpecifySalesAcc>True</SpecifySalesAcc><SalesAccount>$(ConvertTo-ItemXmlSafe $Data.salesAccount)</SalesAccount><SpecifyPurcAcc>True</SpecifyPurcAcc><PurchaseAccount>$(ConvertTo-ItemXmlSafe $Data.purchaseAccount)</PurchaseAccount></Item>"
+    return $xml
+}
+
+function Create-Item {
+    param($Data,[string]$InstanceId = "", [string]$CompanyCode = "")
+    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode; if (-not $fi) { return @{ success = $false; error = "Connect Fail" } }
+    try { $xml = Build-ItemXml -Data $Data; $err = ""; $saved = $fi.SaveMasterFromXML(6, $xml,[ref]$err, $false)
+        if ($saved) { Clear-ItemCaches -InstanceId $InstanceId -CompanyCode $CompanyCode; return @{ success = $true } }
+        return @{ success = $false; error = $(if($err){$err}else{"Save Fail"}) }
+    } catch {
+        $script:ActiveConnection = $null 
+        try {[System.Runtime.InteropServices.Marshal]::ReleaseComObject($fi) | Out-Null } catch {}
+        return @{success = $false; error = "Database error. Connection reset."}
+    } finally { Disconnect-BUSY $fi }
+}
+
+function Update-Item {
+    param($Data, [string]$InstanceId = "", [string]$CompanyCode = "")
+    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode; if (-not $fi) { return @{ success = $false; error = "Connect Fail" } }
+    try { $orig = $(if($Data._originalName){$Data._originalName}else{$Data.name}); $xml = Build-ItemXml -Data $Data -OriginalName $orig; $err = ""; $saved = $fi.SaveMasterFromXML(6, $xml,[ref]$err, $true)
+        if ($saved) { Clear-ItemCaches -InstanceId $InstanceId -CompanyCode $CompanyCode; return @{ success = $true } }
+        return @{ success = $false; error = $(if($err){$err}else{"Update Fail"}) }
+    } catch {
+        $script:ActiveConnection = $null 
+        try {[System.Runtime.InteropServices.Marshal]::ReleaseComObject($fi) | Out-Null } catch {}
+        return @{success = $false; error = "Database error. Connection reset."}
+    } finally { Disconnect-BUSY $fi }
+}
+
+function Get-Units {
+    param([string]$InstanceId = "", [string]$CompanyCode = "")
+    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode; if (-not $fi) { return @{ success = $false; error = "BUSY failed" } }
+    try {
+        $rst = $fi.GetRecordset("SELECT Name, Code FROM Master1 WHERE MasterType = 8 ORDER BY Name")
+        $units = @()
+        if ($rst -and $rst.RecordCount -ne 0) {
+            $rst.MoveFirst()
+            while (-not $rst.EOF) { $units += @{ code = [int][string]$rst.Fields.Item("Code").Value; name = [string]$rst.Fields.Item("Name").Value }; $rst.MoveNext() }
+            try { $rst.Close() } catch {} 
+        }
+        return @{ success = $true; data = @($units) }
+    } finally { Disconnect-BUSY $fi }
+}
+
+function Get-ItemGroups {
+    param([string]$InstanceId = "",[string]$CompanyCode = "")
+    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode; if (-not $fi) { return @{ success = $false; error = "BUSY failed" } }
+    try {
+        $rst = $fi.GetRecordset("SELECT M1.Name, M1.Code, M1.Alias, (SELECT P.Name FROM Master1 P WHERE P.Code = M1.ParentGrp) AS ParentName FROM Master1 M1 WHERE M1.MasterType = 5 ORDER BY M1.Name")
+        $groups = @()
+        if ($rst -and $rst.RecordCount -gt 0) {
+            $rst.MoveFirst()
+            while (-not $rst.EOF) { 
+                $aliasVal = $rst.Fields.Item("Alias").Value
+                $parentVal = $rst.Fields.Item("ParentName").Value
+                
+                $groups += @{ 
+                    code = [int][string]$rst.Fields.Item("Code").Value; 
+                    name = [string]$rst.Fields.Item("Name").Value;
+                    alias = if ($aliasVal -ne [System.DBNull]::Value -and $null -ne $aliasVal) { $aliasVal.ToString() } else { "" };
+                    parent = if ($parentVal -ne [System.DBNull]::Value -and $null -ne $parentVal) { $parentVal.ToString() } else { "General" }
+                }
+                $rst.MoveNext() 
+            }
+            try { $rst.Close() } catch {} 
+        }
+        return @{ success = $true; data = @($groups) }
+    } finally { Disconnect-BUSY $fi }
+}
+
+function Build-ItemGroupXml {
+    param($Data, [string]$OriginalName = "")
+    $name = if ($OriginalName -ne "") { $OriginalName } else { [string]$Data.name }
+    $parent = $Data.parentGroup
+    if ([string]::IsNullOrEmpty($parent) -or $parent.ToLower() -eq "general" -or $parent -eq "__GENERAL__") {
+        return "<ItemGroup><Name>$(ConvertTo-ItemXmlSafe $name)</Name><Alias>$(ConvertTo-ItemXmlSafe $Data.alias)</Alias><PrimaryGroup>True</PrimaryGroup></ItemGroup>"
+    } else {
+        return "<ItemGroup><Name>$(ConvertTo-ItemXmlSafe $name)</Name><Alias>$(ConvertTo-ItemXmlSafe $Data.alias)</Alias><ParentGroupName>$(ConvertTo-ItemXmlSafe $parent)</ParentGroupName></ItemGroup>"
+    }
+}
+
+function Get-TaxCategories {
+    param([string]$InstanceId = "", [string]$CompanyCode = "")
+    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode; if (-not $fi) { return @{ success = $false; error = "BUSY failed" } }
+    try {
+        $rst = $fi.GetRecordset("SELECT Name, Code FROM Master1 WHERE MasterType = 25 ORDER BY Name")
+        $cats = @()
+        if ($rst -and $rst.RecordCount -ne 0) {
+            $rst.MoveFirst()
+            while (-not $rst.EOF) { $cats += @{ code = [int][string]$rst.Fields.Item("Code").Value; name =[string]$rst.Fields.Item("Name").Value }; $rst.MoveNext() }
+            try { $rst.Close() } catch {}
+        }
+        return @{ success = $true; data = @($cats) }
+    } finally { Disconnect-BUSY $fi }
+}
+
+function Create-ItemGroup {
+    param($Data, [string]$InstanceId = "", [string]$CompanyCode = "")
+    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode; if (-not $fi) { return @{ success = $false; error = "Fail" } }
+    try {
+        $xml = Build-ItemGroupXml -Data $Data
+        $err = ""; $saved = $fi.SaveMasterFromXML(5, $xml,[ref]$err, $false)
+        if ($saved) { Clear-ItemCaches -InstanceId $InstanceId -CompanyCode $CompanyCode; return @{ success = $true } }
+        return @{ success = $false; error = $err }
+    } catch {
+        $script:ActiveConnection = $null 
+        try {[System.Runtime.InteropServices.Marshal]::ReleaseComObject($fi) | Out-Null } catch {}
+        return @{success = $false; error = "Database error. Connection reset."}
+    } finally { Disconnect-BUSY $fi }
+}
+
+function Update-ItemGroup {
+    param($Data, [string]$InstanceId = "", [string]$CompanyCode = "")
+    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode; if (-not $fi) { return @{ success = $false; error = "Fail" } }
+    try {
+        $orig = if ($Data._originalName) { $Data._originalName } else { $Data.name }
+        $xml = Build-ItemGroupXml -Data $Data -OriginalName $orig
+        $err = ""; $saved = $fi.SaveMasterFromXML(5, $xml, [ref]$err, $true)
+        if ($saved) { Clear-ItemCaches -InstanceId $InstanceId -CompanyCode $CompanyCode; return @{ success = $true } }
+        return @{ success = $false; error = $err }
+    } catch {
+        $script:ActiveConnection = $null 
+        try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($fi) | Out-Null } catch {}
+        return @{success = $false; error = "Database error. Connection reset."}
+    } finally { Disconnect-BUSY $fi }
+}

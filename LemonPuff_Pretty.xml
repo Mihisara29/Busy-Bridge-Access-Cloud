@@ -1,0 +1,107 @@
+﻿<Item>
+  <Name>Lemon Puff</Name>
+  <Alias>Lemon Puff Alias</Alias>
+  <PrintName>Lemon Puff</PrintName>
+  <ParentGroup>Biscuits</ParentGroup>
+  <MainUnit>Pcs.</MainUnit>
+  <OPStockInMainUnit>100</OPStockInMainUnit>
+  <OPAmount>10000</OPAmount>
+  <AltUnit>Pcs.</AltUnit>
+  <OPStockInAltUnit>100</OPStockInAltUnit>
+  <ConversionFactor>1</ConversionFactor>
+  <ConFactorType>1</ConFactorType>
+  <SalePrice>180</SalePrice>
+  <SalesDiscount>10</SalesDiscount>
+  <PurchasePrice>100</PurchasePrice>
+  <PurcDiscount>10</PurcDiscount>
+  <MRP>180</MRP>
+  <MinSalePrice>170</MinSalePrice>
+  <PackingUnitName>Pcs.</PackingUnitName>
+  <ConFactorPU>1</ConFactorPU>
+  <StockValPrice>180</StockValPrice>
+  <StockValMethod>5</StockValMethod>
+  <ItemSrNoType>1</ItemSrNoType>
+  <OPStockDetails>
+    <OPMCStockDetail>
+      <SrNo>1</SrNo>
+      <MCName>Main Store</MCName>
+      <OPStockMainUnit>50</OPStockMainUnit>
+      <OPStockAltUnit>50</OPStockAltUnit>
+      <Amount>5000</Amount>
+    </OPMCStockDetail>
+    <OPMCStockDetail>
+      <SrNo>2</SrNo>
+      <MCName>Showroom</MCName>
+      <OPStockMainUnit>50</OPStockMainUnit>
+      <OPStockAltUnit>50</OPStockAltUnit>
+      <Amount>5000</Amount>
+    </OPMCStockDetail>
+  </OPStockDetails>
+  <Address>
+    <Address1>Lemon Puff Description 1</Address1>
+    <Address2>Lemo.....2</Address2>
+    <Address3>Lemon....3</Address3>
+    <OF />
+    <TmpMasterCode>1182</TmpMasterCode>
+  </Address>
+  <CriticalLevels>True</CriticalLevels>
+  <MaximumLevel>5000</MaximumLevel>
+  <MaximumDays>100</MaximumDays>
+  <MinimumLevel>50</MinimumLevel>
+  <MinimumDays>5</MinimumDays>
+  <ReorderLevel>20</ReorderLevel>
+  <ReorderDays>4</ReorderDays>
+  <SpecifySalesAcc>True</SpecifySalesAcc>
+  <SpecifyPurcAccInVch>True</SpecifyPurcAccInVch>
+  <PurchaseAccount>Purchase</PurchaseAccount>
+  <SalesAccount>account 02</SalesAccount>
+  <HSNCode>1256</HSNCode>
+  <tmpCode>1182</tmpCode>
+  <tmpMainUnitCode>1091</tmpMainUnitCode>
+  <tmpAltUnitCode>1091</tmpAltUnitCode>
+  <tmpGroupCode>1149</tmpGroupCode>
+  <tmpSaleAccCode>1162</tmpSaleAccCode>
+  <tmpPurcAccCode>5</tmpPurcAccCode>
+  <tmpPackingUnitCode>1091</tmpPackingUnitCode>
+  <tmpTaxCategoryCode>1055</tmpTaxCategoryCode>
+  <TaxCategory>15%</TaxCategory>
+  <HSNCodeGST>1256</HSNCodeGST>
+  <SpecifyDiscStructureTaggingForSale>True</SpecifyDiscStructureTaggingForSale>
+  <SpecifyDiscStructureTaggingForPurc>True</SpecifyDiscStructureTaggingForPurc>
+  <SaleDiscStructTagging>
+    <SaleDiscStructTaggingInfo>
+      <WithEffectFrom>01-04-2026</WithEffectFrom>
+      <StructName>Simple Discount % of Amount</StructName>
+    </SaleDiscStructTaggingInfo>
+  </SaleDiscStructTagging>
+  <PurcDiscStructTagging>
+    <PurcDiscStructTaggingInfo>
+      <WithEffectFrom>01-04-2026</WithEffectFrom>
+      <StructName>Simple Discount % of Amount</StructName>
+    </PurcDiscStructTaggingInfo>
+  </PurcDiscStructTagging>
+  <MCWiseCriticalLevel>
+    <MCWiseCriticalInfo>
+      <MCNameCL>Main Store</MCNameCL>
+      <MinimumLevelMCWise>50</MinimumLevelMCWise>
+      <ReorderLevelMCWise>20</ReorderLevelMCWise>
+      <MaximumLevelMCWise>5000</MaximumLevelMCWise>
+      <MinimumDaysMCWise>5</MinimumDaysMCWise>
+      <ReorderDaysMCWise>4</ReorderDaysMCWise>
+      <MaximumDaysMCWise>100</MaximumDaysMCWise>
+    </MCWiseCriticalInfo>
+    <MCWiseCriticalInfo>
+      <MCNameCL>Showroom</MCNameCL>
+      <MinimumLevelMCWise>50</MinimumLevelMCWise>
+      <ReorderLevelMCWise>20</ReorderLevelMCWise>
+      <MaximumLevelMCWise>5000</MaximumLevelMCWise>
+      <MinimumDaysMCWise>5</MinimumDaysMCWise>
+      <ReorderDaysMCWise>4</ReorderDaysMCWise>
+      <MaximumDaysMCWise>100</MaximumDaysMCWise>
+    </MCWiseCriticalInfo>
+  </MCWiseCriticalLevel>
+  <TaxRateLocal>15</TaxRateLocal>
+  <PercentOfAmount>100</PercentOfAmount>
+  <TaxInclSalePrice>True</TaxInclSalePrice>
+  <TaxInclPurcPrice>True</TaxInclPurcPrice>
+</Item>
