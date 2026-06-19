@@ -155,7 +155,7 @@ function Start-BUSYServer {
 
                 $result = @{
                     success  = $true;
-                    user     = @{ uid = $user.uid; name = $user.name; role = $user.role };
+                    user     = @{ uid = $user.uid; name = $user.name; role = $user.role; permissions = $user.permissions };
                     instances = $instArray;
                     serverId = Get-ServerId
                 }
@@ -553,7 +553,15 @@ function Start-BUSYServer {
                     -InstanceId   $instanceId `
                     -CompanyCode  $companyCode
 
-            } elseif ($path -eq "/busy/units" -and $method -eq "GET") {
+            } elseif ($path -eq "/busy/cash-bank-accounts" -and $method -eq "GET") {
+                $searchVal = Get-QueryStringValue $request.QueryString "search" ""
+                if ($searchVal -eq "") { $searchVal = Get-QueryStringValue $request.QueryString "params[search]" "" }
+
+                $result = Get-CashBankAccounts `
+                    -Search      $searchVal `
+                    -InstanceId  $instanceId `
+                    -CompanyCode $companyCode
+             }elseif ($path -eq "/busy/units" -and $method -eq "GET") {
                 $result = Get-Units -InstanceId $instanceId -CompanyCode $companyCode
             } elseif ($path -eq "/busy/tax-categories" -and $method -eq "GET") {
                 $result = Get-TaxCategories -InstanceId $instanceId -CompanyCode $companyCode

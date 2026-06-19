@@ -2280,7 +2280,7 @@ function Get-VoucherDetail {
                 if ($dirConn) {
                     $conn = $dirConn.connection
                     $conn.Open()
-                    $qryCons = "SELECT M.Name AS ItemName, SUM(VAL(T2.Value1)) AS CQ FROM Tran3 T1, Tran3 T2, Master1 M WHERE T1.RefCode = T2.RefCode AND T1.MasterCode1 = M.Code AND T1.Method=1 AND T1.VchCode=$vchCode AND T1.RecType IN (4,5) AND T2.Method=2 GROUP BY M.Name"
+                    $qryCons = "SELECT M.Name AS ItemName, SUM(T2.Value1) AS CQ FROM Tran3 T1, Tran3 T2, Master1 M WHERE T1.RefCode = T2.RefCode AND T1.MasterCode1 = M.Code AND T1.Method=1 AND T1.VchCode=$vchCode AND T1.RecType IN (4,5) AND T2.Method=2 GROUP BY M.Name"
                     $ccCmd = $conn.CreateCommand()
                     $ccCmd.CommandText = $qryCons
                     $rCons = $ccCmd.ExecuteReader()

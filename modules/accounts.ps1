@@ -293,6 +293,12 @@ function Get-Accounts {
     if (-not $fi) { return @{ success = $false; error = "BUSY connection failed" } }
 
     try {
+        # Dynamically set the wildcard string based on dbType (SQL Server or ADODB standard both use %)
+        $targetInst = Get-InstanceConfig -InstanceId $InstanceId
+        $dbType = 0
+        if ($null -ne $targetInst -and $null -ne $targetInst.dbType) { $dbType = [int]$targetInst.dbType }
+        $wildcard = if ($dbType -eq 1) { "%" } else { "%" } # ADODB OLEDB standard uses %
+
         # Build dynamic MS Access WHERE filter block
         $where = "Master1.MasterType = 2"
         if ($GroupName -and $GroupName -ne "") {
@@ -308,12 +314,13 @@ function Get-Accounts {
             )"
         }
 
+        # FIX: Apply dynamic database wildcards
         if ($Search -and $Search -ne "") {
             $safeSearch = $Search -replace "'", "''"
-            $where += " AND (Master1.Name LIKE '*$safeSearch*' OR Master1.Alias LIKE '*$safeSearch*')"
+            $where += " AND (Master1.Name LIKE '$wildcard$safeSearch$wildcard' OR Master1.Alias LIKE '$wildcard$safeSearch$wildcard')"
         }
 
-        # 1. Fetch exact total records count (resolves forward-only cursor bugs)
+        # 1. Fetch exact total records count
         $countQry = "SELECT COUNT(*) AS TotalCount FROM Master1 WHERE $where"
         $countRst = $fi.GetRecordset($countQry)
         $totalRecords = 0
@@ -338,7 +345,8 @@ function Get-Accounts {
         $endIndex     = $startIndex + $PageSize - 1
         $currentIndex = 0
 
-        if ($rst) {
+        # FIX: Added EOF safety check to prevent COM exception 3021
+        if ($rst -and -not $rst.EOF) {
             $rst.MoveFirst()
             while (-not $rst.EOF) {
                 # Skip items before target page
@@ -388,7 +396,6 @@ function Get-Accounts {
         $totalPages = [Math]::Ceiling($totalRecords / $PageSize)
         if ($totalPages -lt 1) { $totalPages = 1 }
 
-        # Return paginated metadata wrapper
         return @{ 
             success    = $true 
             total      = $totalRecords
@@ -473,6 +480,50 @@ function Update-AccountGroup {
     } finally { Disconnect-BUSY $fi }
 }
 
+function Get-CashBankAccounts {
+    param(
+        [string]$Search      = "",
+        [string]$InstanceId  = "",
+        [string]$CompanyCode = ""
+    )
+
+    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $fi) { return @{ success = $false; error = "BUSY connection failed" } }
+    try {
+        $wildcard = "%"
+        $where = "Master1.MasterType = 2 AND Master1.ParentGrp IN (SELECT Code FROM Master1 WHERE Name IN ('Cash-in-hand', 'Bank Accounts'))"
+
+        if ($Search -and $Search -ne "") {
+            $safeSearch = $Search -replace "'", "''"
+            $where += " AND (Master1.Name LIKE '$wildcard$safeSearch$wildcard' OR Master1.Alias LIKE '$wildcard$safeSearch$wildcard')"
+        }
+
+        $qry = "SELECT Master1.Code, Master1.Name, Master1.Alias,
+                    (SELECT M1.Name FROM Master1 M1 WHERE M1.Code = Master1.ParentGrp) AS ParentGrpName
+                FROM Master1
+                WHERE $where
+                ORDER BY Master1.Name"
+
+        $rst = $fi.GetRecordset($qry)
+        $accounts = Read-Recordset $rst {
+            param($r)
+            $parentGrp = [string]$r.Fields.Item("ParentGrpName").Value
+            $kind = if ($parentGrp -eq "Bank Accounts") { "Bank" } else { "Cash" }
+            @{
+                code  = [int][string]$r.Fields.Item("Code").Value
+                name  = [string]$r.Fields.Item("Name").Value
+                alias = [string]$r.Fields.Item("Alias").Value
+                group = $parentGrp
+                type  = $kind
+            }
+        }
+
+        return @{ success = $true; count = @($accounts).Count; data = @($accounts) }
+    } finally {
+        Disconnect-BUSY $fi
+    }
+}
+
 
 # ═══════════════════════════════════════════════════════
 #  GET PARTIES (Paginated, Searchable & Cash/Bank Capable)
@@ -492,18 +543,24 @@ function Get-Parties {
     $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
     if (-not $fi) { return @{ success = $false; error = "BUSY connection failed" } }
     try {
+        # Dynamically set the wildcard string based on dbType
+        $targetInst = Get-InstanceConfig -InstanceId $InstanceId
+        $dbType = 0
+        if ($null -ne $targetInst -and $null -ne $targetInst.dbType) { $dbType = [int]$targetInst.dbType }
+        $wildcard = if ($dbType -eq 1) { "%" } else { "%" }
+
         $where = "Master1.MasterType = 2"
         
         if ($CashBankOnly) {
-            # Strictly filter database to Cash-in-hand and Bank Accounts groups
             $where += " AND (
                 Master1.ParentGrp IN (SELECT Code FROM Master1 WHERE Name IN ('Cash-in-hand', 'Bank Accounts'))
             )"
         }
 
+        # FIX: Apply dynamic database wildcards
         if ($Search -and $Search -ne "") {
             $safeSearch = $Search -replace "'", "''"
-            $where += " AND (Master1.Name LIKE '*$safeSearch*' OR Master1.Alias LIKE '*$safeSearch*')"
+            $where += " AND (Master1.Name LIKE '$wildcard$safeSearch$wildcard' OR Master1.Alias LIKE '$wildcard$safeSearch$wildcard')"
         }
 
         # 1. Fetch exact total records count
@@ -529,7 +586,8 @@ function Get-Parties {
         $endIndex     = $startIndex + $PageSize - 1
         $currentIndex = 0
 
-        if ($rst) {
+        # FIX: Added EOF safety check to prevent COM exception 3021
+        if ($rst -and -not $rst.EOF) {
             $rst.MoveFirst()
             while (-not $rst.EOF) {
                 # Skip items before target page
@@ -569,7 +627,6 @@ function Get-Parties {
         $totalPages = [Math]::Ceiling($totalRecords / $PageSize)
         if ($totalPages -lt 1) { $totalPages = 1 }
 
-        # Return paginated metadata wrapper
         return @{ 
             success    = $true 
             total      = $totalRecords

@@ -164,23 +164,8 @@ function Get-IsSuperUser-OLEDB {
 
 function Get-HasMobileAccess-OLEDB {
     param([System.Data.OleDb.OleDbConnection]$Conn, [string]$Username)
-    $safe = $Username -replace "'", "''"
-    foreach ($table in @("UserPreferences1", "UserPreferences")) {
-        try {
-            $cmd = $Conn.CreateCommand()
-            $cmd.CommandText = "SELECT [B20] FROM [$table] WHERE [Name]='$safe'"
-            $rdr = $cmd.ExecuteReader()
-            if ($rdr.Read()) {
-                $raw = $rdr.GetValue(0)
-                $isTrue = $false
-                $rawStr = "$raw".Trim().ToUpper()
-                if ($rawStr -eq "TRUE" -or $rawStr -eq "1" -or $rawStr -eq "-1" -or $rawStr -eq "YES") { $isTrue = $true }
-                $rdr.Close()
-                if ($isTrue) { return $true }
-            } else { $rdr.Close() }
-        } catch {}
-    }
-    return $false
+    # B20 permission check removed — mobile access is always granted.
+    return $true
 }
 
 function Get-IsSuperUser-SQL {
@@ -200,19 +185,8 @@ function Get-IsSuperUser-SQL {
 
 function Get-HasMobileAccess-SQL {
     param([System.Data.SqlClient.SqlConnection]$Conn, [string]$Username)
-    foreach ($table in @("UserPreferences1", "UserPreferences")) {
-        try {
-            $cmd = $Conn.CreateCommand()
-            $cmd.CommandText = "SELECT [B20] FROM [$table] WHERE [Name] = @user"
-            $cmd.Parameters.AddWithValue("@user", $Username) | Out-Null
-            $raw = $cmd.ExecuteScalar()
-            if ($null -ne $raw -and "$raw" -ne "") {
-                $rawStr = $raw.ToString().Trim().ToUpper()
-                if ($rawStr -eq "TRUE" -or $rawStr -eq "1" -or $rawStr -eq "-1" -or $rawStr -eq "YES") { return $true }
-            }
-        } catch {}
-    }
-    return $false
+    # B20 permission check removed — mobile access is always granted.
+    return $true
 }
 
 function Get-CompanyUsers {
@@ -557,9 +531,16 @@ function Invoke-BusyLogin {
 
         if (-not $hasMobileAccess) { return @{ success = $false; error = "MOBILE_ACCESS_DENIED" } }
 
-        $permissions = @{ name = $matchedUser; C1=1;C2=1;C3=1;C4=1;C5=1;C6=1;C7=1;C8=1;C9=1;C10=1;I1=1;I2=1;I3=1;I4=1;I5=1;I6=1;I7=1;I8=1;I9=1;I10=1;I11=1;I12=1;I13=1;I14=1;M1="{}"; M2="{}" }
+# Default: NO transaction access. Only superadmins get full access by
+# default; everyone else must be granted access explicitly via
+# MobileUserPreference (set by an admin on the Permissions page).
+if ($assignedRole -eq "superadmin") {
+    $permissions = @{ name = $matchedUser; C1=1;C2=1;C3=1;C4=1;C5=1;C6=1;C7=1;C8=1;C9=1;C10=1;I1=1;I2=1;I3=1;I4=1;I5=1;I6=1;I7=1;I8=1;I9=1;I10=1;I11=1;I12=1;I13=1;I14=1;M1="{}"; M2="{}" }
+} else {
+    $permissions = @{ name = $matchedUser; C1=0;C2=0;C3=0;C4=0;C5=0;C6=0;C7=0;C8=0;C9=0;C10=0;I1=0;I2=0;I3=0;I4=0;I5=0;I6=0;I7=0;I8=0;I9=0;I10=0;I11=0;I12=0;I13=0;I14=0;M1="{}"; M2="{}" }
+}
 
-        if ($assignedRole -ne "superadmin") {
+if ($assignedRole -ne "superadmin") {
             if ($isAccessDb) {
                 try {
                     $safeUser = $matchedUser -replace "'", "''"
@@ -762,42 +743,11 @@ function Invoke-ScanLogin {
         $dec = Local-Decrypt $cipher
         if ($dec -ne $Password -and $cipher -ne $Password) { continue }
 
-        $hasMobile = $false
-        $isSuperU  = $false
-        try {
-            $cs2   = "Provider=Microsoft.Jet.OLEDB.4.0;Data Source=$dbFile;Jet OLEDB:Database Password=ILoveMyINDIA;"
-            $conn2 = New-Object System.Data.OleDb.OleDbConnection($cs2)
-            $conn2.Open()
-            $safe2 = $mUser -replace "'", "''"
-            try {
-                $c2 = $conn2.CreateCommand()
-                $c2.CommandText = "SELECT [SuperUser] FROM UserPreferences WHERE [Name]='$safe2'"
-                $r2 = $c2.ExecuteReader()
-                if ($r2.Read()) {
-                    $rs = "$($r2.GetValue(0))".Trim().ToUpper()
-                    $isSuperU = ($rs -eq "TRUE" -or $rs -eq "1" -or $rs -eq "-1" -or $rs -eq "YES")
-                }
-                $r2.Close()
-            } catch {}
-            if ($isSuperU) {
-                $hasMobile = $true
-            } else {
-                foreach ($t2 in @("UserPreferences1", "UserPreferences")) {
-                    try {
-                        $c3 = $conn2.CreateCommand()
-                        $c3.CommandText = "SELECT [B20] FROM [$t2] WHERE [Name]='$safe2'"
-                        $r3 = $c3.ExecuteReader()
-                        if ($r3.Read()) {
-                            $rs = "$($r3.GetValue(0))".Trim().ToUpper()
-                            $hasMobile = ($rs -eq "TRUE" -or $rs -eq "1" -or $rs -eq "-1" -or $rs -eq "YES")
-                        }
-                        $r3.Close()
-                        if ($hasMobile) { break }
-                    } catch {}
-                }
-            }
-            $conn2.Close()
-        } catch {}
+        # B20 permission check removed — mobile access is always granted
+        # for any user whose credentials matched above. SuperUser status
+        # is still checked separately later (in Invoke-BusyLogin) for role
+        # assignment, but no longer gates mobile access itself.
+        $hasMobile = $true
 
         $entry = @{ instanceId = $target.instanceId; companyCode = $cc; companyName = $target.companyName; matchedUser = $mUser; isAccessDb = $true }
         if ($hasMobile) { [void]$hitList.Add($entry) } else { [void]$deniedList.Add($entry) }
@@ -877,40 +827,8 @@ function Invoke-ScanLogin {
             $dec = Local-Decrypt $cipher
             if ($dec -ne $Password -and $cipher -ne $Password) { return $null }
 
-            $hasMobile = $false
-            $isSuperU  = $false
-            try {
-                $conn2 = New-Object System.Data.SqlClient.SqlConnection("Server=$sv;Database=$db;User Id=$su;Password=$sp;Connect Timeout=5;")
-                $conn2.Open()
-                try {
-                    $c4 = $conn2.CreateCommand()
-                    $c4.CommandText = "SELECT [SuperUser] FROM UserPreferences WHERE [Name]=@u"
-                    $c4.Parameters.AddWithValue("@u", $mUser) | Out-Null
-                    $r4 = $c4.ExecuteScalar()
-                    if ($null -ne $r4) {
-                        $rs = $r4.ToString().Trim().ToUpper()
-                        $isSuperU = ($rs -eq "TRUE" -or $rs -eq "1" -or $rs -eq "-1" -or $rs -eq "YES")
-                    }
-                } catch {}
-                if ($isSuperU) {
-                    $hasMobile = $true
-                } else {
-                    foreach ($t2 in @("UserPreferences1", "UserPreferences")) {
-                        try {
-                            $c5 = $conn2.CreateCommand()
-                            $c5.CommandText = "SELECT [B20] FROM [$t2] WHERE [Name]=@u"
-                            $c5.Parameters.AddWithValue("@u", $mUser) | Out-Null
-                            $r5 = $c5.ExecuteScalar()
-                            if ($null -ne $r5) {
-                                $rs = $r5.ToString().Trim().ToUpper()
-                                $hasMobile = ($rs -eq "TRUE" -or $rs -eq "1" -or $rs -eq "-1" -or $rs -eq "YES")
-                            }
-                            if ($hasMobile) { break }
-                        } catch {}
-                    }
-                }
-                $conn2.Close()
-            } catch {}
+            # B20 permission check removed — mobile access is always granted.
+            $hasMobile = $true
 
             return @{ matched=$true; accessDenied=(-not $hasMobile); instanceId=$iid; companyCode=$cc; companyName=$cn; matchedUser=$mUser; isAccessDb=$false }
         }
