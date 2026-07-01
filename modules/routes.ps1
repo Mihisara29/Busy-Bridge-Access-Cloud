@@ -193,8 +193,12 @@ function Start-BUSYServer {
                 }
             }
 
+            # --- COMPANY SETTINGS ---
+            if ($path -eq "/busy/company" -and $method -eq "GET") {
+                $result = Get-CompanyDetails -InstanceId $instanceId -CompanyCode $companyCode
+
             # --- VOUCHER MANAGEMENT ---
-            if ($path -eq "/busy/voucher" -and $method -eq "POST") {
+            } elseif ($path -eq "/busy/voucher" -and $method -eq "POST") {
                 $bodyObj = Read-RequestBody $request | ConvertFrom-Json
 
                 if ($authResult.user.name) {
@@ -603,6 +607,54 @@ function Start-BUSYServer {
             } elseif ($path -eq "/busy/cache/clear" -and $method -eq "POST") {
                 Clear-Cache
                 $result = @{success=$true; message="All caches cleared"}
+
+            # --- OPTIONAL FIELDS ROUTING ---
+            } elseif ($path -eq "/busy/voucher/optional-fields-config" -and $method -eq "GET") {
+                $vchTypeStr = $request.QueryString["vchType"]
+                if (-not $vchTypeStr) { $vchTypeStr = $request.QueryString["params[vchType]"] }
+
+                $seriesName = Get-QueryStringValue $request.QueryString "seriesName" ""
+                if ($seriesName -eq "") { $seriesName = Get-QueryStringValue $request.QueryString "params[seriesName]" "" }
+
+                if (-not $vchTypeStr -or $seriesName -eq "") {
+                    $result = @{ success = $false; error = "vchType and seriesName required" }
+                    $response.StatusCode = 400
+                } else {
+                    $result = Get-VoucherOptionalFields `
+                        -VchType     ([int]$vchTypeStr) `
+                        -SeriesName  $seriesName `
+                        -InstanceId  $instanceId `
+                        -CompanyCode $companyCode
+                }
+
+            } elseif ($path -eq "/busy/voucher/optional-fields-values" -and $method -eq "GET") {
+                $vchTypeStr = $request.QueryString["vchType"]
+                if (-not $vchTypeStr) { $vchTypeStr = $request.QueryString["params[vchType]"] }
+
+                $seriesName = Get-QueryStringValue $request.QueryString "seriesName" ""
+                if ($seriesName -eq "") { $seriesName = Get-QueryStringValue $request.QueryString "params[seriesName]" "" }
+
+                $fieldKeyStr = Get-QueryStringValue $request.QueryString "fieldNo" ""
+                if ($fieldKeyStr -eq "") { $fieldKeyStr = Get-QueryStringValue $request.QueryString "params[fieldNo]" "" }
+                
+                $fieldNo = 1
+                if ($fieldKeyStr -match "OptionField(\d+)") {
+                    $fieldNo = [int]$Matches[1]
+                } elseif ($fieldKeyStr -ne "") {
+                    $fieldNo = [int]$fieldKeyStr
+                }
+
+                if (-not $vchTypeStr -or $seriesName -eq "" -or $fieldNo -eq 0) {
+                    $result = @{ success = $false; error = "vchType, seriesName, and fieldNo required" }
+                    $response.StatusCode = 400
+                } else {
+                    $result = Get-OptionalFieldMasterValues `
+                        -VchType     ([int]$vchTypeStr) `
+                        -SeriesName  $seriesName `
+                        -FieldNo     $fieldNo `
+                        -InstanceId  $instanceId `
+                        -CompanyCode $companyCode
+                }
             } else {
                 $result = @{success=$false; error="Endpoint not found: $method $path"}
                 $response.StatusCode = 404

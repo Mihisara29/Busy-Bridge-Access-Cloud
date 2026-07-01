@@ -25,6 +25,153 @@ $script:VoucherConfig = @{
     19 = @{ xmlRoot = "Payment";        hasBillNo = $false; isAccounting = $true;  requiredKeys = @("vchSeries","date","accounts") }
 }
 
+
+
+function Get-VoucherOptionalFields {
+    param(
+        [int]$VchType,
+        [string]$SeriesName,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $fi) {
+        return @{ success = $false; error = "BUSY connection failed" }
+    }
+
+    try {
+        # 1. Resolve Series Master Code
+        $prefixStr = "{0:D2}" -f $VchType
+        $prefixedSeriesName = if ($SeriesName.StartsWith($prefixStr)) { $SeriesName } else { "$prefixStr$SeriesName" }
+        
+        $safeSeriesName = $SeriesName -replace "'", "''"
+        $safePrefixedName = $prefixedSeriesName -replace "'", "''"
+
+        $seriesCode = 0
+        $sRst = $fi.GetRecordset("SELECT Code FROM Master1 WHERE MasterType=21 AND (Name='$safeSeriesName' OR Name='$safePrefixedName')")
+        if ($sRst -and -not $sRst.EOF) {
+            $seriesCode = [int]$sRst.Fields.Item("Code").Value
+            $sRst.Close()
+        }
+
+        if ($seriesCode -eq 0) {
+            return @{ success = $true; data = @() }
+        }
+
+        # 2. Query Config table
+        $qry = "SELECT * FROM Config WHERE RecType=1 AND L1=$seriesCode"
+        $rst = $fi.GetRecordset($qry)
+        $fields = @()
+
+        if ($rst -and -not $rst.EOF) {
+            $rst.MoveFirst()
+            
+            for ($i = 1; $i -le 20; $i++) {
+                $colName = "C$i"
+                $fName = ""
+                try {
+                    if ($rst.Fields.Item($colName).Value -ne [System.DBNull]::Value) {
+                        $fName = $rst.Fields.Item($colName).Value.ToString().Trim()
+                    }
+                } catch {}
+
+                if ($fName -ne "") {
+                    $typeColOffset = 5 + $i
+                    $subColOffset = 25 + $i
+
+                    $rawType = 0
+                    $rawSub  = 0
+
+                    try { $rawType = [int]$rst.Fields.Item("I$typeColOffset").Value } catch {}
+                    try { $rawSub  = [int]$rst.Fields.Item("I$subColOffset").Value } catch {}
+
+                    # Safe and resilient Type Mapping based on database structures
+                    $fieldType = "text"
+                    $decimalPlaces = 0
+                    $maintainMaster = $false
+
+                    # 1. Name-based inference takes strict precedence to bypass OLEDB write-buffering lag
+                    if ($fName -match "Date|Dated") {
+                        $fieldType = "date"
+                    }
+                    elseif ($fName -match "Bool|Booleon|YesNo|Status") {
+                        $fieldType = "boolean"
+                    }
+                    elseif ($rawType -eq 4 -or $fName -match "Number|Qty|Amt|Rate|Val") {
+                        $fieldType = "numeric"
+                        $decimalPlaces = 3
+                    }
+                    # 2. Default to text-type inputs
+                    else {
+                        $fieldType = "text"
+                        # Matches master-linking flags in DB or standard configurations (FieldText, FieldText2, FieldText3, etc.)
+                        if ($rawSub -eq 1 -or $fName -match "FieldText\d?|FieldText") {
+                            $maintainMaster = $true
+                        }
+                    }
+
+                    $fields += @{
+                        fieldKey       = "OptionField$i"
+                        fieldName      = $fName
+                        fieldType      = $fieldType
+                        decimalPlaces  = $decimalPlaces
+                        maintainMaster = $maintainMaster
+                    }
+                }
+            }
+            $rst.Close()
+        }
+
+        return @{ success = $true; count = $fields.Count; data = $fields }
+    } catch {
+        return @{ success = $false; error = $_.Exception.Message }
+    } finally {
+        Disconnect-BUSY $fi
+    }
+}
+
+function Get-OptionalFieldMasterValues {
+    param(
+        [int]$VchType,
+        [string]$SeriesName,
+        [int]$FieldNo,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $fi) {
+        return @{ success = $false; error = "BUSY connection failed" }
+    }
+
+    try {
+        # DIRECTLY QUERY THE MAIN MASTER TABLE USING VETTING MASTERTYPE LOGIC (1000 + FieldNo)
+        $targetMasterType = 1000 + $FieldNo
+        $qry = "SELECT Name FROM Master1 WHERE MasterType=$targetMasterType ORDER BY Name"
+        $rst = $fi.GetRecordset($qry)
+
+        $values = @()
+        if ($rst -and -not $rst.EOF) {
+            $rst.MoveFirst()
+            while (-not $rst.EOF) {
+                $val = $rst.Fields.Item("Name").Value
+                if ($val -ne [System.DBNull]::Value -and $val -ne $null) {
+                    $values += $val.ToString().Trim()
+                }
+                $rst.MoveNext()
+            }
+            $rst.Close()
+        }
+
+        return @{ success = $true; data = $values }
+    } catch {
+        return @{ success = $false; error = $_.Exception.Message }
+    } finally {
+        Disconnect-BUSY $fi
+    }
+}
+
 # ═══════════════════════════════════════════════════════════════
 #  DIRECT NATIVE HELPER: Get-VchCode-Direct
 # ═══════════════════════════════════════════════════════════════
@@ -449,22 +596,31 @@ function Build-AccEntriesXml {
     
     if ($VchType -eq 9 -or $VchType -eq 3) {
         
-        $partyAmt = -$partyBalance
-        $saleAmt = $TotalAmt
+                        # 1. Dynamic assignments to handle Dr/Cr directions cleanly
+            if ($VchType -eq 9) {
+                # Sale Invoice: Party Dr (1, Negative), Sales Cr (2, Positive)
+                $partyAmtType = 1; $partyAmt = -$partyBalance
+                $saleAmtType  = 2; $saleAmt  = $TotalAmt
+            } else {
+                # Sale Return: Party Cr (2, Positive), Sales Dr (1, Negative)
+                $partyAmtType = 2; $partyAmt = $partyBalance
+                $saleAmtType  = 1; $saleAmt  = -$TotalAmt
+            }
         
-        if ([Math]::Round($partyBalance, 2) -gt 0 -or $totalSettled -eq 0) {
-            $xml += "<AccDetail>"
-            $xml += "<AccountName>$([System.Security.SecurityElement]::Escape($PartyName))</AccountName>"
-            $xml += "<AmountType>1</AmountType>"
-            $xml += "<AmtMainCur>$($partyAmt.ToString('0.##',[System.Globalization.CultureInfo]::InvariantCulture))</AmtMainCur>"
-            $xml += "</AccDetail>"
-        }
+           # 2. Customer Party AccDetail (updated to use $partyAmtType)
+            if ([Math]::Round($partyBalance, 2) -gt 0 -or $totalSettled -eq 0) {
+                $xml += "<AccDetail>"
+                $xml += "<AccountName>$([System.Security.SecurityElement]::Escape($PartyName))</AccountName>"
+                $xml += "<AmountType>$partyAmtType</AmountType>"
+                $xml += "<AmtMainCur>$($partyAmt.ToString('0.##',[System.Globalization.CultureInfo]::InvariantCulture))</AmtMainCur>"
+                $xml += "</AccDetail>"
+            }
         
-        $xml += "<AccDetail>"
-        $xml += "<AccountName>$([System.Security.SecurityElement]::Escape($salesAcc))</AccountName>"
-        $xml += "<AmountType>2</AmountType>"
-        $xml += "<AmtMainCur>$($saleAmt.ToString('0.##',[System.Globalization.CultureInfo]::InvariantCulture))</AmtMainCur>"
-        $xml += "</AccDetail>"
+                $xml += "<AccDetail>"
+                $xml += "<AccountName>$([System.Security.SecurityElement]::Escape($salesAcc))</AccountName>"
+                $xml += "<AmountType>$saleAmtType</AmountType>"
+                $xml += "<AmtMainCur>$($saleAmt.ToString('0.##',[System.Globalization.CultureInfo]::InvariantCulture))</AmtMainCur>"
+                $xml += "</AccDetail>"
 
         if ($cashAmt -gt 0 -and $cashAcc) {
             $cAmt = -$cashAmt
@@ -479,18 +635,32 @@ function Build-AccEntriesXml {
             $xml += "<AccDetail><AccountName>$([System.Security.SecurityElement]::Escape($giftAcc))</AccountName><AmountType>1</AmountType><AmtMainCur>$($cAmt.ToString('0.##',[System.Globalization.CultureInfo]::InvariantCulture))</AmtMainCur></AccDetail>"
         }
     } elseif ($VchType -eq 2 -or $VchType -eq 10) {
+
+            # 1. Dynamic assignments to handle Dr/Cr directions cleanly
+    if ($VchType -eq 2) {
+        # Purchase: Party Cr (2, Positive), Purchase Dr (1, Negative)
+        $partyAmtType = 2; $partyAmtVal = $TotalAmt
+        $purcAmtType  = 1; $purcAmtVal  = -$TotalAmt
+    } else {
+        # Purchase Return: Party Dr (1, Negative), Purchase Cr (2, Positive)
+        $partyAmtType = 1; $partyAmtVal = -$TotalAmt
+        $purcAmtType  = 2; $purcAmtVal  = $TotalAmt
+    }
+    
         $negAmt = -$TotalAmt
         
+        # 2. Supplier Party AccDetail
         $xml += "<AccDetail>"
         $xml += "<AccountName>$([System.Security.SecurityElement]::Escape($PartyName))</AccountName>"
-        $xml += "<AmountType>2</AmountType>"
-        $xml += "<AmtMainCur>$($TotalAmt.ToString('0.##',[System.Globalization.CultureInfo]::InvariantCulture))</AmtMainCur>"
+        $xml += "<AmountType>$partyAmtType</AmountType>"
+        $xml += "<AmtMainCur>$($partyAmtVal.ToString('0.##',[System.Globalization.CultureInfo]::InvariantCulture))</AmtMainCur>"
         $xml += "</AccDetail>"
         
+        # 3. Purchase Account AccDetail
         $xml += "<AccDetail>"
         $xml += "<AccountName>$([System.Security.SecurityElement]::Escape($purcAcc))</AccountName>"
-        $xml += "<AmountType>1</AmountType>"
-        $xml += "<AmtMainCur>$($negAmt.ToString('0.##',[System.Globalization.CultureInfo]::InvariantCulture))</AmtMainCur>"
+        $xml += "<AmountType>$purcAmtType</AmountType>"
+        $xml += "<AmtMainCur>$($purcAmtVal.ToString('0.##',[System.Globalization.CultureInfo]::InvariantCulture))</AmtMainCur>"
         $xml += "</AccDetail>"
     }
     
@@ -761,8 +931,34 @@ function Build-VoucherXml {
     $xml += "<TranCurName>Rs.</TranCurName>"
     $xml += "<InputType>$inputType</InputType>"
     $xml += "<BillingDetails><PartyName>$([System.Security.SecurityElement]::Escape($Data.party))</PartyName></BillingDetails>"
-    $xml += "<VchOtherInfoDetails>"
     
+    $xml += "<VchOtherInfoDetails>"
+
+    if ($Data.optionalFields) {
+        $xml += "<OFInfo>"
+        # Populate the XML elements OF1 through OF20 sequentially
+        for ($i = 1; $i -le 20; $i++) {
+            $key = "OptionField$i"
+            $val = ""
+
+            # DUAL-COMPATIBLE PROPERTY DETECTION: Handles both [PSCustomObject] and [Hashtable] safely
+            if ($Data.optionalFields.psobject.Properties[$key]) {
+                $val = [string]$Data.optionalFields.$key
+            } elseif ($Data.optionalFields.GetType().Name -eq "Hashtable" -and $Data.optionalFields.ContainsKey($key)) {
+                $val = [string]$Data.optionalFields[$key]
+            }
+
+            if ($val -ne "") {
+                # AUTOMATIC DATE FORMATTER: Detect and reformat standard HTML5 yyyy-MM-dd values to dd-MM-yyyy
+                if ($val -match "^(\d{4})-(\d{2})-(\d{2})$") {
+                    $val = "$($Matches[3])-$($Matches[2])-$($Matches[1])"
+                }
+                $xml += "<OF$i>$([System.Security.SecurityElement]::Escape($val))</OF$i>"
+            }
+        }
+        $xml += "</OFInfo>"
+    }
+
     if ($Cfg.hasBillNo) {
         $billNo = if ($Data.supplierBillNo) { $Data.supplierBillNo } elseif ($Data.purchaseBillNo) { $Data.purchaseBillNo } else { "" }
         $xml += "<PurchaseBillNo>$([System.Security.SecurityElement]::Escape($billNo))</PurchaseBillNo>"
@@ -2492,6 +2688,26 @@ function Get-VoucherDetail {
             if ($null -ne $conn) { try { $conn.Close() } catch {} }
         }
 
+        $optionalFields = @{}
+        try {
+            if ($root.VchOtherInfoDetails.OFInfo) {
+                $ofNode = $root.VchOtherInfoDetails.OFInfo
+                for ($i = 1; $i -le 20; $i++) {
+                    $nodeName = "OF$i"
+                    if ($ofNode.$nodeName) {
+                        $val = ([string]$ofNode.$nodeName).Trim()
+                        if ($val -ne "") {
+                            # AUTOMATIC DATE HYDRATOR: Reformat dd-MM-yyyy back to yyyy-MM-dd for HTML5 inputs
+                            if ($val -match "^(\d{2})-(\d{2})-(\d{4})$") {
+                                $val = "$($Matches[3])-$($Matches[2])-$($Matches[1])"
+                            }
+                            $optionalFields["OptionField$i"] = $val
+                        }
+                    }
+                }
+            }
+        } catch {}
+
         return @{
             success = $true
             data = @{
@@ -2506,12 +2722,12 @@ function Get-VoucherDetail {
                 purchaseType   = $stptName
                 narration      = $narration
                 supplierBillNo = $supplierBillNo
-                voucherType    = $stptName
                 items          = @($items)
                 billSundries   = @($billSundries)
                 settlements    = $settlements
                 refEntries     = @($refEntries)
                 linkedChallans = @($linkedChallans)
+                optionalFields = $optionalFields 
             }
         }
 
@@ -3078,6 +3294,7 @@ function Get-ReturnHistory {
     }
 }
 
+
 # ═══════════════════════════════════════════════════════════════
 #  MODIFY VOUCHER
 # ═══════════════════════════════════════════════════════════════
@@ -3090,46 +3307,59 @@ function Modify-Voucher {
     if (-not $cfg) { return @{ success = $false; error = "Unsupported vchType" } }
     if (-not $Data.vchNo -or [string]$Data.vchNo -eq "") { return @{ success = $false; error = "vchNo is required for modify" } }
     
-    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
-    if (-not $fi) { return @{ success = $false; error = "BUSY connection failed" } }
-    
-    try {
-        $xml = if ($cfg.isAccounting) {
-            Build-AccountingVoucherXml -Data $Data -Cfg $cfg -VchType $vchType -VchNo ([string]$Data.vchNo) -SkipBBA $false -fi $fi
-        } else {
-            Build-VoucherXml -Data $Data -Cfg $cfg -VchType $vchType -VchNo ([string]$Data.vchNo) -SkipBBA $false -fi $fi
-        }
+    $maxAttempts = 2
+    $attempt = 1
+    $lastExceptionMsg = ""
 
-        $errMsg = ""
-        $saved = $fi.SaveVchFromXML($vchType, $xml, [ref]$errMsg, $true)
+    while ($attempt -le $maxAttempts) {
+        $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
+        if (-not $fi) { return @{ success = $false; error = "BUSY connection failed" } }
         
-        if ($saved -eq $true) {
-            if ($Data.bridgeUserName) {
-                Update-CheckListCreator -fi $fi -VchType $vchType -VchNo ([string]$Data.vchNo) -VchDate $Data.date -UserName $Data.bridgeUserName -InstanceId $InstanceId -CompanyCode $CompanyCode
+        try {
+            $xml = if ($cfg.isAccounting) {
+                Build-AccountingVoucherXml -Data $Data -Cfg $cfg -VchType $vchType -VchNo ([string]$Data.vchNo) -SkipBBA $false -fi $fi
+            } else {
+                Build-VoucherXml -Data $Data -Cfg $cfg -VchType $vchType -VchNo ([string]$Data.vchNo) -SkipBBA $false -fi $fi
             }
 
-            Clear-StockCaches -InstanceId $InstanceId -CompanyCode $CompanyCode
-            return @{
-                success = $true
-                message = "$($cfg.xmlRoot) modified"
-                data = @{
-                    vchType = $vchType
-                    vchSeries = $Data.vchSeries
-                    vchNo = $Data.vchNo
-                    date = $Data.date
+            $errMsg = ""
+            $saved = $fi.SaveVchFromXML($vchType, $xml, [ref]$errMsg, $true)
+            
+            if ($saved -eq $true) {
+                if ($Data.bridgeUserName) {
+                    Update-CheckListCreator -fi $fi -VchType $vchType -VchNo ([string]$Data.vchNo) -VchDate $Data.date -UserName $Data.bridgeUserName -InstanceId $InstanceId -CompanyCode $CompanyCode
                 }
+
+                Clear-StockCaches -InstanceId $InstanceId -CompanyCode $CompanyCode
+                return @{
+                    success = $true
+                    message = "$($cfg.xmlRoot) modified"
+                    data = @{
+                        vchType = $vchType
+                        vchSeries = $Data.vchSeries
+                        vchNo = $Data.vchNo
+                        date = $Data.date
+                    }
+                }
+            } else {
+                return @{ success = $false; error = if ($errMsg) { $errMsg } else { "Unknown BUSY error" } }
             }
-        } else {
-            return @{ success = $false; error = if ($errMsg) { $errMsg } else { "Unknown BUSY error" } }
+        } catch {
+            $lastExceptionMsg = $_.Exception.Message
+            $script:ActiveConnection = $null
+            try { $script:ActiveConnection.CloseDB() } catch {}
+            try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($fi) | Out-Null } catch {}
+            
+            if ($attempt -eq 1) {
+                Write-Host "2026-06-26 [WARNING] Idle connection timeout detected on Modify. Reconnecting for Attempt 2..." -ForegroundColor Yellow
+            }
+            $attempt++
+        } finally {
+            Disconnect-BUSY $fi
         }
-    } catch {
-        $script:ActiveConnection = $null
-        try { $script:ActiveConnection.CloseDB() } catch {}
-        try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($fi) | Out-Null } catch {}
-        return @{ success = $false; error = "Database error. Connection reset. Please try saving again." }
-    } finally {
-        Disconnect-BUSY $fi
     }
+
+    return @{ success = $false; error = "Database error. Connection reset. Details: $lastExceptionMsg" }
 }
 
 # ═══════════════════════════════════════════════════════════════

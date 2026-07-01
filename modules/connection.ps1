@@ -19,6 +19,23 @@ function Get-InstanceConfig {
     return $instance
 }
 
+function Get-MainCompanyDbPath {
+    param([string]$CompanyCode)
+    $instancesPath = "$PSScriptRoot\..\instances.json"
+    if (-not (Test-Path $instancesPath)) { return $null }
+    try {
+        $config = Get-Content $instancesPath -Raw | ConvertFrom-Json
+        foreach ($inst in $config.instances) {
+            foreach ($comp in $inst.companies) {
+                if ($comp.code.ToLower() -eq $CompanyCode.ToLower()) {
+                    return Join-Path $inst.dataPath "$($comp.code)\db.bds"
+                }
+            }
+        }
+    } catch {}
+    return $null
+}
+
 # ═══════════════════════════════════════════════════════
 #  DYNAMIC DATABASE NAME RESOLVER (Explicit Mapping + Fallback Formatter)
 # ═══════════════════════════════════════════════════════
@@ -240,6 +257,110 @@ function Get-DirectConnection {
             dbType     = 0
             connection = $conn
             wildcard   = "*"
+        }
+    }
+}
+
+# ═══════════════════════════════════════════════════════
+#  DIRECT NATIVE DB CONFIG QUERIES (db.bds / Base SQL DB)
+# ═══════════════════════════════════════════════════════
+function Get-CompanyDetails {
+    param(
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $targetInst = Get-InstanceConfig -InstanceId $InstanceId
+    $dbType = 0
+    if ($null -ne $targetInst -and $null -ne $targetInst.dbType) { $dbType = [int]$targetInst.dbType }
+
+    function Read-SafeReaderField {
+        param($rdr, [string]$field)
+        try {
+            $idx = $rdr.GetOrdinal($field)
+            if ($idx -ge 0) {
+                $v = $rdr.GetValue($idx)
+                if ($null -ne $v -and $v -ne [System.DBNull]::Value) {
+                    return $v.ToString().Trim()
+                }
+            }
+        } catch {}
+        return ""
+    }
+
+    if ($dbType -eq 1) {
+        $sqlServer   = $targetInst.sqlServer
+        $sqlUser     = $targetInst.sqlUser
+        $sqlPassword = $targetInst.sqlPassword
+        $baseDbName  = Get-SqlDatabaseName -CompanyCode $CompanyCode -InstanceId $InstanceId
+
+        $connStr = "Server=$sqlServer;Database=$baseDbName;User Id=$sqlUser;Password=$sqlPassword;"
+        $conn = New-Object System.Data.SqlClient.SqlConnection($connStr)
+        try {
+            $conn.Open()
+            $cmd = $conn.CreateCommand()
+            $cmd.CommandText = "SELECT TOP 1 [Name], [PrintName], [Address1], [Address2], [Address3], [Address4], [TelNo], [Fax], [Email], [TINNo], [GSTNo] FROM [Company]"
+            $rdr = $cmd.ExecuteReader()
+            $comp = $null
+            if ($rdr.Read()) {
+                $comp = @{
+                    name      = Read-SafeReaderField $rdr "Name"
+                    printName = Read-SafeReaderField $rdr "PrintName"
+                    address1  = Read-SafeReaderField $rdr "Address1"
+                    address2  = Read-SafeReaderField $rdr "Address2"
+                    address3  = Read-SafeReaderField $rdr "Address3"
+                    address4  = Read-SafeReaderField $rdr "Address4"
+                    telNo     = Read-SafeReaderField $rdr "TelNo"
+                    fax       = Read-SafeReaderField $rdr "Fax"
+                    email     = Read-SafeReaderField $rdr "Email"
+                    tinNo     = Read-SafeReaderField $rdr "TINNo"
+                    gstNo     = Read-SafeReaderField $rdr "GSTNo"
+                }
+            }
+            $rdr.Close()
+            if ($null -ne $comp) { return @{ success = $true; data = $comp } }
+            return @{ success = $false; error = "No company configuration found" }
+        } catch {
+            return @{ success = $false; error = $_.Exception.Message }
+        } finally {
+            if ($null -ne $conn) { try { $conn.Close() } catch {} }
+        }
+    } else {
+        $dbFile = Get-MainCompanyDbPath -CompanyCode $CompanyCode
+        if ([string]::IsNullOrEmpty($dbFile) -or -not (Test-Path $dbFile)) {
+            return @{ success = $false; error = "Main db.bds file not found" }
+        }
+
+        $connStr = "Provider=Microsoft.Jet.OLEDB.4.0;Data Source=$dbFile;Jet OLEDB:Database Password=ILoveMyINDIA;"
+        $conn = New-Object System.Data.OleDb.OleDbConnection($connStr)
+        try {
+            $conn.Open()
+            $cmd = $conn.CreateCommand()
+            $cmd.CommandText = "SELECT [Name], [PrintName], [Address1], [Address2], [Address3], [Address4], [TelNo], [Fax], [Email], [TINNo], [GSTNo] FROM [Company]"
+            $rdr = $cmd.ExecuteReader()
+            $comp = $null
+            if ($rdr.Read()) {
+                $comp = @{
+                    name      = Read-SafeReaderField $rdr "Name"
+                    printName = Read-SafeReaderField $rdr "PrintName"
+                    address1  = Read-SafeReaderField $rdr "Address1"
+                    address2  = Read-SafeReaderField $rdr "Address2"
+                    address3  = Read-SafeReaderField $rdr "Address3"
+                    address4  = Read-SafeReaderField $rdr "Address4"
+                    telNo     = Read-SafeReaderField $rdr "TelNo"
+                    fax       = Read-SafeReaderField $rdr "Fax"
+                    email     = Read-SafeReaderField $rdr "Email"
+                    tinNo     = Read-SafeReaderField $rdr "TINNo"
+                    gstNo     = Read-SafeReaderField $rdr "GSTNo"
+                }
+            }
+            $rdr.Close()
+            if ($null -ne $comp) { return @{ success = $true; data = $comp } }
+            return @{ success = $false; error = "No company configuration found in db.bds" }
+        } catch {
+            return @{ success = $false; error = $_.Exception.Message }
+        } finally {
+            if ($null -ne $conn) { try { $conn.Close() } catch {} }
         }
     }
 }
