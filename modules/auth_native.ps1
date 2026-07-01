@@ -126,6 +126,8 @@ function Read-PermissionRow {
         C1=0; C2=0; C3=0; C4=0; C5=0; C6=0; C7=0; C8=0; C9=0; C10=0
         I1=0; I2=0; I3=0; I4=0; I5=0; I6=0; I7=0; I8=0; I9=0; I10=0
         I11=0; I12=0; I13=0; I14=0
+        # Register B21 to B32:
+        B21=0; B22=0; B23=0; B24=0; B25=0; B26=0; B27=0; B28=0; B29=0; B30=0; B31=0; B32=0
         M1="{}"; M2="{}"
     }
     foreach ($col in @($userObj.Keys)) {
@@ -137,11 +139,23 @@ function Read-PermissionRow {
             }
         } catch {}
     }
+    
+    # Safely normalizes both MS Access (-1/0) and SQL Server (1/0) to uniform integers
     foreach ($col in @("C1","C2","C3","C4","C5","C6","C7","C8","C9","C10",
-                       "I1","I2","I3","I4","I5","I6","I7","I8","I9","I10","I11","I12","I13","I14")) {
-        $userObj[$col] = [int]($userObj[$col])
+                       "I1","I2","I3","I4","I5","I6","I7","I8","I9","I10","I11","I12","I13","I14",
+                       "B21","B22","B23","B24","B25","B26","B27","B28","B29","B30","B31","B32")) {
+        $userObj[$col] = Normalize-PermissionValue $userObj[$col]
     }
     return $userObj
+}
+
+# Helper to safely convert Yes/No values
+function Normalize-PermissionValue {
+    param($val)
+    if ($null -eq $val -or "$val" -eq "") { return 0 }
+    $valStr = $val.ToString().Trim().ToLower()
+    if ($valStr -eq "true" -or $valStr -eq "1" -or $valStr -eq "-1" -or $valStr -eq "yes") { return 1 }
+    return 0
 }
 
 function Get-IsSuperUser-OLEDB {
@@ -280,7 +294,13 @@ function Save-UserPermissions {
     $dbType = if ($null -ne $inst.dbType) { [int]$inst.dbType } else { 0 }
     $userName = $Data.name
     if ([string]::IsNullOrEmpty($userName)) { return @{ success = $false; error = "User Name is required" } }
-    $intCols = @("C1","C2","C3","C4","C5","C6","C7","C8","C9","C10","I1","I2","I3","I4","I5","I6","I7","I8","I9","I10","I11","I12","I13","I14")
+
+    $intCols = @(
+    "C1","C2","C3","C4","C5","C6","C7","C8","C9","C10",
+    "I1","I2","I3","I4","I5","I6","I7","I8","I9","I10","I11","I12","I13","I14",
+    "B21","B22","B23","B24","B25","B26","B27","B28","B29","B30","B31","B32"
+)
+
     $m1Val = if ($null -ne $Data.M1) { $Data.M1 } else { "{}" }
     $m2Val = if ($null -ne $Data.M2) { $Data.M2 } else { "{}" }
 
