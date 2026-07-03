@@ -23,9 +23,23 @@ $script:VoucherConfig = @{
     15 = @{ xmlRoot = "Contra";         hasBillNo = $false; isAccounting = $true;  requiredKeys = @("vchSeries","date","accounts") }
     16 = @{ xmlRoot = "Journal";        hasBillNo = $false; isAccounting = $true;  requiredKeys = @("vchSeries","date","accounts") }
     19 = @{ xmlRoot = "Payment";        hasBillNo = $false; isAccounting = $true;  requiredKeys = @("vchSeries","date","accounts") }
+    5  = @{ xmlRoot = "StockTransfer";  typeField = "VchSeriesName"; typeDataKey = "vchSeries"; hasBillNo = $false; isAccounting = $false; requiredKeys = @("vchSeries","date","party","items") }
 }
 
-
+function Safe-ParseDate {
+    param([string]$dateStr)
+    if ([string]::IsNullOrWhiteSpace($dateStr)) { return $null }
+    $formats = @("dd-MM-yyyy", "yyyy-MM-dd", "MM/dd/yyyy", "d-M-yyyy", "yyyy/MM/dd")
+    foreach ($fmt in $formats) {
+        try {
+            return [datetime]::ParseExact($dateStr, $fmt, [System.Globalization.CultureInfo]::InvariantCulture)
+        } catch {}
+    }
+    try {
+        return [datetime]::Parse($dateStr)
+    } catch {}
+    return $null
+}
 
 function Get-VoucherOptionalFields {
     param(
@@ -67,6 +81,7 @@ function Get-VoucherOptionalFields {
         if ($rst -and -not $rst.EOF) {
             $rst.MoveFirst()
             
+            # Loop up to 20 directly to ensure all configured fields are caught 
             for ($i = 1; $i -le 20; $i++) {
                 $colName = "C$i"
                 $fName = ""
@@ -91,23 +106,32 @@ function Get-VoucherOptionalFields {
                     $decimalPlaces = 0
                     $maintainMaster = $false
 
-                    # 1. Name-based inference takes strict precedence to bypass OLEDB write-buffering lag
-                    if ($fName -match "Date|Dated") {
+                    # A. Exhaustive Business Vocabulary matching
+                    if ($fName -match "Date|Dated|Expiry|Due|Period|Mfg|Format|Year|Month|Day") {
                         $fieldType = "date"
                     }
-                    elseif ($fName -match "Bool|Booleon|YesNo|Status") {
+                    elseif ($fName -match "Bool|Booleom|Booleon|YesNo|Status|Active|Enabled|Hold|Block|Approved") {
                         $fieldType = "boolean"
                     }
-                    elseif ($rawType -eq 4 -or $fName -match "Number|Qty|Amt|Rate|Val") {
+                    elseif ($fName -match "Number|Qty|Amt|Rate|Val|Numeric|Discount|Price|Tax|Gst|Balance|Percent|Charge|Cost|Comm|Commission|Duty|Freight") {
                         $fieldType = "numeric"
-                        $decimalPlaces = 3
+                        $decimalPlaces = 3 # Matches FiedNumber default in screenshot
                     }
-                    # 2. Default to text-type inputs
                     else {
                         $fieldType = "text"
-                        # Matches master-linking flags in DB or standard configurations (FieldText, FieldText2, FieldText3, etc.)
-                        if ($rawSub -eq 1 -or $fName -match "FieldText\d?|FieldText") {
-                            $maintainMaster = $true
+                    }
+
+                    # B. SELF-LEARNING DROPDOWN DETECTION: Query the database directly. If master records 
+                    # exist under MasterType = 1000 + i, automatically configure as a dropdown list.
+                    if ($fieldType -eq "text") {
+                        $targetMasterType = 1000 + $i
+                        $chkRst = $fi.GetRecordset("SELECT COUNT(*) AS TotalCount FROM Master1 WHERE MasterType=$targetMasterType")
+                        if ($chkRst -and -not $chkRst.EOF) {
+                            $cnt = [int]$chkRst.Fields.Item("TotalCount").Value
+                            if ($cnt -gt 0) {
+                                $maintainMaster = $true
+                            }
+                            $chkRst.Close()
                         }
                     }
 
@@ -131,6 +155,9 @@ function Get-VoucherOptionalFields {
     }
 }
 
+# ═══════════════════════════════════════════════════════════════
+#  2. GET OPTIONAL FIELD MASTER AUTCOMPLETE SUGGESTIONS
+# ═══════════════════════════════════════════════════════════════
 function Get-OptionalFieldMasterValues {
     param(
         [int]$VchType,
@@ -146,7 +173,7 @@ function Get-OptionalFieldMasterValues {
     }
 
     try {
-        # DIRECTLY QUERY THE MAIN MASTER TABLE USING VETTING MASTERTYPE LOGIC (1000 + FieldNo)
+        # DIRECTLY QUERY THE MAIN MASTER TABLE USING MASTERTYPE LOGIC (1000 + FieldNo)
         $targetMasterType = 1000 + $FieldNo
         $qry = "SELECT Name FROM Master1 WHERE MasterType=$targetMasterType ORDER BY Name"
         $rst = $fi.GetRecordset($qry)
@@ -2008,19 +2035,19 @@ function Get-Vouchers {
             }
             $mRdr.Close()
 
-            # 2. Build Where Filter
+            # 2. Build Where Filter (Using culture-insensitive Safe-ParseDate helper with single quotes for SQL)
             $where = "VchType = $VchType"
             if ($From -ne "") {
-                try {
-                    $d = [datetime]::Parse($From)
-                    $where += " AND [Date] >= '" + $d.ToString("yyyy-MM-dd") + "'"
-                } catch {}
+                $dFrom = Safe-ParseDate -dateStr $From
+                if ($null -ne $dFrom) {
+                    $where += " AND [Date] >= '" + $dFrom.ToString("yyyy-MM-dd") + "'"
+                }
             }
             if ($To -ne "") {
-                try {
-                    $d = [datetime]::Parse($To)
-                    $where += " AND [Date] <= '" + $d.ToString("yyyy-MM-dd") + "'"
-                } catch {}
+                $dTo = Safe-ParseDate -dateStr $To
+                if ($null -ne $dTo) {
+                    $where += " AND [Date] <= '" + $dTo.ToString("yyyy-MM-dd") + "'"
+                }
             }
             if ($Party -ne "") {
                 $pCode = ""
@@ -2042,7 +2069,7 @@ function Get-Vouchers {
             $stptSelect = if ($stptColExists) { "[STPTCode]," } else { "NULL AS [STPTCode]," }
 
             $vCmd = $sqlConn.CreateCommand()
-            $vCmd.CommandText = "SELECT [VchCode], [VchNo], [AutoVchNo], [Date], [MasterCode1], [VchSeriesCode], $stptSelect [CM1], [VchAmtBaseCur] FROM [Tran1] WHERE $where ORDER BY CASE WHEN ISNUMERIC(VchNo) = 1 THEN CAST(VchNo AS DECIMAL(18,2)) ELSE 0 END DESC, VchNo DESC"
+            $vCmd.CommandText = "SELECT [VchCode], [VchNo], [AutoVchNo], [Date], [MasterCode1], [MasterCode2], [VchSeriesCode], $stptSelect [CM1], [VchAmtBaseCur] FROM [Tran1] WHERE $where ORDER BY COALESCE(TRY_CAST(VchNo AS DECIMAL(18,2)), 0) DESC, VchNo DESC"
             $rdr = $vCmd.ExecuteReader()
             while ($rdr.Read()) {
                 $vNo = ""
@@ -2074,6 +2101,10 @@ function Get-Vouchers {
                 try { $pCode = $rdr["MasterCode1"].ToString().Trim() } catch {}
                 $partyName = if ($masterMap.ContainsKey($pCode)) { $masterMap[$pCode] } else { $pCode }
 
+                $p2Code = ""
+                try { $p2Code = $rdr["MasterCode2"].ToString().Trim() } catch {}
+                $toCenterName = if ($masterMap.ContainsKey($p2Code)) { $masterMap[$p2Code] } else { $p2Code }
+
                 $sCode = ""
                 try { $sCode = $rdr["VchSeriesCode"].ToString().Trim() } catch {}
                 $seriesName = if ($masterMap.ContainsKey($sCode)) { $masterMap[$sCode] } else { $sCode }
@@ -2094,6 +2125,7 @@ function Get-Vouchers {
                     vchSeries = $seriesName
                     date = $strDate
                     party = $partyName
+                    matCentre = $toCenterName
                     debitAccount = "—"
                     creditAccount = "—"
                     voucherType = $typeName
@@ -2171,27 +2203,18 @@ function Get-Vouchers {
                 if ($null -ne $mRst) { try { $mRst.Close() } catch {} }
             } catch {}
 
+            # 2. Build Where Filter (Using culture-insensitive parser with hash '#' marks for Access)
             $where = "VchType = $VchType"
             if ($From -ne "") {
-                try {
-                    $fromDate = [datetime]::ParseExact($From, "dd-MM-yyyy", $null).ToString("MM/dd/yyyy")
-                    $where += " AND [Date] >= #$fromDate#"
-                } catch {
-                    try {
-                        $fromDate = [datetime]::Parse($From).ToString("MM/dd/yyyy")
-                        $where += " AND [Date] >= #$fromDate#"
-                    } catch {}
+                $dFrom = Safe-ParseDate -dateStr $From
+                if ($null -ne $dFrom) {
+                    $where += " AND [Date] >= #$($dFrom.ToString('yyyy-MM-dd'))#"
                 }
             }
             if ($To -ne "") {
-                try {
-                    $toDate = [datetime]::ParseExact($To, "dd-MM-yyyy", $null).ToString("MM/dd/yyyy")
-                    $where += " AND [Date] <= #$toDate#"
-                } catch {
-                    try {
-                        $toDate = [datetime]::Parse($To).ToString("MM/dd/yyyy")
-                        $where += " AND [Date] <= #$toDate#"
-                    } catch {}
+                $dTo = Safe-ParseDate -dateStr $To
+                if ($null -ne $dTo) {
+                    $where += " AND [Date] <= #$($dTo.ToString('yyyy-MM-dd'))#"
                 }
             }
             if ($Party -ne "") {
@@ -2268,6 +2291,13 @@ function Get-Vouchers {
                             if ($v -ne [System.DBNull]::Value -and $null -ne $v) { $pCode = $v.ToString().Trim() }
                         } catch {}
                         $partyName = if ($masterMap.ContainsKey($pCode)) { $masterMap[$pCode] } else { $pCode }
+
+                        $p2Code = ""
+                        try {
+                            $v2 = $rst.Fields.Item("MasterCode2").Value
+                            if ($v2 -ne [System.DBNull]::Value -and $null -ne $v2) { $p2Code = $v2.ToString().Trim() }
+                        } catch {}
+                        $toCenterName = if ($masterMap.ContainsKey($p2Code)) { $masterMap[$p2Code] } else { $p2Code }
                     }
 
                     $sCode = ""
@@ -2309,6 +2339,7 @@ function Get-Vouchers {
                         vchSeries = $seriesName
                         date = $strDate
                         party = $partyName
+                        matCentre = $toCenterName
                         debitAccount = if ($debitAcc -ne "") { $debitAcc } else { "—" }
                         creditAccount = if ($creditAcc -ne "") { $creditAcc } else { "—" }
                         voucherType = $typeName
@@ -2688,25 +2719,25 @@ function Get-VoucherDetail {
             if ($null -ne $conn) { try { $conn.Close() } catch {} }
         }
 
-        $optionalFields = @{}
-        try {
-            if ($root.VchOtherInfoDetails.OFInfo) {
-                $ofNode = $root.VchOtherInfoDetails.OFInfo
-                for ($i = 1; $i -le 20; $i++) {
-                    $nodeName = "OF$i"
-                    if ($ofNode.$nodeName) {
-                        $val = ([string]$ofNode.$nodeName).Trim()
-                        if ($val -ne "") {
-                            # AUTOMATIC DATE HYDRATOR: Reformat dd-MM-yyyy back to yyyy-MM-dd for HTML5 inputs
-                            if ($val -match "^(\d{2})-(\d{2})-(\d{4})$") {
-                                $val = "$($Matches[3])-$($Matches[2])-$($Matches[1])"
+            $optionalFields = @{}
+            try {
+                if ($root.VchOtherInfoDetails.OFInfo) {
+                    $ofNode = $root.VchOtherInfoDetails.OFInfo
+                    for ($i = 1; $i -le 20; $i++) {
+                        $nodeName = "OF$i"
+                        if ($ofNode.$nodeName) {
+                            $val = ([string]$ofNode.$nodeName).Trim()
+                            if ($val -ne "") {
+                                # AUTOMATIC DATE HYDRATOR: Reformat dd-MM-yyyy back to yyyy-MM-dd for HTML5 inputs
+                                if ($val -match "^(\d{2})-(\d{2})-(\d{4})$") {
+                                    $val = "$($Matches[3])-$($Matches[2])-$($Matches[1])"
+                                }
+                                $optionalFields["OptionField$i"] = $val
                             }
-                            $optionalFields["OptionField$i"] = $val
                         }
                     }
                 }
-            }
-        } catch {}
+            } catch {}
 
         return @{
             success = $true

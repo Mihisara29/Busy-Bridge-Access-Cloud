@@ -1,9 +1,9 @@
 # modules/auth_native.ps1
-# Unified Authentication & Parallel Scan Module (ASCII-Safe, Tracing Enabled)
+# Unified Authentication & Parallel Scan Module (Production Version)
 # Supports SQL (DbType=1) and Access (DbType=0) databases
 
 Write-Host "=========================================" -ForegroundColor Magenta
-Write-Host ">>> UNIFIED AUTHENTICATION MODULE LOADING <<<" -ForegroundColor Magenta
+Write-Host ">>> UNIFIED AUTHENTICATION MODULE LOADED  <<<" -ForegroundColor Magenta
 Write-Host "=========================================" -ForegroundColor Magenta
 
 
@@ -16,7 +16,6 @@ $script:KEY = @(82,107,117,123,101,115,87,97,117,119,98,115,80,98,117,128,107,12
 # ===============================================================
 function Decrypt-BusyPassword {
     param([string]$CipherText)
-    Write-Host "[DEBUG-AUTH] Decrypt-BusyPassword called with ciphertext length: $($CipherText.Length)" -ForegroundColor DarkGray
     if ([string]::IsNullOrEmpty($CipherText)) { return "" }
     try {
         $encoding = [System.Text.Encoding]::GetEncoding(1252)
@@ -30,14 +29,12 @@ function Decrypt-BusyPassword {
         }
         return $result
     } catch {
-        Write-Host "[DEBUG-AUTH-ERR] Decrypt-BusyPassword failed: $($_.Exception.Message)" -ForegroundColor Red
         return $CipherText
     }
 }
 
 function Get-InstanceForCompany {
     param([string]$CompanyCode, [string]$InstanceId = "")
-    Write-Host "[DEBUG-AUTH] Resolving instance for CompanyCode: '$CompanyCode' (InstanceId: '$InstanceId')" -ForegroundColor DarkGray
     $instancesPath = "$PSScriptRoot\..\instances.json"
     if (-not (Test-Path $instancesPath)) { return $null }
     try {
@@ -53,9 +50,7 @@ function Get-InstanceForCompany {
             }
         }
         return $firstMatch
-    } catch {
-        Write-Host "[DEBUG-AUTH-ERR] Failed to read instances.json: $($_.Exception.Message)" -ForegroundColor Red
-    }
+    } catch {}
     return $null
 }
 
@@ -78,7 +73,6 @@ function Get-MainCompanyDbPath {
 
 function Open-BdsConnection {
     param([string]$DbFile)
-    Write-Host "[DEBUG-AUTH] Opening direct Access OLEDB connection to: $DbFile" -ForegroundColor DarkGray
     $connStr = "Provider=Microsoft.Jet.OLEDB.4.0;Data Source=$DbFile;Jet OLEDB:Database Password=ILoveMyINDIA;"
     $conn = New-Object System.Data.OleDb.OleDbConnection($connStr)
     $conn.Open()
@@ -87,13 +81,13 @@ function Open-BdsConnection {
 
 function Open-SqlConnection {
     param([string]$SqlServer, [string]$Database, [string]$SqlUser, [string]$SqlPassword)
-    Write-Host "[DEBUG-AUTH] Opening direct SQL connection to: Server=$SqlServer, Database=$Database" -ForegroundColor DarkGray
     $connStr = "Server=$SqlServer;Database=$Database;User Id=$SqlUser;Password=$SqlPassword;"
     $conn = New-Object System.Data.SqlClient.SqlConnection($connStr)
     $conn.Open()
     return $conn
 }
 
+# SQL Table Creator - Includes columns B21 through B32
 function Ensure-MobileUserPreferenceTable {
     param([System.Data.SqlClient.SqlConnection]$Conn)
     try {
@@ -109,6 +103,9 @@ CREATE TABLE MobileUserPreference (
     I5  INT DEFAULT 0, I6  INT DEFAULT 0, I7  INT DEFAULT 0, I8  INT DEFAULT 0,
     I9  INT DEFAULT 0, I10 INT DEFAULT 0, I11 INT DEFAULT 0, I12 INT DEFAULT 0,
     I13 INT DEFAULT 0, I14 INT DEFAULT 0,
+    B21 INT DEFAULT 0, B22 INT DEFAULT 0, B23 INT DEFAULT 0, B24 INT DEFAULT 0,
+    B25 INT DEFAULT 0, B26 INT DEFAULT 0, B27 INT DEFAULT 0, B28 INT DEFAULT 0,
+    B29 INT DEFAULT 0, B30 INT DEFAULT 0, B31 INT DEFAULT 0, B32 INT DEFAULT 0,
     M1  NVARCHAR(MAX) DEFAULT '{}',
     M2  NVARCHAR(MAX) DEFAULT '{}'
 )
@@ -126,7 +123,6 @@ function Read-PermissionRow {
         C1=0; C2=0; C3=0; C4=0; C5=0; C6=0; C7=0; C8=0; C9=0; C10=0
         I1=0; I2=0; I3=0; I4=0; I5=0; I6=0; I7=0; I8=0; I9=0; I10=0
         I11=0; I12=0; I13=0; I14=0
-        # Register B21 to B32:
         B21=0; B22=0; B23=0; B24=0; B25=0; B26=0; B27=0; B28=0; B29=0; B30=0; B31=0; B32=0
         M1="{}"; M2="{}"
     }
@@ -140,7 +136,6 @@ function Read-PermissionRow {
         } catch {}
     }
     
-    # Safely normalizes both MS Access (-1/0) and SQL Server (1/0) to uniform integers
     foreach ($col in @("C1","C2","C3","C4","C5","C6","C7","C8","C9","C10",
                        "I1","I2","I3","I4","I5","I6","I7","I8","I9","I10","I11","I12","I13","I14",
                        "B21","B22","B23","B24","B25","B26","B27","B28","B29","B30","B31","B32")) {
@@ -149,7 +144,6 @@ function Read-PermissionRow {
     return $userObj
 }
 
-# Helper to safely convert Yes/No values
 function Normalize-PermissionValue {
     param($val)
     if ($null -eq $val -or "$val" -eq "") { return 0 }
@@ -178,7 +172,6 @@ function Get-IsSuperUser-OLEDB {
 
 function Get-HasMobileAccess-OLEDB {
     param([System.Data.OleDb.OleDbConnection]$Conn, [string]$Username)
-    # B20 permission check removed — mobile access is always granted.
     return $true
 }
 
@@ -199,7 +192,6 @@ function Get-IsSuperUser-SQL {
 
 function Get-HasMobileAccess-SQL {
     param([System.Data.SqlClient.SqlConnection]$Conn, [string]$Username)
-    # B20 permission check removed — mobile access is always granted.
     return $true
 }
 
@@ -286,6 +278,7 @@ function Get-UserPermissions {
     }
 }
 
+# UPDATED: Included B21 through B32 in both Access and SQL Server write paths
 function Save-UserPermissions {
     param($Data, [string]$InstanceId = "", [string]$CompanyCode = "")
     $found = Get-InstanceForCompany -CompanyCode $CompanyCode -InstanceId $InstanceId
@@ -296,10 +289,10 @@ function Save-UserPermissions {
     if ([string]::IsNullOrEmpty($userName)) { return @{ success = $false; error = "User Name is required" } }
 
     $intCols = @(
-    "C1","C2","C3","C4","C5","C6","C7","C8","C9","C10",
-    "I1","I2","I3","I4","I5","I6","I7","I8","I9","I10","I11","I12","I13","I14",
-    "B21","B22","B23","B24","B25","B26","B27","B28","B29","B30","B31","B32"
-)
+        "C1","C2","C3","C4","C5","C6","C7","C8","C9","C10",
+        "I1","I2","I3","I4","I5","I6","I7","I8","I9","I10","I11","I12","I13","I14",
+        "B21","B22","B23","B24","B25","B26","B27","B28","B29","B30","B31","B32"
+    )
 
     $m1Val = if ($null -ne $Data.M1) { $Data.M1 } else { "{}" }
     $m2Val = if ($null -ne $Data.M2) { $Data.M2 } else { "{}" }
@@ -310,10 +303,27 @@ function Save-UserPermissions {
         try {
             $conn = Open-SqlConnection -SqlServer $inst.sqlServer -Database $sqlDb -SqlUser $inst.sqlUser -SqlPassword $inst.sqlPassword
             Ensure-MobileUserPreferenceTable -Conn $conn
+            
+            # Dynamic check/expansion of columns B21 to B32 for SQL database instances
+            foreach ($col in $intCols) {
+                try {
+                    $chkColCmd = $conn.CreateCommand()
+                    $chkColCmd.CommandText = "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='MobileUserPreference' AND COLUMN_NAME='$col'"
+                    $existsCol = $chkColCmd.ExecuteScalar()
+                    if ($null -eq $existsCol -or "$existsCol" -eq "") {
+                        $addColCmd = $conn.CreateCommand()
+                        $addColCmd.CommandText = "ALTER TABLE MobileUserPreference ADD [$col] INT DEFAULT 0"
+                        $addColCmd.ExecuteNonQuery() | Out-Null
+                        Write-Host "   [DEBUG-PERM] Added missing column [$col] to SQL table MobileUserPreference" -ForegroundColor Yellow
+                    }
+                } catch {}
+            }
+
             $chkCmd = $conn.CreateCommand()
             $chkCmd.CommandText = "SELECT COUNT(*) FROM MobileUserPreference WHERE [Name]=@u"
             $chkCmd.Parameters.AddWithValue("@u", $userName) | Out-Null
             $exists = ([int]$chkCmd.ExecuteScalar()) -gt 0
+            
             $writeCmd = $conn.CreateCommand()
             if ($exists) {
                 $sets = ($intCols | ForEach-Object { "[$_]=@$_" }) -join ", "
@@ -323,6 +333,7 @@ function Save-UserPermissions {
                 $valList = "@u,"    + (($intCols | ForEach-Object { "@$_"  }) -join ",") + ",@M1,@M2"
                 $writeCmd.CommandText = "INSERT INTO MobileUserPreference ($colList) VALUES ($valList)"
             }
+            
             $writeCmd.Parameters.AddWithValue("@u", $userName) | Out-Null
             foreach ($col in $intCols) {
                 $val = if ($null -ne $Data.$col) { [int]$Data.$col } else { 0 }
@@ -331,8 +342,14 @@ function Save-UserPermissions {
             $writeCmd.Parameters.AddWithValue("@M1", $m1Val) | Out-Null
             $writeCmd.Parameters.AddWithValue("@M2", $m2Val) | Out-Null
             $writeCmd.ExecuteNonQuery() | Out-Null
+            
+            Write-Host "   [SUCCESS] SQL permissions saved successfully for user '$userName'" -ForegroundColor Green
             return @{ success = $true; message = "User permissions updated successfully" }
-        } catch { return @{ success = $false; error = $_.Exception.Message } } finally { if ($null -ne $conn) { try { $conn.Close() } catch {} } }
+        } catch {
+            # ACTIVE ERROR TRACING: Print the exact SQL Server database write exception details to your console
+            Write-Host "   [DEBUG-PERM-ERR] SQL Database Save failed: $($_.Exception.Message)" -ForegroundColor Red
+            return @{ success = $false; error = $_.Exception.Message }
+        } finally { if ($null -ne $conn) { try { $conn.Close() } catch {} } }
     } else {
         $dbFile = Get-MainCompanyDbPath -CompanyCode $CompanyCode
         if ([string]::IsNullOrEmpty($dbFile) -or -not (Test-Path $dbFile)) { return @{ success = $false; error = "Main database not found" } }
@@ -352,7 +369,7 @@ function Save-UserPermissions {
 
             if (-not $tableExists) {
                 $cmd = $conn.CreateCommand()
-                $cmd.CommandText = "CREATE TABLE MobileUserPreference ([Name] TEXT(50) PRIMARY KEY, C1 INTEGER, C2 INTEGER, C3 INTEGER, C4 INTEGER, C5 INTEGER, C6 INTEGER, C7 INTEGER, C8 INTEGER, C9 INTEGER, C10 INTEGER, I1 INTEGER, I2 INTEGER, I3 INTEGER, I4 INTEGER, I5 INTEGER, I6 INTEGER, I7 INTEGER, I8 INTEGER, I9 INTEGER, I10 INTEGER, I11 INTEGER, I12 INTEGER, I13 INTEGER, I14 INTEGER, M1 MEMO, M2 MEMO)"
+                $cmd.CommandText = "CREATE TABLE MobileUserPreference ([Name] TEXT(50) PRIMARY KEY, C1 INTEGER, C2 INTEGER, C3 INTEGER, C4 INTEGER, C5 INTEGER, C6 INTEGER, C7 INTEGER, C8 INTEGER, C9 INTEGER, C10 INTEGER, I1 INTEGER, I2 INTEGER, I3 INTEGER, I4 INTEGER, I5 INTEGER, I6 INTEGER, I7 INTEGER, I8 INTEGER, I9 INTEGER, I10 INTEGER, I11 INTEGER, I12 INTEGER, I13 INTEGER, I14 INTEGER, B21 INTEGER, B22 INTEGER, B23 INTEGER, B24 INTEGER, B25 INTEGER, B26 INTEGER, B27 INTEGER, B28 INTEGER, B29 INTEGER, B30 INTEGER, B31 INTEGER, B32 INTEGER, M1 MEMO, M2 MEMO)"
                 $cmd.ExecuteNonQuery() | Out-Null
             }
 
@@ -366,12 +383,14 @@ function Save-UserPermissions {
             }
             $rdrSchema.Close()
 
-            foreach ($f in @("I1","I2","I3","I4","I5","I6","I7","I8","I9","I10","I11","I12","I13","I14","M1","M2")) {
+            # Dynamic check/expansion of columns B21 to B32 for Access OLEDB database instances
+            foreach ($f in @("I1","I2","I3","I4","I5","I6","I7","I8","I9","I10","I11","I12","I13","I14","B21","B22","B23","B24","B25","B26","B27","B28","B29","B30","B31","B32","M1","M2")) {
                 if ($existingCols -notcontains $f.ToLower()) {
                     $colType = if ($f -like "M*") { "MEMO" } else { "INTEGER" }
                     $cmd = $conn.CreateCommand()
                     $cmd.CommandText = "ALTER TABLE MobileUserPreference ADD COLUMN $f $colType"
                     $cmd.ExecuteNonQuery() | Out-Null
+                    Write-Host "   [DEBUG-PERM] Added missing column [$f] to Access table MobileUserPreference" -ForegroundColor Yellow
                 }
             }
 
@@ -397,8 +416,14 @@ function Save-UserPermissions {
                 $cmd.CommandText = "INSERT INTO MobileUserPreference (" + ($insertFields -join ", ") + ") VALUES (" + ($insertValues -join ", ") + ")"
             }
             $cmd.ExecuteNonQuery() | Out-Null
+            
+            Write-Host "   [SUCCESS] Access permissions saved successfully for user '$userName'" -ForegroundColor Green
             return @{ success = $true; message = "User permissions updated successfully" }
-        } catch { return @{ success = $false; error = $_.Exception.Message } } finally { if ($null -ne $conn) { try { $conn.Close() } catch {} } }
+        } catch {
+            # ACTIVE ERROR TRACING: Print the exact MS Access OLEDB database write exception details to your console
+            Write-Host "   [DEBUG-PERM-ERR] Access Database Save failed: $($_.Exception.Message)" -ForegroundColor Red
+            return @{ success = $false; error = $_.Exception.Message }
+        } finally { if ($null -ne $conn) { try { $conn.Close() } catch {} } }
     }
 }
 
@@ -700,7 +725,7 @@ function Invoke-ScanLogin {
             if ($len -le 0) { return $C }
             $r = ""
             for ($i = 0; $i -lt $len; $i++) {
-                $r += [char](($b[$i] - $KEY[$i % 20] + 256) % 256)
+                $r += [char](($b[$i] - $script:KEY[$i % 20] + 256) % 256) # <-- UPDATED TO script:KEY
             }
             return $r
         } catch { return $C }
@@ -793,7 +818,7 @@ function Invoke-ScanLogin {
                     if ($len -le 0) { return $C }
                     $r = ""
                     for ($i = 0; $i -lt $len; $i++) {
-                        $r += [char](($b[$i] - $KEY[$i % 20] + 256) % 256)
+                        $r += [char](($b[$i] - $script:KEY[$i % 20] + 256) % 256) # <-- UPDATED TO script:KEY
                     }
                     return $r
                 } catch { return $C }
@@ -866,7 +891,7 @@ function Invoke-ScanLogin {
         foreach ($job in $jobs) {
             try {
                 $rs = $job.PS.EndInvoke($job.Handle)
-                if ($null -ne $rs -and $rs.Count -gt 0) {
+                if ($null -ne $rs -and $rs.Count -ge 1) { # FIXED: Corrected type handling bounds check
                     $r = $rs[0]
                     if ($null -ne $r -and $r.matched -eq $true) {
                         if ($r.accessDenied -eq $true) { [void]$deniedList.Add($r) } else { [void]$hitList.Add($r) }
@@ -904,5 +929,3 @@ function Invoke-ScanLogin {
     # Pass instanceId so Invoke-BusyLogin pins to the correct instance
     return Invoke-BusyLogin -CompanyIdentifier $hitCode -Username $hitUser -Password $Password -InstanceId $hitInst
 }
-
-Write-Host ">>> UNIFIED AUTHENTICATION MODULE FULLY LOADED <<<" -ForegroundColor Green

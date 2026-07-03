@@ -170,9 +170,14 @@ function Disconnect-BUSY {
 function Get-DirectConnection {
     param([string]$InstanceId, [string]$CompanyCode)
     
+    Write-Host "   [DEBUG-DIRECT-CONN] Initializing direct connection builder..." -ForegroundColor Cyan
+    Write-Host "     InstanceId  : '$InstanceId'" -ForegroundColor Cyan
+    Write-Host "     CompanyCode : '$CompanyCode'" -ForegroundColor Cyan
+    
     $instance = Get-InstanceConfig -InstanceId $InstanceId
     $dbType = 0
     if ($null -ne $instance -and $null -ne $instance.dbType) { $dbType = [int]$instance.dbType }
+    Write-Host "     Resolved DbType: $dbType (0=Access, 1=SQL)" -ForegroundColor Cyan
 
     if ($dbType -eq 1) {
         # SQL Server Mode
@@ -183,40 +188,55 @@ function Get-DirectConnection {
         # Base parent database name (e.g. BusyComp0001_db)
         $baseDbName = Get-SqlDatabaseName -CompanyCode $CompanyCode -InstanceId $InstanceId
         $dbName = $baseDbName
+        Write-Host "     Base Database Name resolved: '$baseDbName'" -ForegroundColor Cyan
 
-        # Dynamic year-specific database resolution with COM retry loop
+        # Establish active COM connection to resolve year database if null or company mismatch
+        if ($null -eq $script:ActiveConnection -or $script:ActiveCompanyCode.ToLower() -ne $CompanyCode.ToLower()) {
+            Write-Host "     Active COM connection is missing or mismatched. Triggering Connect-BUSY..." -ForegroundColor DarkCyan
+            $null = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
+        }
+
+        # Dynamic year-specific database resolution with COM query
+        $resolvedYearDb = $false
         if ($script:ActiveConnection -ne $null -and $script:ActiveCompanyCode.ToLower() -eq $CompanyCode.ToLower()) {
             $retryDbCount = 0
-            $resolvedYearDb = $false
-            
             while ($retryDbCount -lt 6 -and -not $resolvedYearDb) {
                 try {
+                    Write-Host "     Attempting COM ActiveDB query (Attempt $($retryDbCount+1)/6)..." -ForegroundColor DarkCyan
                     $dbNameRst = $script:ActiveConnection.GetRecordset("SELECT DB_NAME() AS ActiveDB")
                     if ($dbNameRst -and -not $dbNameRst.EOF) {
                         $activeDbVal = $dbNameRst.Fields.Item("ActiveDB").Value
                         if ($null -ne $activeDbVal -and $activeDbVal -ne [System.DBNull]::Value) {
                             $tempDb = $activeDbVal.ToString().Trim()
-                            if ($tempDb -ne $baseDbName) {
+                            if ($tempDb -ne "") {
+                                # --- FIXED: Trust what DB_NAME() says and avoid bypassing if it equals the base name ---
                                 $dbName = $tempDb
                                 $resolvedYearDb = $true
+                                Write-Host "     [SUCCESS] COM resolved active database name: '$dbName'" -ForegroundColor Green
                             }
                         }
                         $dbNameRst.Close()
                     }
-                } catch {}
+                } catch {
+                    Write-Host "     [WARN] COM database query failed: $($_.Exception.Message)" -ForegroundColor Yellow
+                }
                 
                 if (-not $resolvedYearDb) {
                     $retryDbCount++
                     Start-Sleep -Milliseconds 500
                 }
             }
+        } else {
+            Write-Host "     [WARN] Active COM connection could not be established." -ForegroundColor Yellow
         }
 
-        # Double-Layer Protection: Financial Year Estimation fallback
-        if ($dbName -eq $baseDbName) {
+        # Fallback Estimation ONLY if COM query completely failed
+        if (-not $resolvedYearDb) {
+            Write-Host "     COM resolution failed. Entering fallback estimation mode..." -ForegroundColor DarkYellow
             $currentYear = (Get-Date).Year
             if ((Get-Date).Month -lt 4) { $currentYear = $currentYear - 1 }
             $estimatedDb = $baseDbName + "1" + $currentYear
+            Write-Host "     Estimated Fallback Database Target: '$estimatedDb'" -ForegroundColor DarkYellow
             
             $testConn = $null
             try {
@@ -224,15 +244,17 @@ function Get-DirectConnection {
                 $testConn = New-Object System.Data.SqlClient.SqlConnection($testConnStr)
                 $testConn.Open()
                 $dbName = $estimatedDb
-                Write-Host "  [DEBUG-DIRECT-CONN] Resolved year database via estimation: $dbName" -ForegroundColor Green
+                $resolvedYearDb = $true
+                Write-Host "     [SUCCESS] Fallback connection to '$estimatedDb' opened successfully!" -ForegroundColor Green
             } catch {
+                Write-Host "     [WARN] Fallback estimation to '$estimatedDb' failed: $($_.Exception.Message). Defaulting to base DB." -ForegroundColor Yellow
                 $dbName = $baseDbName
             } finally {
                 if ($null -ne $testConn) { try { $testConn.Close() } catch {} }
             }
         }
 
-        Write-Host "  [DEBUG-DIRECT-CONN] Final Resolved SQL Database: $dbName" -ForegroundColor Green
+        Write-Host "   [DEBUG-DIRECT-CONN] Final Resolved Database to Open: '$dbName'" -ForegroundColor Green
 
         $connStr = "Server=$sqlServer;Database=$dbName;User Id=$sqlUser;Password=$sqlPassword;"
         $conn = New-Object System.Data.SqlClient.SqlConnection($connStr)
@@ -245,13 +267,15 @@ function Get-DirectConnection {
         }
     } else {
         # MS Access Mode
+        Write-Host "     Building Access OLEDB connection..." -ForegroundColor Cyan
         $dbFile = Get-MainCompanyDbPath -CompanyCode $CompanyCode
         if ([string]::IsNullOrEmpty($dbFile) -or -not (Test-Path $dbFile)) {
+            Write-Host "     [ERROR] Main db.bds file not found for path: '$dbFile'" -ForegroundColor Red
             return $null
         }
         $connStr = "Provider=Microsoft.Jet.OLEDB.4.0;Data Source=$dbFile;Jet OLEDB:Database Password=ILoveMyINDIA;"
         $conn = New-Object System.Data.OleDb.OleDbConnection($connStr)
-        
+        Write-Host "     [SUCCESS] Access connection built." -ForegroundColor Green
         return @{
             type       = "Access"
             dbType     = 0
