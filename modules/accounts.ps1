@@ -293,11 +293,11 @@ function Get-Accounts {
     if (-not $fi) { return @{ success = $false; error = "BUSY connection failed" } }
 
     try {
-        # Dynamically set the wildcard string based on dbType (SQL Server or ADODB standard both use %)
+        # Dynamically set the wildcard string based on dbType
         $targetInst = Get-InstanceConfig -InstanceId $InstanceId
         $dbType = 0
         if ($null -ne $targetInst -and $null -ne $targetInst.dbType) { $dbType = [int]$targetInst.dbType }
-        $wildcard = if ($dbType -eq 1) { "%" } else { "%" } # ADODB OLEDB standard uses %
+        $wildcard = if ($dbType -eq 1) { "%" } else { "*" }
 
         # Build dynamic MS Access WHERE filter block
         $where = "Master1.MasterType = 2"
@@ -544,10 +544,10 @@ function Get-Parties {
     if (-not $fi) { return @{ success = $false; error = "BUSY connection failed" } }
     try {
         # Dynamically set the wildcard string based on dbType
-        $targetInst = Get-InstanceConfig -InstanceId $InstanceId
-        $dbType = 0
-        if ($null -ne $targetInst -and $null -ne $targetInst.dbType) { $dbType = [int]$targetInst.dbType }
-        $wildcard = if ($dbType -eq 1) { "%" } else { "%" }
+$targetInst = Get-InstanceConfig -InstanceId $InstanceId
+$dbType = 0
+if ($null -ne $targetInst -and $null -ne $targetInst.dbType) { $dbType = [int]$targetInst.dbType }
+$wildcard = if ($dbType -eq 1) { "%" } else { "*" }
 
         $where = "Master1.MasterType = 2"
         
