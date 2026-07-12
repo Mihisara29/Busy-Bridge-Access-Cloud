@@ -2,11 +2,6 @@
 # Unified Authentication & Parallel Scan Module (Production Version)
 # Supports SQL (DbType=1) and Access (DbType=0) databases
 
-Write-Host "=========================================" -ForegroundColor Magenta
-Write-Host ">>> UNIFIED AUTHENTICATION MODULE LOADED  <<<" -ForegroundColor Magenta
-Write-Host "=========================================" -ForegroundColor Magenta
-
-
 $script:_authCache = @{}
 $script:_AUTH_CACHE_TTL = 86400
 $script:KEY = @(82,107,117,123,101,115,87,97,117,119,98,115,80,98,117,128,107,121,86,100)
@@ -103,6 +98,8 @@ CREATE TABLE MobileUserPreference (
     I5  INT DEFAULT 0, I6  INT DEFAULT 0, I7  INT DEFAULT 0, I8  INT DEFAULT 0,
     I9  INT DEFAULT 0, I10 INT DEFAULT 0, I11 INT DEFAULT 0, I12 INT DEFAULT 0,
     I13 INT DEFAULT 0, I14 INT DEFAULT 0,
+    I15 INT DEFAULT 0, I16 INT DEFAULT 0, I17 INT DEFAULT 0, I18 INT DEFAULT 0,
+    I19 INT DEFAULT 0, I20 INT DEFAULT 0,
     B21 INT DEFAULT 0, B22 INT DEFAULT 0, B23 INT DEFAULT 0, B24 INT DEFAULT 0,
     B25 INT DEFAULT 0, B26 INT DEFAULT 0, B27 INT DEFAULT 0, B28 INT DEFAULT 0,
     B29 INT DEFAULT 0, B30 INT DEFAULT 0, B31 INT DEFAULT 0, B32 INT DEFAULT 0,
@@ -123,6 +120,7 @@ function Read-PermissionRow {
         C1=0; C2=0; C3=0; C4=0; C5=0; C6=0; C7=0; C8=0; C9=0; C10=0
         I1=0; I2=0; I3=0; I4=0; I5=0; I6=0; I7=0; I8=0; I9=0; I10=0
         I11=0; I12=0; I13=0; I14=0
+        I15=0; I16=0; I17=0; I18=0; I19=0; I20=0
         B21=0; B22=0; B23=0; B24=0; B25=0; B26=0; B27=0; B28=0; B29=0; B30=0; B31=0; B32=0
         M1="{}"; M2="{}"
     }
@@ -138,6 +136,7 @@ function Read-PermissionRow {
     
     foreach ($col in @("C1","C2","C3","C4","C5","C6","C7","C8","C9","C10",
                        "I1","I2","I3","I4","I5","I6","I7","I8","I9","I10","I11","I12","I13","I14",
+                       "I15","I16","I17","I18","I19","I20",
                        "B21","B22","B23","B24","B25","B26","B27","B28","B29","B30","B31","B32")) {
         $userObj[$col] = Normalize-PermissionValue $userObj[$col]
     }
@@ -291,6 +290,7 @@ function Save-UserPermissions {
     $intCols = @(
         "C1","C2","C3","C4","C5","C6","C7","C8","C9","C10",
         "I1","I2","I3","I4","I5","I6","I7","I8","I9","I10","I11","I12","I13","I14",
+        "I15","I16","I17","I18","I19","I20",
         "B21","B22","B23","B24","B25","B26","B27","B28","B29","B30","B31","B32"
     )
 
@@ -384,7 +384,7 @@ function Save-UserPermissions {
             $rdrSchema.Close()
 
             # Dynamic check/expansion of columns B21 to B32 for Access OLEDB database instances
-            foreach ($f in @("I1","I2","I3","I4","I5","I6","I7","I8","I9","I10","I11","I12","I13","I14","B21","B22","B23","B24","B25","B26","B27","B28","B29","B30","B31","B32","M1","M2")) {
+            foreach ($f in @("I1","I2","I3","I4","I5","I6","I7","I8","I9","I10","I11","I12","I13","I14","I15","I16","I17","I18","I19","I20","B21","B22","B23","B24","B25","B26","B27","B28","B29","B30","B31","B32","M1","M2")) {
                 if ($existingCols -notcontains $f.ToLower()) {
                     $colType = if ($f -like "M*") { "MEMO" } else { "INTEGER" }
                     $cmd = $conn.CreateCommand()
@@ -580,9 +580,9 @@ function Invoke-BusyLogin {
 # default; everyone else must be granted access explicitly via
 # MobileUserPreference (set by an admin on the Permissions page).
 if ($assignedRole -eq "superadmin") {
-    $permissions = @{ name = $matchedUser; C1=1;C2=1;C3=1;C4=1;C5=1;C6=1;C7=1;C8=1;C9=1;C10=1;I1=1;I2=1;I3=1;I4=1;I5=1;I6=1;I7=1;I8=1;I9=1;I10=1;I11=1;I12=1;I13=1;I14=1;M1="{}"; M2="{}" }
+    $permissions = @{ name = $matchedUser; C1=1;C2=1;C3=1;C4=1;C5=1;C6=1;C7=1;C8=1;C9=1;C10=1;I1=1;I2=1;I3=1;I4=1;I5=1;I6=1;I7=1;I8=1;I9=1;I10=1;I11=1;I12=1;I13=1;I14=1;I15=1;I16=1;I17=1;I18=1;I19=1;I20=1;M1="{}"; M2="{}" }
 } else {
-    $permissions = @{ name = $matchedUser; C1=0;C2=0;C3=0;C4=0;C5=0;C6=0;C7=0;C8=0;C9=0;C10=0;I1=0;I2=0;I3=0;I4=0;I5=0;I6=0;I7=0;I8=0;I9=0;I10=0;I11=0;I12=0;I13=0;I14=0;M1="{}"; M2="{}" }
+    $permissions = @{ name = $matchedUser; C1=0;C2=0;C3=0;C4=0;C5=0;C6=0;C7=0;C8=0;C9=0;C10=0;I1=0;I2=0;I3=0;I4=0;I5=0;I6=0;I7=0;I8=0;I9=0;I10=0;I11=0;I12=0;I13=0;I14=0;I15=0;I16=0;I17=0;I18=0;I19=0;I20=0;M1="{}"; M2="{}" }
 }
 
 if ($assignedRole -ne "superadmin") {

@@ -24,6 +24,7 @@ $script:VoucherConfig = @{
     16 = @{ xmlRoot = "Journal";        hasBillNo = $false; isAccounting = $true;  requiredKeys = @("vchSeries","date","accounts") }
     19 = @{ xmlRoot = "Payment";        hasBillNo = $false; isAccounting = $true;  requiredKeys = @("vchSeries","date","accounts") }
     5  = @{ xmlRoot = "StockTransfer";  typeField = "VchSeriesName"; typeDataKey = "vchSeries"; hasBillNo = $false; isAccounting = $false; requiredKeys = @("vchSeries","date","party","items") }
+    8  = @{ xmlRoot = "StockJournal";   typeField = "VchSeriesName"; typeDataKey = "vchSeries"; hasBillNo = $false; isAccounting = $false; requiredKeys = @("vchSeries","date","party","items") }
 }
 
 function Safe-ParseDate {
@@ -520,6 +521,10 @@ function Build-ItemsXml {
         $xml += "<ItemDetail>"
         $xml += "<SrNo>$($item.srNo)</SrNo>"
         $xml += "<ItemName>$([System.Security.SecurityElement]::Escape($item.itemName))</ItemName>"
+         # Inject ItemType inside ItemDetail for Stock Journal transactions
+        if ($item.itemType) {
+            $xml += "<ItemType>$($item.itemType)</ItemType>"
+        }
         $xml += "<UnitName>$([System.Security.SecurityElement]::Escape($item.unit))</UnitName>"
         $xml += "<Qty>$qtyOut</Qty>"
         $xml += "<QtyMainUnit>$qtyMain</QtyMainUnit>"
@@ -556,6 +561,187 @@ function Build-ItemsXml {
         $xml += "</ItemDetail>"
     }
     $xml += "</ItemEntries>"
+
+    return $xml
+}
+
+function Build-ConsumedItemsXml {
+    param(
+        $items,
+        [string]$defaultMC = "Main Store"
+    )
+
+    # IMPORTANT:
+    # BUSY Stock Journal consumed section is ItemEntries1, not ConsumedItemEntries.
+    $xml = "<ItemEntries1>"
+
+    foreach ($item in @($items)) {
+        if (-not $item.itemName -or [string]::IsNullOrWhiteSpace([string]$item.itemName)) {
+            continue
+        }
+
+        $mc = if ($item.mc -and -not [string]::IsNullOrWhiteSpace([string]$item.mc)) {
+            [string]$item.mc
+        } else {
+            $defaultMC
+        }
+
+        $conFactor = 1.0
+        try {
+            if ($item.conFactor -and [double]$item.conFactor -ne 0) {
+                $conFactor = [double]$item.conFactor
+            }
+        } catch {}
+
+        $altQtyConFactor = $conFactor
+        try {
+            if ($item.altQtyConFactor -and [double]$item.altQtyConFactor -ne 0) {
+                $altQtyConFactor = [double]$item.altQtyConFactor
+            }
+        } catch {}
+
+        $conType = 1
+        try {
+            if ($item.conType) {
+                $conType = [int]$item.conType
+            }
+        } catch {}
+
+        $qty = 0.0
+        $price = 0.0
+        $amt = 0.0
+        $altPrice = 0.0
+
+        try { $qty = [double]$item.qty } catch {}
+        try { $price = [double]$item.price } catch {}
+        try { $amt = [double]$item.amount } catch {}
+        try {
+            if ($item.altPrice) {
+                $altPrice = [double]$item.altPrice
+            }
+        } catch {}
+
+        $enteredInAltUnit = $false
+        try {
+            $enteredInAltUnit =
+                ($item.enteredInAltUnit -eq $true) -or
+                ($item.altUnit -and [string]$item.unit -eq [string]$item.altUnit)
+        } catch {}
+
+        if ($enteredInAltUnit) {
+            $qtyAlt = $qty
+            $qtyMain = if ($altQtyConFactor -ne 0) {
+                [Math]::Round($qtyAlt / $altQtyConFactor, 3)
+            } else {
+                $qty
+            }
+            $qtyOut = $qtyMain
+        } else {
+            $qtyMain = $qty
+            $qtyAlt = [Math]::Round($qty * $altQtyConFactor, 3)
+            $qtyOut = $qtyMain
+        }
+
+        $sendAltPrice = $false
+
+        if ($enteredInAltUnit -and $conType -eq 1) {
+            if ($altPrice -ne 0) {
+                $amt = [Math]::Round($qtyAlt * $altPrice, 2)
+                $price = if ($qtyMain -ne 0) {
+                    [Math]::Round($amt / $qtyMain, 2)
+                } else {
+                    0
+                }
+            }
+            $sendAltPrice = $true
+        }
+        elseif (-not $enteredInAltUnit -and $conType -eq 1) {
+            if ($price -ne 0) {
+                $amt = [Math]::Round($qtyMain * $price, 2)
+            }
+            $altPrice = 0
+            $sendAltPrice = $false
+        }
+        elseif ($conType -eq 2) {
+            if ($price -ne 0) {
+                $amt = [Math]::Round($qtyOut * $price, 2)
+            }
+            $sendAltPrice = ($altPrice -ne 0)
+        }
+
+        $listPrice = $price
+        $discType = "U"
+        $discVal = 0.0
+
+        try {
+            if ($item.listPrice) {
+                $listPrice = [double]$item.listPrice
+            }
+        } catch {}
+
+        try {
+            if ($item.discType) {
+                $discType = [string]$item.discType
+            }
+        } catch {}
+
+        try {
+            if ($item.discVal) {
+                $discVal = [double]$item.discVal
+            }
+        } catch {}
+
+        $srNo = 1
+        try {
+            if ($item.srNo) {
+                $srNo = [int]$item.srNo
+            }
+        } catch {}
+
+        $xml += "<ItemDetail>"
+        $xml += "<SrNo>$srNo</SrNo>"
+        $xml += "<ItemName>$([System.Security.SecurityElement]::Escape([string]$item.itemName))</ItemName>"
+        $xml += "<ItemType>2</ItemType>"
+        $xml += "<UnitName>$([System.Security.SecurityElement]::Escape([string]$item.unit))</UnitName>"
+        $xml += "<Qty>$qtyOut</Qty>"
+        $xml += "<QtyMainUnit>$qtyMain</QtyMainUnit>"
+
+        if ($item.altUnit -and [string]$item.altUnit -ne "") {
+            $xml += "<AltUnitName>$([System.Security.SecurityElement]::Escape([string]$item.altUnit))</AltUnitName>"
+            $xml += "<ConFactor>$conFactor</ConFactor>"
+            $xml += "<AltQtyConFactor>$altQtyConFactor</AltQtyConFactor>"
+            $xml += "<ConFactorType>$conType</ConFactorType>"
+            $xml += "<QtyAltUnit>$qtyAlt</QtyAltUnit>"
+
+            if ($sendAltPrice) {
+                $xml += "<PriceAltUnit>$altPrice</PriceAltUnit>"
+            }
+        } else {
+            $xml += "<QtyAltUnit>$qtyOut</QtyAltUnit>"
+        }
+
+        $xml += "<Price>$price</Price>"
+        $xml += "<Amt>$amt</Amt>"
+        $xml += "<MC>$([System.Security.SecurityElement]::Escape($mc))</MC>"
+
+        if ($discVal -gt 0) {
+            $xml += "<ListPrice>$listPrice</ListPrice>"
+
+            if ($discType -eq "%") {
+                $xml += "<DiscountPercent>$discVal</DiscountPercent>"
+                $discAmt = [Math]::Round($listPrice * $discVal / 100, 2)
+                $xml += "<Discount>$discAmt</Discount>"
+            } else {
+                $xml += "<Discount>$discVal</Discount>"
+            }
+
+            $xml += "<DiscountStructure>Simple Discount, % of Price</DiscountStructure>"
+        }
+
+        $xml += "</ItemDetail>"
+    }
+
+    $xml += "</ItemEntries1>"
 
     return $xml
 }
@@ -953,9 +1139,17 @@ function Build-VoucherXml {
     }
 
     $xml += "<$typeField>$([System.Security.SecurityElement]::Escape($typeValue))</$typeField>"
-    $xml += "<MasterName1>$([System.Security.SecurityElement]::Escape($Data.party))</MasterName1>"
-    $xml += "<MasterName2>$([System.Security.SecurityElement]::Escape($matCentre))</MasterName2>"
-    $xml += "<TranCurName>Rs.</TranCurName>"
+  $xml += "<MasterName1>$([System.Security.SecurityElement]::Escape($Data.party))</MasterName1>"
+$xml += "<MasterName2>$([System.Security.SecurityElement]::Escape($matCentre))</MasterName2>"
+
+# IMPORTANT FOR STOCK JOURNAL:
+# BUSY uses ConMCName for consumed material centre.
+if ($VchType -eq 8) {
+    $xml += "<ConMCName>$([System.Security.SecurityElement]::Escape([string]$Data.party))</ConMCName>"
+}
+
+$xml += "<TranCurName>Rs.</TranCurName>"
+
     $xml += "<InputType>$inputType</InputType>"
     $xml += "<BillingDetails><PartyName>$([System.Security.SecurityElement]::Escape($Data.party))</PartyName></BillingDetails>"
     
@@ -994,7 +1188,31 @@ function Build-VoucherXml {
     $xml += "<Narration1>$([System.Security.SecurityElement]::Escape($narration))</Narration1>"
     $xml += "</VchOtherInfoDetails>"
 
+if ($VchType -eq 8) {
+    # Stock Journal:
+    # ItemEntries  = Items Generated
+    # ItemEntries1 = Items Consumed
+
+    $genItems = @(
+        $Data.items | Where-Object {
+            $null -eq $_.itemType -or [int]$_.itemType -eq 1
+        }
+    )
+
+    $conItems = @(
+        $Data.items | Where-Object {
+            $null -ne $_.itemType -and [int]$_.itemType -eq 2
+        }
+    )
+
+    Write-Host "[StockJournal Save DEBUG] Generated items=$($genItems.Count), Consumed items=$($conItems.Count)" -ForegroundColor Cyan
+    Write-Host "[StockJournal Save DEBUG] Generated MC=$matCentre, Consumed MC=$($Data.party)" -ForegroundColor Cyan
+
+    $xml += Build-ItemsXml -items $genItems -defaultMC $matCentre
+    $xml += Build-ConsumedItemsXml -items $conItems -defaultMC ([string]$Data.party)
+} else {
     $xml += Build-ItemsXml -items $Data.items -defaultMC $matCentre
+}
     $xml += Build-BillSundriesXml -billSundries $Data.billSundries
 
     if (-not $isChallanType) {
@@ -2361,10 +2579,142 @@ function Get-Vouchers {
 
 function Get-VoucherDetail {
     param(
-        [int]$VchType,[string]$VchNo,[string]$VchSeries,
+        [int]$VchType,
+        [string]$VchNo,
+        [string]$VchSeries,
         [string]$VchDate,
-        [string]$InstanceId = "",[string]$CompanyCode = ""
+        [string]$InstanceId = "",
+        [string]$CompanyCode = "",
+        [switch]$DebugStockJournal
     )
+
+    function Write-SJDebug {
+        param([string]$Message)
+        if ($VchType -eq 8 -or $DebugStockJournal) {
+            try { Write-Host "[StockJournal Detail DEBUG] $Message" -ForegroundColor Cyan } catch {}
+        }
+    }
+
+    function Get-NodeTextSafe {
+        param($Node)
+        try {
+            if ($null -eq $Node) { return "" }
+            $txt = ([string]$Node).Trim()
+            return $txt
+        } catch { return "" }
+    }
+
+    function Get-DoubleSafe {
+        param($Node, [double]$DefaultValue = 0.0)
+        try {
+            if ($null -eq $Node) { return $DefaultValue }
+            $txt = ([string]$Node).Trim()
+            if ($txt -eq "") { return $DefaultValue }
+            return [double]::Parse($txt, [System.Globalization.CultureInfo]::InvariantCulture)
+        } catch {
+            try { return [double]$Node } catch { return $DefaultValue }
+        }
+    }
+
+    function Get-IntSafe {
+        param($Node, [int]$DefaultValue = 0)
+        try {
+            if ($null -eq $Node) { return $DefaultValue }
+            $txt = ([string]$Node).Trim()
+            if ($txt -eq "") { return $DefaultValue }
+            return [int]$txt
+        } catch {
+            try { return [int]$Node } catch { return $DefaultValue }
+        }
+    }
+
+    function Convert-VoucherXmlItemToHash {
+        param(
+            $d,
+            [int]$ForcedItemType,
+            [int]$OutputSrNo,
+            $consumptionMap,
+            $challanItemRemainingMap
+        )
+
+        $itemName = Get-NodeTextSafe $d.ItemName
+        $unitName = Get-NodeTextSafe $d.UnitName
+        $mcName   = Get-NodeTextSafe $d.MC
+
+        $qty      = Get-DoubleSafe $d.Qty 0.0
+        $price    = Get-DoubleSafe $d.Price 0.0
+        $amount   = Get-DoubleSafe $d.Amt 0.0
+        $mainQty  = Get-DoubleSafe $d.QtyMainUnit $qty
+
+        $altUnit   = Get-NodeTextSafe $d.AltUnitName
+        $altQty    = Get-DoubleSafe $d.QtyAltUnit 0.0
+        $altPrice  = Get-DoubleSafe $d.PriceAltUnit 0.0
+        $conFactor = Get-DoubleSafe $d.ConFactor 1.0
+        $conType   = Get-IntSafe $d.ConFactorType 1
+
+        $itemType = $ForcedItemType
+        if ($ForcedItemType -eq 0) {
+            $itemType = Get-IntSafe $d.ItemType 1
+        }
+
+        $listPrice = Get-DoubleSafe $d.ListPrice $price
+        $discVal = 0.0
+        $discType = "U"
+        try {
+            if ($d.DiscountPercent) {
+                $discType = "%"
+                $discVal = Get-DoubleSafe $d.DiscountPercent 0.0
+            } elseif ($d.Discount) {
+                $discVal = Get-DoubleSafe $d.Discount 0.0
+            }
+        } catch {}
+
+        $itemXmlSrNo = Get-IntSafe $d.SrNo 1
+        $pendingQty = $qty
+
+        try {
+            if ($null -ne $challanItemRemainingMap -and $challanItemRemainingMap.ContainsKey($itemXmlSrNo)) {
+                $pendingQty = $challanItemRemainingMap[$itemXmlSrNo]
+            }
+        } catch {}
+
+        try {
+            if ($null -ne $consumptionMap -and $consumptionMap.ContainsKey($itemName)) {
+                $availableToDeduct = $consumptionMap[$itemName]
+                if ($availableToDeduct -lt 0) {
+                    if (([Math]::Abs($availableToDeduct)) -ge $qty) {
+                        $pendingQty = 0
+                        $consumptionMap[$itemName] = $availableToDeduct + $qty
+                    } else {
+                        $pendingQty = [Math]::Round($qty + $availableToDeduct, 3)
+                        $consumptionMap[$itemName] = 0
+                    }
+                }
+            }
+        } catch {}
+
+        return @{
+            srNo            = $OutputSrNo
+            itemName        = $itemName
+            unit            = $unitName
+            qty             = $qty
+            listPrice       = $listPrice
+            discVal         = $discVal
+            discType        = $discType
+            price           = $price
+            amount          = $amount
+            itemType        = $itemType
+            mc              = $mcName
+            altUnit         = $altUnit
+            conFactor       = $conFactor
+            conType         = $conType
+            altQtyConFactor = $conFactor
+            altQty          = $altQty
+            altPrice        = $altPrice
+            mainQty         = $mainQty
+            pendingQty      = $pendingQty
+        }
+    }
 
     # Resolve if SQL or Access from instances.json
     $targetInst = Get-InstanceConfig -InstanceId $InstanceId
@@ -2373,20 +2723,20 @@ function Get-VoucherDetail {
     $isSql = ($dbType -eq 1)
 
     $vchCode = 0
-    
+    Write-SJDebug "Start Get-VoucherDetail. VchType=$VchType VchNo=$VchNo VchSeries=$VchSeries VchDate=$VchDate InstanceId=$InstanceId CompanyCode=$CompanyCode IsSql=$isSql"
+
     if ($isSql) {
-        # ── SQL PATH: Resolve VchCode natively using direct SQL connection ──
         $dirConn = Get-DirectConnection -InstanceId $InstanceId -CompanyCode $CompanyCode
         if ($null -eq $dirConn) { return @{ success = $false; error = "Could not build direct database connection" } }
         $conn = $dirConn.connection
         try {
             $conn.Open()
             $vchCode = Get-VchCode-Direct -conn $conn -VchType $VchType -VchNo $VchNo -VchDate $VchDate -isSql $true
+            Write-SJDebug "SQL resolved VchCode=$vchCode"
         } finally {
             if ($null -ne $conn) { try { $conn.Close() } catch {} }
         }
     } else {
-        # ── ACCESS PATH: Original stable COM recordset query ──
         $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
         if (-not $fi) { return @{ success = $false; error = "BUSY connection failed" } }
         try {
@@ -2401,6 +2751,7 @@ function Get-VoucherDetail {
 
             $targetNo = $VchNo.Trim().ToLower()
             $qry = "SELECT VchCode, VchNo, AutoVchNo FROM Tran1 WHERE VchType=$VchType" + $dateFilter
+            Write-SJDebug "Access lookup query: $qry"
             $rst = $fi.GetRecordset($qry)
 
             if ($rst -and -not $rst.EOF) {
@@ -2415,7 +2766,7 @@ function Get-VoucherDetail {
                             if ($av -ne [System.DBNull]::Value) { $dbVchNo = $av.ToString().Trim().ToLower() }
                         }
                     } catch {}
-                    
+
                     if ($dbVchNo -eq $targetNo) {
                         $vchCode = [int]$rst.Fields.Item("VchCode").Value
                         break
@@ -2427,6 +2778,7 @@ function Get-VoucherDetail {
 
             if ($vchCode -eq 0) {
                 $qryAll = "SELECT VchCode, VchNo, AutoVchNo FROM Tran1 WHERE VchType=$VchType"
+                Write-SJDebug "Date-filter lookup failed. Fallback query: $qryAll"
                 $rstAll = $fi.GetRecordset($qryAll)
                 if ($rstAll -and -not $rstAll.EOF) {
                     $rstAll.MoveFirst()
@@ -2450,6 +2802,7 @@ function Get-VoucherDetail {
                     try { $rstAll.Close() } catch {}
                 }
             }
+            Write-SJDebug "Access resolved VchCode=$vchCode"
         } finally {
             Disconnect-BUSY $fi
         }
@@ -2459,7 +2812,6 @@ function Get-VoucherDetail {
         return @{ success = $false; error = "Could not find Voucher in database (VchType=$VchType, No=$VchNo)" }
     }
 
-    # 2. Invoke COM only to fetch the parsed XML
     $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
     if (-not $fi) { return @{ success = $false; error = "BUSY connection failed" } }
 
@@ -2476,8 +2828,19 @@ function Get-VoucherDetail {
             return @{ success = $false; error = if ($errMsg) { $errMsg } else { "Voucher XML is empty" } }
         }
 
+        Write-SJDebug "GetVchXML length=$($xmlStr.Length)"
+
         $xml = [xml]$xmlStr
         $root = $xml.DocumentElement
+
+        if ($VchType -eq 8) {
+            try {
+                $childNames = @($root.ChildNodes | ForEach-Object { $_.Name }) -join ", "
+                Write-SJDebug "Root=$($root.Name). Child nodes: $childNames"
+                Write-SJDebug "ItemEntries nodes=$(@($root.SelectNodes('ItemEntries/ItemDetail')).Count), ConsumedItemEntries nodes=$(@($root.SelectNodes('ConsumedItemEntries/ItemDetail')).Count), ItemEntries1 nodes=$(@($root.SelectNodes('ItemEntries1/ItemDetail')).Count)"
+                Write-SJDebug "Anywhere consumed nodes: ConsumedItemEntries=$(@($root.SelectNodes('//ConsumedItemEntries/ItemDetail')).Count), ItemEntries1=$(@($root.SelectNodes('//ItemEntries1/ItemDetail')).Count)"
+            } catch {}
+        }
 
         $vchDateStr = ""
         try { if ($root.Date) { $vchDateStr = ([string]$root.Date).Trim() } } catch {}
@@ -2514,9 +2877,7 @@ function Get-VoucherDetail {
                     while ($rCons.Read()) {
                         $iName = $rCons["ItemName"].ToString().Trim()
                         $cVal = $rCons["CQ"]
-                        if ($null -ne $cVal -and "$cVal" -ne "") {
-                            $consumptionMap[$iName] = [double]$cVal
-                        }
+                        if ($null -ne $cVal -and "$cVal" -ne "") { $consumptionMap[$iName] = [double]$cVal }
                     }
                     $rCons.Close()
                 }
@@ -2527,7 +2888,7 @@ function Get-VoucherDetail {
 
         $challanItemRemainingMap = @{}
         if ($VchType -eq 11 -or $VchType -eq 4) {
-            $targetRecType = 3 
+            $targetRecType = 3
             try {
                 $dirConn = Get-DirectConnection -InstanceId $InstanceId -CompanyCode $CompanyCode
                 if ($dirConn) {
@@ -2547,7 +2908,7 @@ function Get-VoucherDetail {
                         $consVal = $consCmd.ExecuteScalar()
                         if ($null -ne $consVal -and "$consVal" -ne "") { $consumedQty = [Math]::Abs([double]$consVal) }
 
-                    $challanItemRemainingMap[$iSrNo] = [Math]::Max(0, [Math]::Round($origQty - $consumedQty, 3))
+                        $challanItemRemainingMap[$iSrNo] = [Math]::Max(0, [Math]::Round($origQty - $consumedQty, 3))
                     }
                     $cRdr.Close()
                 }
@@ -2558,79 +2919,58 @@ function Get-VoucherDetail {
 
         $items = @()
         $srNo = 1
-        try {
-            foreach ($d in $root.ItemEntries.ItemDetail) {
-                $conFactor = 1.0
-                $conType = 1
-                $altUnit = ""
-                $altQty = 0.0
-                $altPrice = 0.0
 
-                try { $conFactor = [double]$d.ConFactor } catch {}
-                try { $conType = [int]$d.ConFactorType } catch {}
-                try { if ($d.AltUnitName) { $altUnit = ([string]$d.AltUnitName).Trim() } } catch {}
-                try { $altQty = [double]$d.QtyAltUnit } catch {}
-                try { $altPrice = [double]$d.PriceAltUnit } catch {}
+        if ($VchType -eq 8) {
+            # Stock Journal is special:
+            #   ItemEntries          = Items Generated
+            #   ConsumedItemEntries  = Items Consumed
+            $generatedNodes = @()
+            $consumedNodes = @()
 
-                $qty = [double]$d.Qty
-                $price = [double]$d.Price
-                $itemName = if ($d.ItemName) { ([string]$d.ItemName).Trim() } else { "" }
+            try { $generatedNodes = @($root.SelectNodes("ItemEntries/ItemDetail")) } catch {}
+            if ($generatedNodes.Count -eq 0) {
+                try { $generatedNodes = @($root.SelectNodes("//ItemEntries/ItemDetail")) } catch {}
+            }
 
-                $listPrice = $price
-                $discVal = 0.0
-                $discType = "U"
-                try {
-                    if ($d.ListPrice) { $listPrice = [double]$d.ListPrice }
-                    if ($d.Discount) { $discVal = [double]$d.Discount }
-                    if ($d.DiscountPercent) {
-                        $discType = "%"
-                        $discVal = [double]$d.DiscountPercent
-                    }
-                } catch {}
+            # BUSY Stock Journal consumed/bottom grid may be exported as either:
+            #   ConsumedItemEntries  OR  ItemEntries1
+            # In your debug XML, BUSY returned ItemEntries1.
+            try { $consumedNodes = @($root.SelectNodes("ConsumedItemEntries/ItemDetail")) } catch {}
+            if ($consumedNodes.Count -eq 0) {
+                try { $consumedNodes = @($root.SelectNodes("ItemEntries1/ItemDetail")) } catch {}
+                if ($consumedNodes.Count -gt 0) { Write-SJDebug "Using ItemEntries1 as consumed Stock Journal rows" }
+            }
+            if ($consumedNodes.Count -eq 0) {
+                try { $consumedNodes = @($root.SelectNodes("//ConsumedItemEntries/ItemDetail")) } catch {}
+            }
+            if ($consumedNodes.Count -eq 0) {
+                try { $consumedNodes = @($root.SelectNodes("//ItemEntries1/ItemDetail")) } catch {}
+                if ($consumedNodes.Count -gt 0) { Write-SJDebug "Using //ItemEntries1 fallback as consumed Stock Journal rows" }
+            }
 
-                $itemXmlSrNo = 1
-                try { $itemXmlSrNo = [int]$d.SrNo } catch {}
-                $pendingQty = if ($challanItemRemainingMap.ContainsKey($itemXmlSrNo)) { 
-                    $challanItemRemainingMap[$itemXmlSrNo] 
-                } else { 
-                    $qty 
-                }
-                if ($consumptionMap.ContainsKey($itemName)) {
-                    $availableToDeduct = $consumptionMap[$itemName]
-                    if ($availableToDeduct -lt 0) {
-                        if (([Math]::Abs($availableToDeduct)) -ge $qty) {
-                            $pendingQty = 0
-                            $consumptionMap[$itemName] = $availableToDeduct + $qty
-                        } else {
-                            $pendingQty = [Math]::Round($qty + $availableToDeduct, 3)
-                            $consumptionMap[$itemName] = 0
-                        }
-                    }
-                }
+            Write-SJDebug "Final parsed generatedNodes=$($generatedNodes.Count), consumedNodes=$($consumedNodes.Count)"
 
-                $items += @{
-                    srNo            = $srNo
-                    itemName        = $itemName
-                    unit            = if ($d.UnitName) { ([string]$d.UnitName).Trim() } else { "" }
-                    qty             = $qty
-                    listPrice       = $listPrice
-                    discVal         = $discVal
-                    discType        = $discType
-                    price           = $price
-                    amount          = [double]$d.Amt
-                    mc              = if ($d.MC) { ([string]$d.MC).Trim() } else { "" }
-                    altUnit         = $altUnit
-                    conFactor       = $conFactor
-                    conType         = $conType
-                    altQtyConFactor = $conFactor
-                    altQty          = $altQty
-                    altPrice        = $altPrice
-                    mainQty         = [double]$d.QtyMainUnit
-                    pendingQty      = $pendingQty
-                }
+            foreach ($d in $generatedNodes) {
+                $items += Convert-VoucherXmlItemToHash -d $d -ForcedItemType 1 -OutputSrNo $srNo -consumptionMap $consumptionMap -challanItemRemainingMap $challanItemRemainingMap
                 $srNo++
             }
-        } catch {}
+
+            foreach ($d in $consumedNodes) {
+                $items += Convert-VoucherXmlItemToHash -d $d -ForcedItemType 2 -OutputSrNo $srNo -consumptionMap $consumptionMap -challanItemRemainingMap $challanItemRemainingMap
+                $srNo++
+            }
+
+            Write-SJDebug "Returned item count=$($items.Count), generated=$(@($items | Where-Object { [int]$_.itemType -eq 1 }).Count), consumed=$(@($items | Where-Object { [int]$_.itemType -eq 2 }).Count)"
+        } else {
+            try {
+                if ($root.ItemEntries -and $root.ItemEntries.ItemDetail) {
+                    foreach ($d in @($root.ItemEntries.ItemDetail)) {
+                        $items += Convert-VoucherXmlItemToHash -d $d -ForcedItemType 0 -OutputSrNo $srNo -consumptionMap $consumptionMap -challanItemRemainingMap $challanItemRemainingMap
+                        $srNo++
+                    }
+                }
+            } catch {}
+        }
 
         $billSundries = @()
         $bsr = 1
@@ -2638,7 +2978,6 @@ function Get-VoucherDetail {
             foreach ($bs in $root.BillSundries.BSDetail) {
                 $percentVal = 0
                 try { $percentVal = [double]$bs.PercentVal } catch {}
-                
                 $billSundries += @{
                     srNo       = $bsr
                     name       = if ($bs.BSName) { ([string]$bs.BSName).Trim() } else { "" }
@@ -2658,7 +2997,7 @@ function Get-VoucherDetail {
                 try { $cardAmt = [double]$sd.CreditCardAmt1 } catch {}
                 try { $giftAmt = [double]$sd.CreditCardAmt2 } catch {}
                 try { $tendered = [double]$sd.CashRecvdAmt } catch {}
-                
+
                 if ($cashAmt -gt 0 -or $cardAmt -gt 0 -or $giftAmt -gt 0) {
                     $settlements = @{
                         cash = @{ amount = $cashAmt; account = if ($sd.CashAccName) { ([string]$sd.CashAccName).Trim() } else { "Cash" } }
@@ -2674,22 +3013,21 @@ function Get-VoucherDetail {
         try {
             if ($root.PendingBillDetails.BillDetail) {
                 foreach ($bd in $root.PendingBillDetails.BillDetail) {
-                    $srNo = 1
+                    $refSrNo = 1
                     foreach ($ref in $bd.BillRefs) {
                         $amt = [double]$ref.Value1
                         if ($amt -lt 0) { $amt = -$amt }
-
                         $refType = 1
                         try { $refType = [int]$ref.Method } catch {}
 
                         $refEntries += @{
-                            srNo    = $srNo
+                            srNo    = $refSrNo
                             refType = $refType
                             refNo   = if ($ref.RefNo) { ([string]$ref.RefNo).Trim() } else { "" }
                             amount  = $amt
                             dueDate = if ($ref.dueDate) { ([string]$ref.DueDate).Trim() } else { "" }
                         }
-                        $srNo++
+                        $refSrNo++
                     }
                 }
             }
@@ -2710,7 +3048,6 @@ function Get-VoucherDetail {
                     $cDate = ""
                     if ($dVal -is [datetime]) { $cDate = $dVal.ToString("dd-MM-yyyy") }
                     else { $cDate = [datetime]::Parse($dVal.ToString()).ToString("dd-MM-yyyy") }
-                    
                     $linkedChallans += @{ vchNo = $cNo; date = $cDate }
                 }
                 $lcRdr.Close()
@@ -2719,25 +3056,24 @@ function Get-VoucherDetail {
             if ($null -ne $conn) { try { $conn.Close() } catch {} }
         }
 
-            $optionalFields = @{}
-            try {
-                if ($root.VchOtherInfoDetails.OFInfo) {
-                    $ofNode = $root.VchOtherInfoDetails.OFInfo
-                    for ($i = 1; $i -le 20; $i++) {
-                        $nodeName = "OF$i"
-                        if ($ofNode.$nodeName) {
-                            $val = ([string]$ofNode.$nodeName).Trim()
-                            if ($val -ne "") {
-                                # AUTOMATIC DATE HYDRATOR: Reformat dd-MM-yyyy back to yyyy-MM-dd for HTML5 inputs
-                                if ($val -match "^(\d{2})-(\d{2})-(\d{4})$") {
-                                    $val = "$($Matches[3])-$($Matches[2])-$($Matches[1])"
-                                }
-                                $optionalFields["OptionField$i"] = $val
+        $optionalFields = @{}
+        try {
+            if ($root.VchOtherInfoDetails.OFInfo) {
+                $ofNode = $root.VchOtherInfoDetails.OFInfo
+                for ($i = 1; $i -le 20; $i++) {
+                    $nodeName = "OF$i"
+                    if ($ofNode.$nodeName) {
+                        $val = ([string]$ofNode.$nodeName).Trim()
+                        if ($val -ne "") {
+                            if ($val -match "^(\d{2})-(\d{2})-(\d{4})$") {
+                                $val = "$($Matches[3])-$($Matches[2])-$($Matches[1])"
                             }
+                            $optionalFields["OptionField$i"] = $val
                         }
                     }
                 }
-            } catch {}
+            }
+        } catch {}
 
         return @{
             success = $true
@@ -2758,16 +3094,17 @@ function Get-VoucherDetail {
                 settlements    = $settlements
                 refEntries     = @($refEntries)
                 linkedChallans = @($linkedChallans)
-                optionalFields = $optionalFields 
+                optionalFields = $optionalFields
             }
         }
-
     } catch {
+        Write-SJDebug "ERROR: $($_.Exception.Message)"
         return @{ success = $false; error = $_.Exception.Message }
     } finally {
         Disconnect-BUSY $fi
     }
 }
+
 
 function Get-AccountVoucherDetail {
     param(
@@ -2992,6 +3329,21 @@ function Get-AccountVoucherDetail {
 # ═══════════════════════════════════════════════════════════════
 #  SEARCH ORIGINAL VOUCHERS (Specifically for BBA)
 # ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# SEARCH ORIGINAL/PENDING VOUCHERS FOR RECEIPT AND PAYMENT BBA
+#
+# Supported parent voucher types:
+#   9  = Sale
+#   10 = Purchase Return
+#   2  = Purchase
+#   3  = Sale Return
+#
+# Receipt searches:
+#   Sale + Purchase Return
+#
+# Payment searches:
+#   Purchase + Sale Return
+# ═══════════════════════════════════════════════════════════════
 function Search-OriginalVouchers {
     param(
         [int]$VchType,
@@ -3002,172 +3354,658 @@ function Search-OriginalVouchers {
         [string]$InstanceId = "",
         [string]$CompanyCode = ""
     )
-    
-    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
-    if (-not $fi) { return @{ success = $false; error = "BUSY connection failed" } }
-    
+
+    $fi = Connect-BUSY `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $fi) {
+        return @{
+            success = $false
+            error   = "BUSY connection failed"
+        }
+    }
+
     try {
-        $partyCode = ""
-        if ($Party -ne "") {
-            $safeParty = $Party -replace "'", "''"
-            $mRst = $fi.GetRecordset("SELECT Code FROM Master1 WHERE Name = '$safeParty'")
-            if ($mRst -and -not $mRst.EOF) {
-                $partyCode = $mRst.Fields.Item("Code").Value.ToString()
+        # --------------------------------------------------------
+        # Validate supported transaction types
+        # --------------------------------------------------------
+        if ($VchType -notin @(2, 3, 9, 10)) {
+            return @{
+                success = $false
+                error   = "Unsupported pending bill voucher type: $VchType"
             }
-            if ($mRst) { try { $mRst.Close() } catch {} }
-        }
-        
-        if ($Party -ne "" -and $partyCode -eq "") {
-            return @{ success = $true; count = 0; data = @() }
         }
 
-        $where = "RecType = 1 AND Method IN (1,3,4) AND VchType = $VchType"
-        if ($partyCode -ne "") {
-            $where += " AND MasterCode1 = $partyCode"
+        # --------------------------------------------------------
+        # Transaction label
+        # --------------------------------------------------------
+        $transactionType = switch ($VchType) {
+            2  { "Purchase" }
+            3  { "Sale Return" }
+            9  { "Sale" }
+            10 { "Purchase Return" }
+            default { "Voucher" }
         }
-        if ($FromDate -ne "") {
+
+        # --------------------------------------------------------
+        # Resolve party master code
+        # --------------------------------------------------------
+        $partyCode = 0
+
+        if (-not [string]::IsNullOrWhiteSpace($Party)) {
+            $safeParty = $Party.Trim() -replace "'", "''"
+
+            $partyRst = $fi.GetRecordset(
+                "SELECT Code
+                 FROM Master1
+                 WHERE Name='$safeParty'"
+            )
+
+            if ($partyRst -and -not $partyRst.EOF) {
+                try {
+                    $partyCode = [int]$partyRst.Fields.Item(
+                        "Code"
+                    ).Value
+                } catch {
+                    $partyCode = 0
+                }
+            }
+
+            if ($partyRst) {
+                try { $partyRst.Close() } catch {}
+            }
+
+            if ($partyCode -le 0) {
+                return @{
+                    success = $true
+                    count   = 0
+                    data    = @()
+                }
+            }
+        }
+
+        # --------------------------------------------------------
+        # Build original reference filter
+        #
+        # Method 1 = original/new bill reference
+        # Method 3/4 retained for compatibility with existing data
+        # --------------------------------------------------------
+        $whereParts = @(
+            "T3.RecType=1",
+            "T3.Method IN (1,3,4)",
+            "T3.VchType=$VchType",
+            "H.Cancelled=0",
+            "H.VchCancelled=0"
+        )
+
+        if ($partyCode -gt 0) {
+            $whereParts += "T3.MasterCode1=$partyCode"
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($VchNo)) {
+            $safeVchNo = $VchNo.Trim() -replace "'", "''"
+
+            $whereParts += @"
+(
+    H.VchNo LIKE '*$safeVchNo*'
+    OR T3.[No] LIKE '*$safeVchNo*'
+)
+"@
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($FromDate)) {
             try {
-                $fd = [datetime]::ParseExact($FromDate, "dd-MM-yyyy", $null).ToString("MM/dd/yyyy")
-                $where += " AND [Date] >= #$fd#"
+                $fromParsed = [datetime]::ParseExact(
+                    $FromDate,
+                    "dd-MM-yyyy",
+                    [System.Globalization.CultureInfo]::InvariantCulture
+                )
+
+                $fromAccess = $fromParsed.ToString("MM/dd/yyyy")
+                $whereParts += "T3.[Date] >= #$fromAccess#"
             } catch {}
         }
-        if ($ToDate -ne "") {
+
+        if (-not [string]::IsNullOrWhiteSpace($ToDate)) {
             try {
-                $td = [datetime]::ParseExact($ToDate, "dd-MM-yyyy", $null).ToString("MM/dd/yyyy")
-                $where += " AND [Date] <= #$td#"
+                $toParsed = [datetime]::ParseExact(
+                    $ToDate,
+                    "dd-MM-yyyy",
+                    [System.Globalization.CultureInfo]::InvariantCulture
+                )
+
+                $toAccess = $toParsed.ToString("MM/dd/yyyy")
+                $whereParts += "T3.[Date] <= #$toAccess#"
             } catch {}
         }
-        
-        $rst = $fi.GetRecordset("SELECT VchCode, VchType, [No], [Date], DueDate, Value1, RefCode FROM Tran3 WHERE $where ORDER BY [Date] DESC")
+
+        $whereClause = $whereParts -join " AND "
+
+        # --------------------------------------------------------
+        # Load original bill references
+        # --------------------------------------------------------
+        $originalQuery = @"
+SELECT
+    T3.RefCode,
+    T3.VchCode,
+    T3.VchType,
+    T3.MasterCode1,
+    T3.[No] AS RefNo,
+    T3.[Date] AS RefDate,
+    T3.DueDate,
+    T3.Value1 AS ParentValue,
+    H.VchNo AS CurrentVchNo,
+    H.AutoVchNo,
+    H.VchAmtBaseCur,
+    H.OrgVchAmtBaseCur
+FROM Tran3 T3
+INNER JOIN Tran1 H
+    ON H.VchCode=T3.VchCode
+WHERE $whereClause
+ORDER BY T3.[Date] DESC
+"@
+
+        $originalRst = $fi.GetRecordset($originalQuery)
+
         $results = @()
-        
-        if ($null -ne $rst -and -not $rst.EOF) {
-            $rst.MoveFirst()
-            while (-not $rst.EOF) {
-                $refNo = ""
-            # Always resolve current VchNo from Tran1 using VchCode — Tran3.[No] holds stale renamed numbers
-            try {
-                $vchCodeForNo = [int]$rst.Fields.Item("VchCode").Value
-                $noRst = $fi.GetRecordset("SELECT VchNo, AutoVchNo FROM Tran1 WHERE VchCode=$vchCodeForNo")
-                if ($noRst -and -not $noRst.EOF) {
-                    $v = $noRst.Fields.Item("VchNo").Value
-                    if ($v -ne [System.DBNull]::Value -and $null -ne $v -and $v.ToString().Trim() -ne "") {
-                        $refNo = $v.ToString().Trim()
-                    }
-                    if ($refNo -eq "") {
-                        $av = $noRst.Fields.Item("AutoVchNo").Value
-                        if ($av -ne [System.DBNull]::Value -and $null -ne $av) { $refNo = $av.ToString().Trim() }
-                    }
-                }
-                if ($noRst) { try { $noRst.Close() } catch {} }
-            } catch {
-                # Fallback to Tran3.[No] if Tran1 lookup fails
-                try {
-                    $v = $rst.Fields.Item("No").Value
-                    if ($v -ne [System.DBNull]::Value -and $v -ne $null) { $refNo = $v.ToString().Trim() }
-                } catch {}
-            }
-                
-                if ($VchNo -ne "" -and $refNo.ToLower() -notlike "*$($VchNo.ToLower())*") {
-                    $rst.MoveNext()
-                    continue
-                }
-                
-                $vchCode = 0
-                try { $vchCode = [int]$rst.Fields.Item("VchCode").Value } catch {}
-                
+        $seenReferenceCodes = @{}
+
+        if ($originalRst -and -not $originalRst.EOF) {
+            $originalRst.MoveFirst()
+
+            while (-not $originalRst.EOF) {
                 $refCode = 0
-                try { $refCode = [int]$rst.Fields.Item("RefCode").Value } catch {}
-                
-                $strDate = ""
+                $parentVchCode = 0
+                $refNo = ""
+                $dateString = ""
+                $dueDateString = ""
+                $parentAmount = 0.0
+
                 try {
-                    $dVal = $rst.Fields.Item("Date").Value
-                    if ($dVal -ne [System.DBNull]::Value -and $dVal -ne $null) {
-                        if ($dVal -is [datetime]) { $strDate = $dVal.ToString("dd-MM-yyyy") }
-                        else { $strDate = [datetime]::Parse($dVal.ToString()).ToString("dd-MM-yyyy") }
+                    $refCode = [int]$originalRst.Fields.Item(
+                        "RefCode"
+                    ).Value
+                } catch {}
+
+                try {
+                    $parentVchCode = [int]$originalRst.Fields.Item(
+                        "VchCode"
+                    ).Value
+                } catch {}
+
+                # ------------------------------------------------
+                # Use current Tran1 voucher number first.
+                # Tran3.[No] can contain an old/stale number.
+                # ------------------------------------------------
+                try {
+                    $rawCurrentNo = $originalRst.Fields.Item(
+                        "CurrentVchNo"
+                    ).Value
+
+                    if (
+                        $rawCurrentNo -ne [System.DBNull]::Value -and
+                        $null -ne $rawCurrentNo
+                    ) {
+                        $refNo = $rawCurrentNo.ToString().Trim()
                     }
                 } catch {}
 
-                $dueDateStr = $strDate
-                try {
-                    $ddVal = $rst.Fields.Item("DueDate").Value
-                    if ($ddVal -ne [System.DBNull]::Value -and $ddVal -ne $null) {
-                        if ($ddVal -is [datetime]) { 
-                            if ($ddVal.Year -gt 1900) { $dueDateStr = $ddVal.ToString("dd-MM-yyyy") }
-                        }
-                        else { 
-                            $parsed = [datetime]::Parse($ddVal.ToString())
-                            if ($parsed.Year -gt 1900) { $dueDateStr = $parsed.ToString("dd-MM-yyyy") }
-                        }
-                    }
-                } catch {}
-                
-                $totalAmt = 0.0
-                try {
-                    $val1 = $rst.Fields.Item("Value1").Value
-                    if ($val1 -ne [System.DBNull]::Value -and $val1 -ne $null) {
-                        $totalAmt = [Math]::Abs([double]$val1)
-                    }
-                } catch {}
-                
-                $adjustedAmt = 0.0
-                if ($refNo -ne "") {
-                    $safeRn = $refNo -replace "'", "''"
-                    $adjQry = ""
-                    
-                    if ($refCode -gt 0) {
-                        $adjQry = "SELECT SUM(ABS(Value1)) AS AdjAmt FROM Tran3 WHERE Method = 2 AND RefCode = $refCode AND VchCode <> $vchCode"
-                    } else {
-                        $adjQry = "SELECT SUM(ABS(Value1)) AS AdjAmt FROM Tran3 WHERE Method = 2 AND MasterCode1 = $partyCode AND [No] LIKE '*$safeRn*' AND VchCode <> $vchCode"
-                    }
+                if ([string]::IsNullOrWhiteSpace($refNo)) {
+                    try {
+                        $rawReferenceNo = $originalRst.Fields.Item(
+                            "RefNo"
+                        ).Value
 
-                    $adjRst = $fi.GetRecordset($adjQry)
-                    if ($adjRst -and -not $adjRst.EOF) {
-                        $adjRst.MoveFirst()
-                        $v = $adjRst.Fields.Item("AdjAmt").Value
-                        if ($v -ne [System.DBNull]::Value -and $v -ne $null) {
-                            $adjustedAmt = [Math]::Abs([double]$v)
+                        if (
+                            $rawReferenceNo -ne [System.DBNull]::Value -and
+                            $null -ne $rawReferenceNo
+                        ) {
+                            $refNo = $rawReferenceNo.ToString().Trim()
                         }
-                    }
-                    if ($adjRst) { try { $adjRst.Close() } catch {} }
+                    } catch {}
                 }
-                
-                $netAmt = [Math]::Round($totalAmt - $adjustedAmt, 2)
-                
-                if ($netAmt -gt 0) {
+
+                if ([string]::IsNullOrWhiteSpace($refNo)) {
+                    try {
+                        $rawAutoNo = $originalRst.Fields.Item(
+                            "AutoVchNo"
+                        ).Value
+
+                        if (
+                            $rawAutoNo -ne [System.DBNull]::Value -and
+                            [int]$rawAutoNo -gt 0
+                        ) {
+                            $refNo = [string]$rawAutoNo
+                        }
+                    } catch {}
+                }
+
+                # ------------------------------------------------
+                # Date
+                # ------------------------------------------------
+                try {
+                    $rawDate = $originalRst.Fields.Item(
+                        "RefDate"
+                    ).Value
+
+                    if (
+                        $rawDate -ne [System.DBNull]::Value -and
+                        $null -ne $rawDate
+                    ) {
+                        if ($rawDate -is [datetime]) {
+                            $dateString = $rawDate.ToString(
+                                "dd-MM-yyyy"
+                            )
+                        } else {
+                            $dateString = [datetime]::Parse(
+                                $rawDate.ToString()
+                            ).ToString("dd-MM-yyyy")
+                        }
+                    }
+                } catch {}
+
+                # ------------------------------------------------
+                # Due date
+                # ------------------------------------------------
+                $dueDateString = $dateString
+
+                try {
+                    $rawDueDate = $originalRst.Fields.Item(
+                        "DueDate"
+                    ).Value
+
+                    if (
+                        $rawDueDate -ne [System.DBNull]::Value -and
+                        $null -ne $rawDueDate
+                    ) {
+                        $parsedDueDate = if (
+                            $rawDueDate -is [datetime]
+                        ) {
+                            $rawDueDate
+                        } else {
+                            [datetime]::Parse(
+                                $rawDueDate.ToString()
+                            )
+                        }
+
+                        if ($parsedDueDate.Year -gt 1900) {
+                            $dueDateString = $parsedDueDate.ToString(
+                                "dd-MM-yyyy"
+                            )
+                        }
+                    }
+                } catch {}
+
+                # ------------------------------------------------
+                # Parent transaction amount
+                #
+                # Tran3.Value1 is normally the original reference
+                # amount. Fall back to Tran1 amount if necessary.
+                # ------------------------------------------------
+                try {
+                    $rawParentValue = $originalRst.Fields.Item(
+                        "ParentValue"
+                    ).Value
+
+                    if (
+                        $rawParentValue -ne [System.DBNull]::Value -and
+                        $null -ne $rawParentValue
+                    ) {
+                        $parentAmount = [Math]::Abs(
+                            [double]$rawParentValue
+                        )
+                    }
+                } catch {}
+
+                if ($parentAmount -le 0) {
+                    try {
+                        $rawVoucherAmount = $originalRst.Fields.Item(
+                            "VchAmtBaseCur"
+                        ).Value
+
+                        if (
+                            $rawVoucherAmount -ne [System.DBNull]::Value -and
+                            $null -ne $rawVoucherAmount
+                        ) {
+                            $parentAmount = [Math]::Abs(
+                                [double]$rawVoucherAmount
+                            )
+                        }
+                    } catch {}
+                }
+
+                if ($parentAmount -le 0) {
+                    try {
+                        $rawOriginalAmount = $originalRst.Fields.Item(
+                            "OrgVchAmtBaseCur"
+                        ).Value
+
+                        if (
+                            $rawOriginalAmount -ne [System.DBNull]::Value -and
+                            $null -ne $rawOriginalAmount
+                        ) {
+                            $parentAmount = [Math]::Abs(
+                                [double]$rawOriginalAmount
+                            )
+                        }
+                    } catch {}
+                }
+
+                $parentAmount = [Math]::Round(
+                    $parentAmount,
+                    2
+                )
+
+                # ------------------------------------------------
+                # Calculate linked adjustment categories
+                #
+                # VchType 3  = Sale Return
+                # VchType 10 = Purchase Return
+                # VchType 14 = Receipt
+                # VchType 19 = Payment
+                # ------------------------------------------------
+                $saleReturnedAmount = 0.0
+                $purchaseReturnedAmount = 0.0
+                $alreadyReceivedAmount = 0.0
+                $alreadyPaidAmount = 0.0
+                $otherAdjustedAmount = 0.0
+
+                if ($refCode -gt 0) {
+                    $adjustmentQuery = @"
+SELECT
+    A.VchType,
+    SUM(ABS(A.Value1)) AS AdjustedAmount
+FROM Tran3 A
+INNER JOIN Tran1 AH
+    ON AH.VchCode=A.VchCode
+WHERE
+    A.RecType=1
+    AND A.Method=2
+    AND A.RefCode=$refCode
+    AND A.VchCode<>$parentVchCode
+    AND AH.Cancelled=0
+    AND AH.VchCancelled=0
+GROUP BY A.VchType
+"@
+
+                    $adjustmentRst = $fi.GetRecordset(
+                        $adjustmentQuery
+                    )
+
+                    if (
+                        $adjustmentRst -and
+                        -not $adjustmentRst.EOF
+                    ) {
+                        $adjustmentRst.MoveFirst()
+
+                        while (-not $adjustmentRst.EOF) {
+                            $adjustmentVchType = 0
+                            $adjustmentAmount = 0.0
+
+                            try {
+                                $adjustmentVchType = [int](
+                                    $adjustmentRst.Fields.Item(
+                                        "VchType"
+                                    ).Value
+                                )
+                            } catch {}
+
+                            try {
+                                $rawAdjustedAmount =
+                                    $adjustmentRst.Fields.Item(
+                                        "AdjustedAmount"
+                                    ).Value
+
+                                if (
+                                    $rawAdjustedAmount -ne
+                                        [System.DBNull]::Value -and
+                                    $null -ne $rawAdjustedAmount
+                                ) {
+                                    $adjustmentAmount = [Math]::Abs(
+                                        [double]$rawAdjustedAmount
+                                    )
+                                }
+                            } catch {}
+
+                            switch ($adjustmentVchType) {
+                                3 {
+                                    $saleReturnedAmount +=
+                                        $adjustmentAmount
+                                }
+
+                                10 {
+                                    $purchaseReturnedAmount +=
+                                        $adjustmentAmount
+                                }
+
+                                14 {
+                                    $alreadyReceivedAmount +=
+                                        $adjustmentAmount
+                                }
+
+                                19 {
+                                    $alreadyPaidAmount +=
+                                        $adjustmentAmount
+                                }
+
+                                default {
+                                    $otherAdjustedAmount +=
+                                        $adjustmentAmount
+                                }
+                            }
+
+                            $adjustmentRst.MoveNext()
+                        }
+                    }
+
+                    if ($adjustmentRst) {
+                        try { $adjustmentRst.Close() } catch {}
+                    }
+                }
+
+                $saleReturnedAmount = [Math]::Round(
+                    $saleReturnedAmount,
+                    2
+                )
+
+                $purchaseReturnedAmount = [Math]::Round(
+                    $purchaseReturnedAmount,
+                    2
+                )
+
+                $alreadyReceivedAmount = [Math]::Round(
+                    $alreadyReceivedAmount,
+                    2
+                )
+
+                $alreadyPaidAmount = [Math]::Round(
+                    $alreadyPaidAmount,
+                    2
+                )
+
+                $otherAdjustedAmount = [Math]::Round(
+                    $otherAdjustedAmount,
+                    2
+                )
+
+                # ------------------------------------------------
+                # Calculate pending amount by parent transaction
+                #
+                # Sale:
+                # Parent - Sale Returns - Receipts
+                #
+                # Purchase Return:
+                # Parent - Receipts
+                #
+                # Purchase:
+                # Parent - Purchase Returns - Payments
+                #
+                # Sale Return:
+                # Parent - Payments
+                # ------------------------------------------------
+                $pendingAmount = $parentAmount
+
+                switch ($VchType) {
+                    9 {
+                        $pendingAmount =
+                            $parentAmount -
+                            $saleReturnedAmount -
+                            $alreadyReceivedAmount -
+                            $otherAdjustedAmount
+                    }
+
+                    10 {
+                        $pendingAmount =
+                            $parentAmount -
+                            $alreadyReceivedAmount -
+                            $otherAdjustedAmount
+                    }
+
+                    2 {
+                        $pendingAmount =
+                            $parentAmount -
+                            $purchaseReturnedAmount -
+                            $alreadyPaidAmount -
+                            $otherAdjustedAmount
+                    }
+
+                    3 {
+                        $pendingAmount =
+                            $parentAmount -
+                            $alreadyPaidAmount -
+                            $otherAdjustedAmount
+                    }
+                }
+
+                $pendingAmount = [Math]::Max(
+                    0,
+                    [Math]::Round($pendingAmount, 2)
+                )
+
+                # ------------------------------------------------
+                # Keep only unique original references
+                # ------------------------------------------------
+                $uniqueKey = if ($refCode -gt 0) {
+                    "REF:$refCode"
+                } else {
+                    "VCH:$parentVchCode"
+                }
+
+                if (
+                    $pendingAmount -gt 0.005 -and
+                    -not $seenReferenceCodes.ContainsKey($uniqueKey)
+                ) {
+                    $returnedAmountForCurrentType = switch (
+                        $VchType
+                    ) {
+                        9 { $saleReturnedAmount }
+                        2 { $purchaseReturnedAmount }
+                        default { 0.0 }
+                    }
+
+                    $settledAmountForCurrentType = switch (
+                        $VchType
+                    ) {
+                        9  { $alreadyReceivedAmount }
+                        10 { $alreadyReceivedAmount }
+                        2  { $alreadyPaidAmount }
+                        3  { $alreadyPaidAmount }
+                        default { 0.0 }
+                    }
+
                     $results += @{
-                        vchCode = $vchCode
-                        vchNo = $refNo
-                        vchSeries = ""
-                        date = $strDate
-                        dueDate = $dueDateStr
+                        refCode = $refCode
+
+                        vchCode = $parentVchCode
+                        vchNo   = $refNo
+                        date    = $dateString
+                        dueDate = $dueDateString
+
+                        vchType         = $VchType
+                        transactionType = $transactionType
+                        voucherType     = $transactionType
+
                         party = $Party
-                        voucherType = ""
-                        totalAmt = [Math]::Round($totalAmt, 2)
-                        returnedAmt = [Math]::Round($adjustedAmt, 2)
-                        netAmt = $netAmt
-                        fullyReturned = ($netAmt -le 0)
+
+                        # New detailed values
+                        parentAmount = $parentAmount
+
+                        saleReturnedAmount =
+                            $saleReturnedAmount
+
+                        purchaseReturnedAmount =
+                            $purchaseReturnedAmount
+
+                        alreadyReceivedAmount =
+                            $alreadyReceivedAmount
+
+                        alreadyPaidAmount =
+                            $alreadyPaidAmount
+
+                        pendingAmount = $pendingAmount
+
+                        # Generic frontend convenience fields
+                        returnedAmount =
+                            $returnedAmountForCurrentType
+
+                        settledAmount =
+                            $settledAmountForCurrentType
+
+                        # Backward-compatible fields
+                        totalAmt = $parentAmount
+                        netAmt   = $pendingAmount
+                        returnedAmt =
+                            $returnedAmountForCurrentType
+
+                        fullyAdjusted =
+                            ($pendingAmount -le 0.005)
+
+                        fullyReturned =
+                            ($pendingAmount -le 0.005)
                     }
+
+                    $seenReferenceCodes[$uniqueKey] = $true
                 }
-                
-                $rst.MoveNext()
-            }
-            try { $rst.Close() } catch {}
-        }
 
-        $uniqueResults = @()
-        $seenRefs = @{}
-        foreach ($res in $results) {
-            if (-not $seenRefs.ContainsKey($res.vchNo)) {
-                $uniqueResults += $res
-                $seenRefs[$res.vchNo] = $true
+                $originalRst.MoveNext()
             }
         }
 
-        return @{ success = $true; count = $uniqueResults.Count; data = $uniqueResults }
-    } catch {
-        return @{ success = $false; error = $_.Exception.Message }
-    } finally {
+        if ($originalRst) {
+            try { $originalRst.Close() } catch {}
+        }
+
+        # --------------------------------------------------------
+        # Sort newest first
+        # --------------------------------------------------------
+        $sortedResults = @(
+            $results | Sort-Object {
+                try {
+                    [datetime]::ParseExact(
+                        $_.date,
+                        "dd-MM-yyyy",
+                        [System.Globalization.CultureInfo]::InvariantCulture
+                    )
+                } catch {
+                    [datetime]::MinValue
+                }
+            } -Descending
+        )
+
+        return @{
+            success = $true
+            count   = $sortedResults.Count
+            data    = $sortedResults
+        }
+    }
+    catch {
+        return @{
+            success = $false
+            error   = $_.Exception.Message
+        }
+    }
+    finally {
         Disconnect-BUSY $fi
     }
 }
@@ -3182,145 +4020,389 @@ function Get-ReturnHistory {
         [string]$InstanceId = "",
         [string]$CompanyCode = ""
     )
-    
+
     $returnVchType = if ($OrigVchType -eq 9) { 3 } else { 10 }
-    
+
     $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
-    if (-not $fi) { return @{ success = $false; error = "BUSY connection failed" } }
-    
+    if (-not $fi) {
+        return @{
+            success = $false
+            error   = "BUSY connection failed"
+        }
+    }
+
     try {
+        # ------------------------------------------------------------
+        # Load master names
+        # ------------------------------------------------------------
         $masterMap = @{}
-        $mRst = $fi.GetRecordset("SELECT Code, Name FROM Master1")
+
+        $mRst = $fi.GetRecordset(
+            "SELECT Code, Name FROM Master1"
+        )
+
         if ($null -ne $mRst -and -not $mRst.EOF) {
             $mRst.MoveFirst()
+
             while (-not $mRst.EOF) {
-                $c = $mRst.Fields.Item("Code").Value
-                $n = $mRst.Fields.Item("Name").Value
-                if ($c -ne [System.DBNull]::Value) {
-                    $masterMap[$c.ToString().Trim()] = if ($n -ne [System.DBNull]::Value) { $n.ToString().Trim() } else { "" }
+                $code = ""
+                $name = ""
+
+                try {
+                    $rawCode = $mRst.Fields.Item("Code").Value
+                    if ($rawCode -ne [System.DBNull]::Value) {
+                        $code = $rawCode.ToString().Trim()
+                    }
+                } catch {}
+
+                try {
+                    $rawName = $mRst.Fields.Item("Name").Value
+                    if ($rawName -ne [System.DBNull]::Value) {
+                        $name = $rawName.ToString().Trim()
+                    }
+                } catch {}
+
+                if (-not [string]::IsNullOrWhiteSpace($code)) {
+                    $masterMap[$code] = $name
                 }
+
                 $mRst.MoveNext()
             }
+
             try { $mRst.Close() } catch {}
         }
-        
+
+        # ------------------------------------------------------------
+        # Read and accumulate original voucher items
+        # Use item code as the key so duplicate item rows are summed.
+        # ------------------------------------------------------------
         $originalItems = @{}
-        $oRst = $fi.GetRecordset("SELECT MasterCode1, MasterCode2, Value1, Value2 FROM Tran2 WHERE VchCode=$OrigVchCode AND RecType=2")
+
+        $oRst = $fi.GetRecordset(
+            "SELECT MasterCode1, Value1, Value2
+             FROM Tran2
+             WHERE VchCode=$OrigVchCode
+               AND RecType=2"
+        )
+
         if ($null -ne $oRst -and -not $oRst.EOF) {
             $oRst.MoveFirst()
+
             while (-not $oRst.EOF) {
-                $iCode = ""
-                try { $iCode = $oRst.Fields.Item("MasterCode1").Value.ToString().Trim() } catch {}
-                
+                $itemCode = ""
                 $qty = 0.0
-                try { $qty = [Math]::Abs([double]$oRst.Fields.Item("Value1").Value) } catch {}
-                
                 $altQty = 0.0
-                try { $altQty = [Math]::Abs([double]$oRst.Fields.Item("Value2").Value) } catch {}
-                
-                $itemName = if ($masterMap.ContainsKey($iCode)) { $masterMap[$iCode] } else { $iCode }
-                
-                if ($itemName -ne "" -and $qty -gt 0) {
-                    $originalItems[$itemName] = @{ originalQty = $qty; originalAltQty = $altQty }
+
+                try {
+                    $rawCode = $oRst.Fields.Item("MasterCode1").Value
+                    if ($rawCode -ne [System.DBNull]::Value) {
+                        $itemCode = $rawCode.ToString().Trim()
+                    }
+                } catch {}
+
+                try {
+                    $rawQty = $oRst.Fields.Item("Value1").Value
+                    if ($rawQty -ne [System.DBNull]::Value) {
+                        $qty = [Math]::Abs([double]$rawQty)
+                    }
+                } catch {}
+
+                try {
+                    $rawAltQty = $oRst.Fields.Item("Value2").Value
+                    if ($rawAltQty -ne [System.DBNull]::Value) {
+                        $altQty = [Math]::Abs([double]$rawAltQty)
+                    }
+                } catch {}
+
+                if (
+                    -not [string]::IsNullOrWhiteSpace($itemCode) -and
+                    $qty -gt 0
+                ) {
+                    $itemName = if ($masterMap.ContainsKey($itemCode)) {
+                        $masterMap[$itemCode]
+                    } else {
+                        $itemCode
+                    }
+
+                    if (-not $originalItems.ContainsKey($itemCode)) {
+                        $originalItems[$itemCode] = @{
+                            itemCode       = $itemCode
+                            itemName       = $itemName
+                            originalQty    = 0.0
+                            originalAltQty = 0.0
+                        }
+                    }
+
+                    # Important: accumulate duplicate item rows
+                    $originalItems[$itemCode].originalQty += $qty
+                    $originalItems[$itemCode].originalAltQty += $altQty
                 }
+
                 $oRst.MoveNext()
             }
+
             try { $oRst.Close() } catch {}
         }
-        
+
+        # ------------------------------------------------------------
+        # Find all return vouchers linked to the original voucher
+        # ------------------------------------------------------------
         $linkedReturnCodes = @()
-        $lRst = $fi.GetRecordset("SELECT DISTINCT T2.VchCode FROM Tran3 T1, Tran3 T2 WHERE T1.RefCode = T2.RefCode AND T1.Method=1 AND T1.VchCode=$OrigVchCode AND T1.VchType=$OrigVchType AND T2.VchType=$returnVchType AND T2.Method=2")
+
+        $lRst = $fi.GetRecordset(
+            "SELECT DISTINCT T2.VchCode
+             FROM Tran3 T1, Tran3 T2
+             WHERE T1.RefCode = T2.RefCode
+               AND T1.Method = 1
+               AND T1.VchCode = $OrigVchCode
+               AND T1.VchType = $OrigVchType
+               AND T2.VchType = $returnVchType
+               AND T2.Method = 2"
+        )
+
         if ($null -ne $lRst -and -not $lRst.EOF) {
             $lRst.MoveFirst()
+
             while (-not $lRst.EOF) {
-                $rc = 0
-                try { $rc = [int]$lRst.Fields.Item("VchCode").Value } catch {}
-                if ($rc -gt 0) { $linkedReturnCodes += $rc }
+                $returnCode = 0
+
+                try {
+                    $rawReturnCode = $lRst.Fields.Item("VchCode").Value
+                    if ($rawReturnCode -ne [System.DBNull]::Value) {
+                        $returnCode = [int]$rawReturnCode
+                    }
+                } catch {}
+
+                if (
+                    $returnCode -gt 0 -and
+                    $linkedReturnCodes -notcontains $returnCode
+                ) {
+                    $linkedReturnCodes += $returnCode
+                }
+
                 $lRst.MoveNext()
             }
+
             try { $lRst.Close() } catch {}
         }
-        
+
+        # ------------------------------------------------------------
+        # Read each linked return voucher
+        # ------------------------------------------------------------
         $returnVouchers = @()
+
         foreach ($retCode in $linkedReturnCodes) {
             $retVchNo = ""
             $retDate = ""
-            $retAmt = 0.0
-            
-            $hRst = $fi.GetRecordset("SELECT VchNo, Date FROM Tran1 WHERE VchCode=$retCode")
-            if ($hRst -and -not $hRst.EOF) {
+            $retItemsByCode = @{}
+
+            $hRst = $fi.GetRecordset(
+                "SELECT VchNo, Date
+                 FROM Tran1
+                 WHERE VchCode=$retCode"
+            )
+
+            if ($null -ne $hRst -and -not $hRst.EOF) {
                 $hRst.MoveFirst()
-                try { $retVchNo = $hRst.Fields.Item("VchNo").Value.ToString().Trim() } catch {}
+
+                try {
+                    $rawVchNo = $hRst.Fields.Item("VchNo").Value
+                    if ($rawVchNo -ne [System.DBNull]::Value) {
+                        $retVchNo = $rawVchNo.ToString().Trim()
+                    }
+                } catch {}
+
                 try {
                     $rawDate = $hRst.Fields.Item("Date").Value
-                    if ($rawDate -is [datetime]) {
-                        $retDate = $rawDate.ToString("dd-MM-yyyy")
-                    } else {
-                        $retDate = [datetime]::Parse($rawDate.ToString()).ToString("dd-MM-yyyy")
+
+                    if ($rawDate -ne [System.DBNull]::Value) {
+                        if ($rawDate -is [datetime]) {
+                            $retDate = $rawDate.ToString("dd-MM-yyyy")
+                        } else {
+                            $retDate = [datetime]::Parse(
+                                $rawDate.ToString()
+                            ).ToString("dd-MM-yyyy")
+                        }
                     }
                 } catch {}
             }
-            if ($hRst) { try { $hRst.Close() } catch {} }
-            
-            $retItems = @()
-            $riRst = $fi.GetRecordset("SELECT MasterCode1, Value1, Value2 FROM Tran2 WHERE VchCode=$retCode AND RecType=2")
+
+            if ($null -ne $hRst) {
+                try { $hRst.Close() } catch {}
+            }
+
+            $riRst = $fi.GetRecordset(
+                "SELECT MasterCode1, Value1, Value2
+                 FROM Tran2
+                 WHERE VchCode=$retCode
+                   AND RecType=2"
+            )
+
             if ($null -ne $riRst -and -not $riRst.EOF) {
                 $riRst.MoveFirst()
+
                 while (-not $riRst.EOF) {
-                    $iCode = ""
-                    try { $iCode = $riRst.Fields.Item("MasterCode1").Value.ToString().Trim() } catch {}
-                    
+                    $itemCode = ""
                     $qty = 0.0
-                    try { $qty = [Math]::Abs([double]$riRst.Fields.Item("Value1").Value) } catch {}
-                    
-                    $itemName = if ($masterMap.ContainsKey($iCode)) { $masterMap[$iCode] } else { $iCode }
-                    
-                    if ($itemName -ne "" -and $qty -gt 0) {
-                        $retItems += @{ itemName = $itemName; returnedQty = $qty }
-                        $retAmt += $qty
+                    $altQty = 0.0
+
+                    try {
+                        $rawCode = $riRst.Fields.Item("MasterCode1").Value
+                        if ($rawCode -ne [System.DBNull]::Value) {
+                            $itemCode = $rawCode.ToString().Trim()
+                        }
+                    } catch {}
+
+                    try {
+                        $rawQty = $riRst.Fields.Item("Value1").Value
+                        if ($rawQty -ne [System.DBNull]::Value) {
+                            $qty = [Math]::Abs([double]$rawQty)
+                        }
+                    } catch {}
+
+                    try {
+                        $rawAltQty = $riRst.Fields.Item("Value2").Value
+                        if ($rawAltQty -ne [System.DBNull]::Value) {
+                            $altQty = [Math]::Abs([double]$rawAltQty)
+                        }
+                    } catch {}
+
+                    if (
+                        -not [string]::IsNullOrWhiteSpace($itemCode) -and
+                        $qty -gt 0
+                    ) {
+                        $itemName = if ($masterMap.ContainsKey($itemCode)) {
+                            $masterMap[$itemCode]
+                        } else {
+                            $itemCode
+                        }
+
+                        if (-not $retItemsByCode.ContainsKey($itemCode)) {
+                            $retItemsByCode[$itemCode] = @{
+                                itemCode       = $itemCode
+                                itemName       = $itemName
+                                returnedQty    = 0.0
+                                returnedAltQty = 0.0
+                            }
+                        }
+
+                        # Accumulate duplicate rows in the return voucher
+                        $retItemsByCode[$itemCode].returnedQty += $qty
+                        $retItemsByCode[$itemCode].returnedAltQty += $altQty
                     }
+
                     $riRst.MoveNext()
                 }
+
                 try { $riRst.Close() } catch {}
             }
-            
+
+            $retItems = @()
+
+            foreach ($itemCode in $retItemsByCode.Keys) {
+                $item = $retItemsByCode[$itemCode]
+
+                $retItems += @{
+                    itemCode       = $item.itemCode
+                    itemName       = $item.itemName
+                    returnedQty    = [Math]::Round(
+                        [double]$item.returnedQty,
+                        3
+                    )
+                    returnedAltQty = [Math]::Round(
+                        [double]$item.returnedAltQty,
+                        3
+                    )
+                }
+            }
+
             $returnVouchers += @{
                 vchCode = $retCode
-                vchNo = $retVchNo
-                date = $retDate
-                items = $retItems
+                vchNo   = $retVchNo
+                date    = $retDate
+                items   = $retItems
             }
         }
-        
+
+        # ------------------------------------------------------------
+        # Build final per-item return summary
+        # ------------------------------------------------------------
         $itemSummary = @()
-        foreach ($itemName in $originalItems.Keys) {
-            $origQty = $originalItems[$itemName].originalQty
-            $retQty = 0.0
-            foreach ($rv in $returnVouchers) {
-                foreach ($ri in $rv.items) {
-                    if ($ri.itemName -eq $itemName) {
-                        $retQty += $ri.returnedQty
+
+        foreach ($itemCode in $originalItems.Keys) {
+            $originalItem = $originalItems[$itemCode]
+
+            $originalQty = [Math]::Round(
+                [double]$originalItem.originalQty,
+                3
+            )
+
+            $originalAltQty = [Math]::Round(
+                [double]$originalItem.originalAltQty,
+                3
+            )
+
+            $returnedQty = 0.0
+            $returnedAltQty = 0.0
+
+            foreach ($returnVoucher in $returnVouchers) {
+                foreach ($returnedItem in @($returnVoucher.items)) {
+                    if (
+                        [string]$returnedItem.itemCode -eq
+                        [string]$itemCode
+                    ) {
+                        $returnedQty += [double]$returnedItem.returnedQty
+                        $returnedAltQty += [double]$returnedItem.returnedAltQty
                     }
                 }
             }
-            $available = [Math]::Max(0,[Math]::Round($origQty - $retQty, 3))
+
+            $returnedQty = [Math]::Round($returnedQty, 3)
+            $returnedAltQty = [Math]::Round($returnedAltQty, 3)
+
+            $availableQty = [Math]::Max(
+                0,
+                [Math]::Round(
+                    $originalQty - $returnedQty,
+                    3
+                )
+            )
+
+            $availableAltQty = [Math]::Max(
+                0,
+                [Math]::Round(
+                    $originalAltQty - $returnedAltQty,
+                    3
+                )
+            )
+
             $itemSummary += @{
-                itemName = $itemName
-                originalQty = $origQty
-                returnedQty = [Math]::Round($retQty, 3)
-                availableQty = $available
+                itemCode        = $itemCode
+                itemName        = $originalItem.itemName
+                originalQty     = $originalQty
+                returnedQty     = $returnedQty
+                availableQty    = $availableQty
+                originalAltQty  = $originalAltQty
+                returnedAltQty  = $returnedAltQty
+                availableAltQty = $availableAltQty
+                fullyReturned   = ($availableQty -le 0.000001)
             }
         }
-        
+
         return @{
-            success = $true
+            success         = $true
             originalVchCode = $OrigVchCode
-            returnVouchers = $returnVouchers
-            itemSummary = $itemSummary
+            returnVouchers  = $returnVouchers
+            itemSummary     = $itemSummary
         }
-    } catch {
-        return @{ success = $false; error = $_.Exception.Message }
-    } finally {
+    }
+    catch {
+        return @{
+            success = $false
+            error   = $_.Exception.Message
+        }
+    }
+    finally {
         Disconnect-BUSY $fi
     }
 }

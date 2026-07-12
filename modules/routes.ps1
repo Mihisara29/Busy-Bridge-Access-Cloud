@@ -341,32 +341,103 @@ function Start-BUSYServer {
                 }
 
             } elseif ($path -eq "/busy/search-for-return" -and $method -eq "GET") {
-                $vchTypeStr = $request.QueryString["vchType"]
-                if (-not $vchTypeStr) { $vchTypeStr = $request.QueryString["params[vchType]"] }
+                # Used by:
+                #   - Sale/Purchase return original-voucher search
+                #   - Receipt F11 pending bills
+                #   - Payment F11 pending bills
+                #
+                # Supported parent voucher types:
+                #   2  = Purchase
+                #   3  = Sale Return
+                #   9  = Sale
+                #   10 = Purchase Return
 
-                if (-not $vchTypeStr) {
-                    $result = @{ success=$true; count=0; data=@() }
+                $vchTypeStr = Get-QueryStringValue $request.QueryString "vchType" ""
+                if ($vchTypeStr -eq "") {
+                    $vchTypeStr = Get-QueryStringValue $request.QueryString "params[vchType]" ""
+                }
+
+                $parsedVchType = 0
+                $validVchType = $false
+
+                if (-not [string]::IsNullOrWhiteSpace($vchTypeStr)) {
+                    $validVchType = [int]::TryParse(
+                        $vchTypeStr.ToString(),
+                        [ref]$parsedVchType
+                    )
+                }
+
+                if (-not $validVchType -or $parsedVchType -notin @(2, 3, 9, 10)) {
+                    $result = @{
+                        success = $false
+                        error   = "A valid vchType is required. Supported values are 2, 3, 9, and 10."
+                        count   = 0
+                        data    = @()
+                    }
+                    $response.StatusCode = 400
                 } else {
                     $vchNoVal = Get-QueryStringValue $request.QueryString "vchNo" ""
-                    if ($vchNoVal -eq "") { $vchNoVal = Get-QueryStringValue $request.QueryString "params[vchNo]" "" }
+                    if ($vchNoVal -eq "") {
+                        $vchNoVal = Get-QueryStringValue $request.QueryString "params[vchNo]" ""
+                    }
 
                     $partyVal = Get-QueryStringValue $request.QueryString "party" ""
-                    if ($partyVal -eq "") { $partyVal = Get-QueryStringValue $request.QueryString "params[party]" "" }
+                    if ($partyVal -eq "") {
+                        $partyVal = Get-QueryStringValue $request.QueryString "params[party]" ""
+                    }
 
                     $fromVal = Get-QueryStringValue $request.QueryString "from" ""
-                    if ($fromVal -eq "") { $fromVal = Get-QueryStringValue $request.QueryString "params[from]" "" }
+                    if ($fromVal -eq "") {
+                        $fromVal = Get-QueryStringValue $request.QueryString "params[from]" ""
+                    }
 
                     $toVal = Get-QueryStringValue $request.QueryString "to" ""
-                    if ($toVal -eq "") { $toVal = Get-QueryStringValue $request.QueryString "params[to]" "" }
+                    if ($toVal -eq "") {
+                        $toVal = Get-QueryStringValue $request.QueryString "params[to]" ""
+                    }
 
+                    # Return the complete enriched result from Search-OriginalVouchers.
+                    # The response includes:
+                    #   transactionType
+                    #   parentAmount
+                    #   saleReturnedAmount
+                    #   purchaseReturnedAmount
+                    #   alreadyReceivedAmount
+                    #   alreadyPaidAmount
+                    #   pendingAmount
+                    #   totalAmt / returnedAmt / netAmt compatibility fields
                     $result = Search-OriginalVouchers `
-                        -VchType     ([int]$vchTypeStr) `
+                        -VchType     $parsedVchType `
                         -VchNo       $vchNoVal `
                         -Party       $partyVal `
                         -FromDate    $fromVal `
                         -ToDate      $toVal `
                         -InstanceId  $instanceId `
                         -CompanyCode $companyCode
+
+                    if ($null -eq $result) {
+                        $result = @{
+                            success = $false
+                            error   = "Search-OriginalVouchers returned no response."
+                            count   = 0
+                            data    = @()
+                        }
+                        $response.StatusCode = 500
+                    }
+                    elseif ($result.success -eq $false) {
+                        $response.StatusCode = 500
+                    }
+                    else {
+                        # Ensure predictable response structure without removing
+                        # any of the enriched fields returned by vouchers.ps1.
+                        if ($null -eq $result.data) {
+                            $result.data = @()
+                        }
+
+                        if ($null -eq $result.count) {
+                            $result.count = @($result.data).Count
+                        }
+                    }
                 }
 
             } elseif ($path -eq "/busy/return-history" -and $method -eq "GET") {
@@ -483,6 +554,56 @@ function Start-BUSYServer {
                 $data = Read-RequestBody $request | ConvertFrom-Json
                 if (-not $data.name -or -not $data.group) { $result = @{success=$false;error="name and group required"}; $response.StatusCode=400 } else { $result = Update-Account -Data $data -InstanceId $instanceId -CompanyCode $companyCode }
 
+            } elseif ($path -eq "/busy/reports/outstanding" -and $method -eq "GET") {
+                $asOfVal = Get-QueryStringValue $request.QueryString "asOf" ""
+                $typeVal = Get-QueryStringValue $request.QueryString "type" "all"
+                $searchVal = Get-QueryStringValue $request.QueryString "search" ""
+                $groupVal = Get-QueryStringValue $request.QueryString "group" ""
+                $statusVal = Get-QueryStringValue $request.QueryString "status" "all"
+                $minAmountVal = Get-QueryStringValue $request.QueryString "minAmount" "0"
+                $includeZeroVal = Get-QueryStringValue $request.QueryString "includeZero" "false"
+                $pageVal = Get-QueryStringValue $request.QueryString "page" "1"
+                $pageSizeVal = Get-QueryStringValue $request.QueryString "pageSize" "100"
+
+                $result = Get-OutstandingReport `
+                    -AsOf        $asOfVal `
+                    -Type        $typeVal `
+                    -Search      $searchVal `
+                    -Group       $groupVal `
+                    -Status      $statusVal `
+                    -MinAmount   ([double]$minAmountVal) `
+                    -IncludeZero ($includeZeroVal -eq "true" -or $includeZeroVal -eq "1") `
+                    -Page        ([int]$pageVal) `
+                    -PageSize    ([int]$pageSizeVal) `
+                    -InstanceId  $instanceId `
+                    -CompanyCode $companyCode
+
+            } elseif ($path -eq "/busy/reports/stock-status" -and $method -eq "GET") {
+                $asOfVal = Get-QueryStringValue $request.QueryString "asOf" ""
+                $materialCentreVal = Get-QueryStringValue $request.QueryString "materialCentre" ""
+                $itemGroupVal = Get-QueryStringValue $request.QueryString "itemGroup" ""
+                $searchVal = Get-QueryStringValue $request.QueryString "search" ""
+                $statusVal = Get-QueryStringValue $request.QueryString "status" "all"
+                $includeZeroVal = Get-QueryStringValue $request.QueryString "includeZero" "true"
+                $lowStockLevelVal = Get-QueryStringValue $request.QueryString "lowStockLevel" "5"
+                $valueByVal = Get-QueryStringValue $request.QueryString "valueBy" "purchase"
+                $pageVal = Get-QueryStringValue $request.QueryString "page" "1"
+                $pageSizeVal = Get-QueryStringValue $request.QueryString "pageSize" "100"
+
+                $result = Get-StockStatusReport `
+                    -AsOf           $asOfVal `
+                    -MaterialCentre $materialCentreVal `
+                    -ItemGroup      $itemGroupVal `
+                    -Search         $searchVal `
+                    -Status         $statusVal `
+                    -IncludeZero    ($includeZeroVal -eq "true" -or $includeZeroVal -eq "1") `
+                    -LowStockLevel  ([double]$lowStockLevelVal) `
+                    -ValueBy        $valueByVal `
+                    -Page           ([int]$pageVal) `
+                    -PageSize       ([int]$pageSizeVal) `
+                    -InstanceId     $instanceId `
+                    -CompanyCode    $companyCode
+
             } elseif ($path -eq "/busy/item-groups" -and $method -eq "GET") {
                 $result = Get-ItemGroups -InstanceId $instanceId -CompanyCode $companyCode
             } elseif ($path -eq "/busy/item-group" -and $method -eq "POST") {
@@ -521,6 +642,35 @@ function Start-BUSYServer {
                     -Search      $searchVal `
                     -InstanceId  $instanceId `
                     -CompanyCode $companyCode
+
+            } elseif ($path -eq "/busy/vouchers/item-detail" -and $method -eq "GET") {
+                $codeStr = Get-QueryStringValue $request.QueryString "code" ""
+                if ($codeStr -eq "") {
+                    $codeStr = Get-QueryStringValue $request.QueryString "params[code]" ""
+                }
+
+                $itemCode = 0
+                $isValidCode = $false
+
+                if (-not [string]::IsNullOrWhiteSpace($codeStr)) {
+                    $isValidCode = [int]::TryParse(
+                        $codeStr.ToString(),
+                        [ref]$itemCode
+                    )
+                }
+
+                if (-not $isValidCode -or $itemCode -le 0) {
+                    $result = @{
+                        success = $false
+                        error   = "Valid item code is required"
+                    }
+                    $response.StatusCode = 400
+                } else {
+                    $result = Get-VoucherItemDetail `
+                        -Code        $itemCode `
+                        -InstanceId  $instanceId `
+                        -CompanyCode $companyCode
+                }
 
             } elseif ($path -eq "/busy/item" -and $method -eq "GET") {
                 $codeStr = $request.QueryString["code"]
