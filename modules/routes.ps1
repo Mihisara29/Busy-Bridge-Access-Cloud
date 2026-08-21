@@ -798,6 +798,107 @@ function Start-BUSYServer {
                 $result = Get-CompanyUsers -InstanceId $instanceId -CompanyCode $companyCode
 
             # --- MASTER DATA ---
+
+            # --- PRODUCTION BOM MASTER DATA ---
+            } elseif ($path -eq "/busy/boms" -and $method -eq "GET") {
+                $searchVal = Get-QueryStringValue $request.QueryString "search" ""
+                if ($searchVal -eq "") {
+                    $searchVal = Get-QueryStringValue $request.QueryString "params[search]" ""
+                }
+
+                $result = Get-BomList `
+                    -Search       $searchVal `
+                    -InstanceId   $instanceId `
+                    -CompanyCode  $companyCode
+
+            } elseif ($path -eq "/busy/bom/detail" -and $method -eq "GET") {
+                $bomCodeStr = Get-QueryStringValue $request.QueryString "code" ""
+                if ($bomCodeStr -eq "") {
+                    $bomCodeStr = Get-QueryStringValue $request.QueryString "params[code]" ""
+                }
+
+                $bomName = Get-QueryStringValue $request.QueryString "name" ""
+                if ($bomName -eq "") {
+                    $bomName = Get-QueryStringValue $request.QueryString "params[name]" ""
+                }
+
+                $bomCode = 0
+                $validBomCode = $false
+
+                if (-not [string]::IsNullOrWhiteSpace($bomCodeStr)) {
+                    $validBomCode = [int]::TryParse(
+                        $bomCodeStr.ToString(),
+                        [ref]$bomCode
+                    )
+                }
+
+                if (
+                    (-not $validBomCode -or $bomCode -le 0) -and
+                    [string]::IsNullOrWhiteSpace($bomName)
+                ) {
+                    $result = @{
+                        success = $false
+                        error   = "BOM code or BOM name is required"
+                    }
+                    $response.StatusCode = 400
+                } else {
+                    $result = Get-BomDetail `
+                        -BomCode     $bomCode `
+                        -BomName     $bomName `
+                        -InstanceId  $instanceId `
+                        -CompanyCode $companyCode
+                }
+
+            } elseif ($path -eq "/busy/bom" -and $method -eq "POST") {
+                $data = Read-RequestBody $request | ConvertFrom-Json
+
+                if (
+                    -not $data.name -or
+                    -not ($data.item -or $data.mainItemName) -or
+                    -not ($data.unit -or $data.mainUnit)
+                ) {
+                    $result = @{
+                        success = $false
+                        error   = "BOM name, Item to Produce and Unit are required"
+                    }
+                    $response.StatusCode = 400
+                }
+                else {
+                    $result = Create-Bom `
+                        -Data        $data `
+                        -InstanceId  $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false) {
+                        $response.StatusCode = 400
+                    }
+                }
+
+            } elseif ($path -eq "/busy/bom" -and $method -eq "PUT") {
+                $data = Read-RequestBody $request | ConvertFrom-Json
+
+                if (
+                    -not $data.name -or
+                    -not ($data.item -or $data.mainItemName) -or
+                    -not ($data.unit -or $data.mainUnit)
+                ) {
+                    $result = @{
+                        success = $false
+                        error   = "BOM name, Item to Produce and Unit are required"
+                    }
+                    $response.StatusCode = 400
+                }
+                else {
+                    $result = Update-Bom `
+                        -Data        $data `
+                        -InstanceId  $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false) {
+                        $response.StatusCode = 400
+                    }
+                }
+
             } elseif ($path -eq "/busy/account-groups" -and $method -eq "GET") {
                 $result = Get-AccountGroups -InstanceId $instanceId -CompanyCode $companyCode
             } elseif ($path -eq "/busy/account-group" -and $method -eq "POST") {
