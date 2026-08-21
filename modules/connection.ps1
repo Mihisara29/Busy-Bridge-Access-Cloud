@@ -290,101 +290,329 @@ function Get-DirectConnection {
 # ═══════════════════════════════════════════════════════
 function Get-CompanyDetails {
     param(
-        [string]$InstanceId = "",
+        [string]$InstanceId  = "",
         [string]$CompanyCode = ""
     )
 
-    $targetInst = Get-InstanceConfig -InstanceId $InstanceId
+    $targetInst =
+        Get-InstanceConfig -InstanceId $InstanceId
+
     $dbType = 0
-    if ($null -ne $targetInst -and $null -ne $targetInst.dbType) { $dbType = [int]$targetInst.dbType }
+
+    if (
+        $null -ne $targetInst -and
+        $null -ne $targetInst.dbType
+    ) {
+        $dbType = [int]$targetInst.dbType
+    }
 
     function Read-SafeReaderField {
-        param($rdr, [string]$field)
+        param(
+            $Reader,
+            [string]$FieldName
+        )
+
         try {
-            $idx = $rdr.GetOrdinal($field)
-            if ($idx -ge 0) {
-                $v = $rdr.GetValue($idx)
-                if ($null -ne $v -and $v -ne [System.DBNull]::Value) {
-                    return $v.ToString().Trim()
-                }
+            $index =
+                $Reader.GetOrdinal($FieldName)
+
+            if (
+                $index -ge 0 -and
+                -not $Reader.IsDBNull($index)
+            ) {
+                return (
+                    [string]$Reader.GetValue($index)
+                ).Trim()
             }
-        } catch {}
+        }
+        catch {}
+
         return ""
     }
 
-    if ($dbType -eq 1) {
-        $sqlServer   = $targetInst.sqlServer
-        $sqlUser     = $targetInst.sqlUser
-        $sqlPassword = $targetInst.sqlPassword
-        $baseDbName  = Get-SqlDatabaseName -CompanyCode $CompanyCode -InstanceId $InstanceId
+    function Build-CompanyResult {
+        param($Reader)
 
-        $connStr = "Server=$sqlServer;Database=$baseDbName;User Id=$sqlUser;Password=$sqlPassword;"
-        $conn = New-Object System.Data.SqlClient.SqlConnection($connStr)
-        try {
-            $conn.Open()
-            $cmd = $conn.CreateCommand()
-            $cmd.CommandText = "SELECT TOP 1 [Name], [PrintName], [Address1], [Address2], [Address3], [Address4], [TelNo], [Fax], [Email], [TINNo], [GSTNo] FROM [Company]"
-            $rdr = $cmd.ExecuteReader()
-            $comp = $null
-            if ($rdr.Read()) {
-                $comp = @{
-                    name      = Read-SafeReaderField $rdr "Name"
-                    printName = Read-SafeReaderField $rdr "PrintName"
-                    address1  = Read-SafeReaderField $rdr "Address1"
-                    address2  = Read-SafeReaderField $rdr "Address2"
-                    address3  = Read-SafeReaderField $rdr "Address3"
-                    address4  = Read-SafeReaderField $rdr "Address4"
-                    telNo     = Read-SafeReaderField $rdr "TelNo"
-                    fax       = Read-SafeReaderField $rdr "Fax"
-                    email     = Read-SafeReaderField $rdr "Email"
-                    tinNo     = Read-SafeReaderField $rdr "TINNo"
-                    gstNo     = Read-SafeReaderField $rdr "GSTNo"
+        $name =
+            Read-SafeReaderField `
+                -Reader $Reader `
+                -FieldName "Name"
+
+        $printName =
+            Read-SafeReaderField `
+                -Reader $Reader `
+                -FieldName "PrintName"
+
+        $address1 =
+            Read-SafeReaderField `
+                -Reader $Reader `
+                -FieldName "Address1"
+
+        $address2 =
+            Read-SafeReaderField `
+                -Reader $Reader `
+                -FieldName "Address2"
+
+        $address3 =
+            Read-SafeReaderField `
+                -Reader $Reader `
+                -FieldName "Address3"
+
+        $address4 =
+            Read-SafeReaderField `
+                -Reader $Reader `
+                -FieldName "Address4"
+
+        $telNo =
+            Read-SafeReaderField `
+                -Reader $Reader `
+                -FieldName "TelNo"
+
+        $email =
+            Read-SafeReaderField `
+                -Reader $Reader `
+                -FieldName "Email"
+
+        $fax =
+            Read-SafeReaderField `
+                -Reader $Reader `
+                -FieldName "Fax"
+
+        $tinNo =
+            Read-SafeReaderField `
+                -Reader $Reader `
+                -FieldName "TINNo"
+
+        $gstNo =
+            Read-SafeReaderField `
+                -Reader $Reader `
+                -FieldName "GSTNo"
+
+        # Prefer the proper TIN field.
+        # Use GST only when TIN is blank.
+        $taxNo = if (
+            -not [string]::IsNullOrWhiteSpace($tinNo)
+        ) {
+            $tinNo
+        }
+        else {
+            $gstNo
+        }
+
+        # Current company data stores phone inside Address3.
+        # Use this fallback only when TelNo is empty.
+        $phone = $telNo
+
+        if (
+            [string]::IsNullOrWhiteSpace($phone) -and
+            $address3 -match
+                '(?i)(?:tel|telephone)\s*:?\s*(.+)$'
+        ) {
+            $phone =
+                $Matches[1].Trim()
+        }
+
+        # Current company data stores email inside Address4.
+        # Use this fallback only when Email is empty.
+        if (
+            [string]::IsNullOrWhiteSpace($email) -and
+            $address4 -match
+                '(?i)(?:e-mail|email)\s*:?\s*(.+)$'
+        ) {
+            $email =
+                $Matches[1].Trim()
+        }
+
+        # Do not repeat telephone and email text
+        # inside the supplier postal address.
+        $addressParts = @()
+
+        foreach ($line in @(
+            $address1,
+            $address2
+        )) {
+            if (
+                -not [string]::IsNullOrWhiteSpace($line)
+            ) {
+                $addressParts += $line
+            }
+        }
+
+        $address =
+            $addressParts -join ", "
+
+        $displayName = if (
+            -not [string]::IsNullOrWhiteSpace($printName)
+        ) {
+            $printName
+        }
+        else {
+            $name
+        }
+
+        return @{
+            name      = $name
+            printName = $printName
+            displayName = $displayName
+
+            address1  = $address1
+            address2  = $address2
+            address3  = $address3
+            address4  = $address4
+            address   = $address
+
+            telNo     = $telNo
+            phone     = $phone
+            fax       = $fax
+            email     = $email
+
+            tinNo     = $tinNo
+            gstNo     = $gstNo
+            taxNo     = $taxNo
+        }
+    }
+
+    $conn = $null
+    $cmd = $null
+    $rdr = $null
+
+    try {
+        if ($dbType -eq 1) {
+            if ($null -eq $targetInst) {
+                return @{
+                    success = $false
+                    error   = "Instance configuration not found"
                 }
             }
-            $rdr.Close()
-            if ($null -ne $comp) { return @{ success = $true; data = $comp } }
-            return @{ success = $false; error = "No company configuration found" }
-        } catch {
-            return @{ success = $false; error = $_.Exception.Message }
-        } finally {
-            if ($null -ne $conn) { try { $conn.Close() } catch {} }
-        }
-    } else {
-        $dbFile = Get-MainCompanyDbPath -CompanyCode $CompanyCode
-        if ([string]::IsNullOrEmpty($dbFile) -or -not (Test-Path $dbFile)) {
-            return @{ success = $false; error = "Main db.bds file not found" }
-        }
 
-        $connStr = "Provider=Microsoft.Jet.OLEDB.4.0;Data Source=$dbFile;Jet OLEDB:Database Password=ILoveMyINDIA;"
-        $conn = New-Object System.Data.OleDb.OleDbConnection($connStr)
-        try {
-            $conn.Open()
-            $cmd = $conn.CreateCommand()
-            $cmd.CommandText = "SELECT [Name], [PrintName], [Address1], [Address2], [Address3], [Address4], [TelNo], [Fax], [Email], [TINNo], [GSTNo] FROM [Company]"
-            $rdr = $cmd.ExecuteReader()
-            $comp = $null
-            if ($rdr.Read()) {
-                $comp = @{
-                    name      = Read-SafeReaderField $rdr "Name"
-                    printName = Read-SafeReaderField $rdr "PrintName"
-                    address1  = Read-SafeReaderField $rdr "Address1"
-                    address2  = Read-SafeReaderField $rdr "Address2"
-                    address3  = Read-SafeReaderField $rdr "Address3"
-                    address4  = Read-SafeReaderField $rdr "Address4"
-                    telNo     = Read-SafeReaderField $rdr "TelNo"
-                    fax       = Read-SafeReaderField $rdr "Fax"
-                    email     = Read-SafeReaderField $rdr "Email"
-                    tinNo     = Read-SafeReaderField $rdr "TINNo"
-                    gstNo     = Read-SafeReaderField $rdr "GSTNo"
+            $sqlServer =
+                [string]$targetInst.sqlServer
+
+            $sqlUser =
+                [string]$targetInst.sqlUser
+
+            $sqlPassword =
+                [string]$targetInst.sqlPassword
+
+            $baseDbName =
+                Get-SqlDatabaseName `
+                    -CompanyCode $CompanyCode `
+                    -InstanceId $InstanceId
+
+            $connectionString =
+                "Server=$sqlServer;" +
+                "Database=$baseDbName;" +
+                "User Id=$sqlUser;" +
+                "Password=$sqlPassword;"
+
+            $conn =
+                New-Object `
+                    System.Data.SqlClient.SqlConnection(
+                        $connectionString
+                    )
+        }
+        else {
+            $dbFile =
+                Get-MainCompanyDbPath `
+                    -CompanyCode $CompanyCode
+
+            if (
+                [string]::IsNullOrWhiteSpace($dbFile) -or
+                -not (Test-Path -LiteralPath $dbFile)
+            ) {
+                return @{
+                    success = $false
+                    error   = "Main db.bds file not found: $dbFile"
                 }
             }
-            $rdr.Close()
-            if ($null -ne $comp) { return @{ success = $true; data = $comp } }
-            return @{ success = $false; error = "No company configuration found in db.bds" }
-        } catch {
-            return @{ success = $false; error = $_.Exception.Message }
-        } finally {
-            if ($null -ne $conn) { try { $conn.Close() } catch {} }
+
+            $connectionString =
+                "Provider=Microsoft.Jet.OLEDB.4.0;" +
+                "Data Source=$dbFile;" +
+                "Jet OLEDB:Database Password=ILoveMyINDIA;"
+
+            $conn =
+                New-Object `
+                    System.Data.OleDb.OleDbConnection(
+                        $connectionString
+                    )
+        }
+
+        $conn.Open()
+
+        $cmd =
+            $conn.CreateCommand()
+
+        $cmd.CommandText = @"
+SELECT TOP 1
+    [Name],
+    [PrintName],
+    [Address1],
+    [Address2],
+    [Address3],
+    [Address4],
+    [TelNo],
+    [Fax],
+    [Email],
+    [TINNo],
+    [GSTNo]
+FROM [Company]
+"@
+
+        $rdr =
+            $cmd.ExecuteReader()
+
+        if (-not $rdr.Read()) {
+            return @{
+                success = $false
+                error   = "No company configuration found"
+            }
+        }
+
+        $company =
+            Build-CompanyResult -Reader $rdr
+
+        return @{
+            success = $true
+            data    = $company
+        }
+    }
+    catch {
+        return @{
+            success = $false
+            error   = $_.Exception.Message
+        }
+    }
+    finally {
+        if ($null -ne $rdr) {
+            try {
+                $rdr.Close()
+            }
+            catch {}
+
+            try {
+                $rdr.Dispose()
+            }
+            catch {}
+        }
+
+        if ($null -ne $cmd) {
+            try {
+                $cmd.Dispose()
+            }
+            catch {}
+        }
+
+        if ($null -ne $conn) {
+            try {
+                $conn.Close()
+            }
+            catch {}
+
+            try {
+                $conn.Dispose()
+            }
+            catch {}
         }
     }
 }

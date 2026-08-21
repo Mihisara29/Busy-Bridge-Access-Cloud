@@ -537,106 +537,446 @@ function Get-Parties {
         [string]$InstanceId  = "",
         [string]$CompanyCode = ""
     )
-    if ($Page -lt 1) { $Page = 1 }
-    if ($PageSize -lt 1) { $PageSize = 30 }
 
-    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
-    if (-not $fi) { return @{ success = $false; error = "BUSY connection failed" } }
+    if ($Page -lt 1) {
+        $Page = 1
+    }
+
+    if ($PageSize -lt 1) {
+        $PageSize = 30
+    }
+
+    $fi = Connect-BUSY `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $fi) {
+        return @{
+            success = $false
+            error   = "BUSY connection failed"
+        }
+    }
+
     try {
-        # Dynamically set the wildcard string based on dbType
-$targetInst = Get-InstanceConfig -InstanceId $InstanceId
-$dbType = 0
-if ($null -ne $targetInst -and $null -ne $targetInst.dbType) { $dbType = [int]$targetInst.dbType }
-$wildcard = if ($dbType -eq 1) { "%" } else { "*" }
+        $targetInst = Get-InstanceConfig `
+            -InstanceId $InstanceId
 
-        $where = "Master1.MasterType = 2"
-        
+        $dbType = 0
+
+        if (
+            $null -ne $targetInst -and
+            $null -ne $targetInst.dbType
+        ) {
+            $dbType = [int]$targetInst.dbType
+        }
+
+        # SQL Server uses %, Access uses *.
+        $wildcard = if ($dbType -eq 1) {
+            "%"
+        }
+        else {
+            "*"
+        }
+
+        $where = "M.MasterType = 2"
+
         if ($CashBankOnly) {
-            $where += " AND (
-                Master1.ParentGrp IN (SELECT Code FROM Master1 WHERE Name IN ('Cash-in-hand', 'Bank Accounts'))
-            )"
+            $where += @"
+ AND M.ParentGrp IN (
+    SELECT Code
+    FROM Master1
+    WHERE Name IN ('Cash-in-hand', 'Bank Accounts')
+)
+"@
         }
 
-        # FIX: Apply dynamic database wildcards
-        if ($Search -and $Search -ne "") {
-            $safeSearch = $Search -replace "'", "''"
-            $where += " AND (Master1.Name LIKE '$wildcard$safeSearch$wildcard' OR Master1.Alias LIKE '$wildcard$safeSearch$wildcard')"
+        if (-not [string]::IsNullOrWhiteSpace($Search)) {
+            $safeSearch =
+                $Search.Trim() -replace "'", "''"
+
+            $where += @"
+ AND (
+    M.Name LIKE '$wildcard$safeSearch$wildcard'
+    OR M.Alias LIKE '$wildcard$safeSearch$wildcard'
+    OR A.TelNo LIKE '$wildcard$safeSearch$wildcard'
+    OR A.Mobile LIKE '$wildcard$safeSearch$wildcard'
+    OR A.TINNo LIKE '$wildcard$safeSearch$wildcard'
+ )
+"@
         }
 
-        # 1. Fetch exact total records count
-        $countQry = "SELECT COUNT(*) AS TotalCount FROM Master1 WHERE $where"
-        $countRst = $fi.GetRecordset($countQry)
+        # Count distinct accounts because the address table is joined.
+        $countQry = @"
+SELECT COUNT(*) AS TotalCount
+FROM Master1 AS M
+WHERE $where
+"@
+
+        $countRst =
+            $fi.GetRecordset($countQry)
+
         $totalRecords = 0
+
         if ($countRst -and -not $countRst.EOF) {
-            $totalRecords = [int]$countRst.Fields.Item("TotalCount").Value
-            $countRst.Close()
+            $countValue =
+                $countRst.Fields.Item(
+                    "TotalCount"
+                ).Value
+
+            if (
+                $countValue -ne
+                [System.DBNull]::Value
+            ) {
+                $totalRecords =
+                    [int][string]$countValue
+            }
+
+            try {
+                $countRst.Close()
+            }
+            catch {}
         }
 
-        # 2. Query target page dataset
-        $qry = "SELECT Master1.Code, Master1.Name, Master1.Alias, 
-                    (SELECT M1.Name FROM Master1 M1 WHERE M1.Code = Master1.ParentGrp) AS ParentGrpName 
-                FROM Master1 
-                WHERE $where 
-                ORDER BY Master1.Name"
-        $rst = $fi.GetRecordset($qry)
+        $qry = @"
+SELECT
+    M.Code,
+    M.Name,
+    M.Alias,
+
+    (
+        SELECT G.Name
+        FROM Master1 AS G
+        WHERE G.Code = M.ParentGrp
+    ) AS ParentGrpName,
+
+    A.Address1,
+    A.Address2,
+    A.Address3,
+    A.Address4,
+    A.TelNo,
+    A.Mobile,
+    A.Email,
+    A.TINNo
+
+FROM
+    Master1 AS M
+
+LEFT JOIN
+    MasterAddressInfo AS A
+ON
+    A.MasterCode = M.Code
+
+WHERE
+    $where
+
+ORDER BY
+    M.Name
+"@
+
+        $rst =
+            $fi.GetRecordset($qry)
+
         $parties = @()
 
-        # Pagination indexing parameters
-        $startIndex   = ($Page - 1) * $PageSize
-        $endIndex     = $startIndex + $PageSize - 1
+        $startIndex =
+            ($Page - 1) * $PageSize
+
+        $endIndex =
+            $startIndex + $PageSize - 1
+
         $currentIndex = 0
 
-        # FIX: Added EOF safety check to prevent COM exception 3021
         if ($rst -and -not $rst.EOF) {
             $rst.MoveFirst()
+
             while (-not $rst.EOF) {
-                # Skip items before target page
                 if ($currentIndex -lt $startIndex) {
                     $currentIndex++
                     $rst.MoveNext()
                     continue
                 }
-                
-                # Break once page is full
+
                 if ($currentIndex -gt $endIndex) {
                     break
                 }
 
-                $parentGrp = [string]$rst.Fields.Item("ParentGrpName").Value
-                $name      = [string]$rst.Fields.Item("Name").Value
+                $codeValue =
+                    $rst.Fields.Item("Code").Value
+
+                $nameValue =
+                    $rst.Fields.Item("Name").Value
+
+                $aliasValue =
+                    $rst.Fields.Item("Alias").Value
+
+                $groupValue =
+                    $rst.Fields.Item(
+                        "ParentGrpName"
+                    ).Value
+
+                $address1Value =
+                    $rst.Fields.Item(
+                        "Address1"
+                    ).Value
+
+                $address2Value =
+                    $rst.Fields.Item(
+                        "Address2"
+                    ).Value
+
+                $address3Value =
+                    $rst.Fields.Item(
+                        "Address3"
+                    ).Value
+
+                $address4Value =
+                    $rst.Fields.Item(
+                        "Address4"
+                    ).Value
+
+                $telValue =
+                    $rst.Fields.Item(
+                        "TelNo"
+                    ).Value
+
+                $mobileValue =
+                    $rst.Fields.Item(
+                        "Mobile"
+                    ).Value
+
+                $emailValue =
+                    $rst.Fields.Item(
+                        "Email"
+                    ).Value
+
+                $tinValue =
+                    $rst.Fields.Item(
+                        "TINNo"
+                    ).Value
+
+                $code = if (
+                    $codeValue -ne
+                    [System.DBNull]::Value
+                ) {
+                    [int][string]$codeValue
+                }
+                else {
+                    0
+                }
+
+                $name = if (
+                    $nameValue -ne
+                    [System.DBNull]::Value
+                ) {
+                    [string]$nameValue
+                }
+                else {
+                    ""
+                }
+
+                $alias = if (
+                    $aliasValue -ne
+                    [System.DBNull]::Value
+                ) {
+                    [string]$aliasValue
+                }
+                else {
+                    ""
+                }
+
+                $parentGrp = if (
+                    $groupValue -ne
+                    [System.DBNull]::Value
+                ) {
+                    [string]$groupValue
+                }
+                else {
+                    ""
+                }
+
+                $addressLines = @()
+
+                foreach ($addressValue in @(
+                    $address1Value,
+                    $address2Value,
+                    $address3Value,
+                    $address4Value
+                )) {
+                    if (
+                        $addressValue -ne
+                            [System.DBNull]::Value -and
+                        -not [string]::IsNullOrWhiteSpace(
+                            [string]$addressValue
+                        )
+                    ) {
+                        $addressLines +=
+                            ([string]$addressValue).Trim()
+                    }
+                }
+
+                $address =
+                    $addressLines -join ", "
+
+                $telNo = if (
+                    $telValue -ne
+                    [System.DBNull]::Value
+                ) {
+                    ([string]$telValue).Trim()
+                }
+                else {
+                    ""
+                }
+
+                $mobileNo = if (
+                    $mobileValue -ne
+                    [System.DBNull]::Value
+                ) {
+                    ([string]$mobileValue).Trim()
+                }
+                else {
+                    ""
+                }
+
+                $phoneParts = @()
+
+                if (
+                    -not [string]::IsNullOrWhiteSpace(
+                        $telNo
+                    )
+                ) {
+                    $phoneParts += $telNo
+                }
+
+                if (
+                    -not [string]::IsNullOrWhiteSpace(
+                        $mobileNo
+                    ) -and
+                    $mobileNo -ne $telNo
+                ) {
+                    $phoneParts += $mobileNo
+                }
+
+                $phone =
+                    $phoneParts -join ", "
+
+                $email = if (
+                    $emailValue -ne
+                    [System.DBNull]::Value
+                ) {
+                    ([string]$emailValue).Trim()
+                }
+                else {
+                    ""
+                }
+
+                $taxNo = if (
+                    $tinValue -ne
+                    [System.DBNull]::Value
+                ) {
+                    ([string]$tinValue).Trim()
+                }
+                else {
+                    ""
+                }
+
                 $partyType = "Other"
-                if ($parentGrp -match "Debtor|Customer|Receivable") { $partyType = "Customer" }
-                elseif ($parentGrp -match "Creditor|Supplier|Payable") { $partyType = "Supplier" }
-                elseif ($name -eq "Cash" -or $parentGrp -match "Cash") { $partyType = "Cash" }
+
+                if (
+                    $parentGrp -match
+                    "Debtor|Customer|Receivable"
+                ) {
+                    $partyType = "Customer"
+                }
+                elseif (
+                    $parentGrp -match
+                    "Creditor|Supplier|Payable"
+                ) {
+                    $partyType = "Supplier"
+                }
+                elseif (
+                    $name -eq "Cash" -or
+                    $parentGrp -match "Cash"
+                ) {
+                    $partyType = "Cash"
+                }
 
                 $parties += @{
-                    code  = [int][string]$rst.Fields.Item("Code").Value
-                    name  = $name
-                    alias = [string]$rst.Fields.Item("Alias").Value
-                    group = $parentGrp
-                    type  = $partyType
+                    code     = $code
+                    name     = $name
+                    alias    = $alias
+                    group    = $parentGrp
+                    type     = $partyType
+
+                    address  = $address
+                    address1 = if ($address1Value -ne [System.DBNull]::Value) {
+                        [string]$address1Value
+                    } else {
+                        ""
+                    }
+                    address2 = if ($address2Value -ne [System.DBNull]::Value) {
+                        [string]$address2Value
+                    } else {
+                        ""
+                    }
+                    address3 = if ($address3Value -ne [System.DBNull]::Value) {
+                        [string]$address3Value
+                    } else {
+                        ""
+                    }
+                    address4 = if ($address4Value -ne [System.DBNull]::Value) {
+                        [string]$address4Value
+                    } else {
+                        ""
+                    }
+
+                    telNo    = $telNo
+                    mobileNo = $mobileNo
+                    phone    = $phone
+                    email    = $email
+
+                    # VAT field from the account master.
+                    taxNo    = $taxNo
+                    vat      = $taxNo
+                    tinNo    = $taxNo
                 }
 
                 $currentIndex++
                 $rst.MoveNext()
             }
-            try { $rst.Close() } catch {}
+
+            try {
+                $rst.Close()
+            }
+            catch {}
         }
 
-        # Calculate Total Pages
-        $totalPages = [Math]::Ceiling($totalRecords / $PageSize)
-        if ($totalPages -lt 1) { $totalPages = 1 }
+        $totalPages =
+            [Math]::Ceiling(
+                $totalRecords /
+                [double]$PageSize
+            )
 
-        return @{ 
-            success    = $true 
+        if ($totalPages -lt 1) {
+            $totalPages = 1
+        }
+
+        return @{
+            success    = $true
             total      = $totalRecords
             page       = $Page
             pageSize   = $PageSize
             totalPages = $totalPages
-            data       = @($parties) 
+            data       = @($parties)
         }
-    } finally { 
-        Disconnect-BUSY $fi 
+    }
+    catch {
+        return @{
+            success = $false
+            error   = $_.Exception.Message
+        }
+    }
+    finally {
+        Disconnect-BUSY $fi
     }
 }
 

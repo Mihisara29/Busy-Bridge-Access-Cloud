@@ -1,0 +1,2 @@
+IF OBJECT_ID('dbo.BridgeOfflineVoucherSync','U') IS NULL
+CREATE TABLE dbo.BridgeOfflineVoucherSync(Id BIGINT IDENTITY PRIMARY KEY,LocalId VARCHAR(100) NOT NULL,InstanceId VARCHAR(100) NOT NULL,CompanyCode VARCHAR(50) NOT NULL,VchType INT NOT NULL,SeriesName VARCHAR(100),TemporaryVchNo VARCHAR(100),FinalVchNo VARCHAR(100),Status VARCHAR(20) NOT NULL,RequestPayload NVARCHAR(MAX),ErrorMessage NVARCHAR(2000),CreatedAt DATETIME2 DEFAULT SYSDATETIME(),SyncedAt DATETIME2,CONSTRAINT UQ_BridgeOfflineVoucherSync UNIQUE(LocalId,InstanceId,CompanyCode));

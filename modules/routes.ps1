@@ -70,7 +70,7 @@ function Start-BUSYServer {
         $response.Headers.Add("Content-Type",                 "application/json")
         $response.Headers.Add("Access-Control-Allow-Origin",  "*")
         $response.Headers.Add("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-        $response.Headers.Add("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Bridge-Secret, X-Instance-ID, X-Company-Code")
+        $response.Headers.Add("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Bridge-Secret, X-Instance-ID, X-Company-Code, Idempotency-Key")
 
         if ($request.HttpMethod -eq "OPTIONS") {
             $response.StatusCode = 200
@@ -206,6 +206,129 @@ function Start-BUSYServer {
                 }
 
                 $result = Create-Voucher -Data $bodyObj -InstanceId $instanceId -CompanyCode $companyCode
+
+            # --- OFFLINE VOUCHER SYNCHRONIZATION ---
+            } elseif ($path -eq "/busy/offline-vouchers/sync" -and $method -eq "POST") {
+                if (-not (Get-Command Sync-OfflineVoucher -ErrorAction SilentlyContinue)) {
+                    $result = @{
+                        success   = $false
+                        errorCode = "OFFLINE_SYNC_NOT_LOADED"
+                        error     = "Offline synchronization functions are not loaded."
+                    }
+                    $response.StatusCode = 503
+                }
+                elseif (-not $requireAuth -or $null -eq $authResult -or $null -eq $authResult.user) {
+                    $result = @{
+                        success   = $false
+                        errorCode = "AUTH_REQUIRED"
+                        error     = "An authenticated user is required to synchronize offline vouchers."
+                    }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $bodyText = Read-RequestBody $request
+
+                    if ([string]::IsNullOrWhiteSpace($bodyText)) {
+                        $result = @{
+                            success   = $false
+                            errorCode = "EMPTY_REQUEST"
+                            error     = "Offline voucher payload is required."
+                        }
+                        $response.StatusCode = 400
+                    }
+                    else {
+                        $bodyObj = $null
+
+                        try {
+                            $bodyObj = $bodyText | ConvertFrom-Json
+                        }
+                        catch {
+                            $result = @{
+                                success   = $false
+                                errorCode = "INVALID_JSON"
+                                error     = "The offline voucher request body is not valid JSON."
+                            }
+                            $response.StatusCode = 400
+                        }
+
+                        if ($null -ne $bodyObj) {
+                            $bodyObj | Add-Member -MemberType NoteProperty -Name "instanceId" -Value ([string]$instanceId) -Force
+                            $bodyObj | Add-Member -MemberType NoteProperty -Name "companyCode" -Value ([string]$companyCode) -Force
+                            $bodyObj | Add-Member -MemberType NoteProperty -Name "userName" -Value ([string]$authResult.user.name) -Force
+
+                            $idempotencyKey = [string]$request.Headers["Idempotency-Key"]
+                            if ([string]::IsNullOrWhiteSpace($idempotencyKey)) {
+                                $idempotencyKey = [string]$bodyObj.localId
+                            }
+
+                            if ([string]::IsNullOrWhiteSpace($idempotencyKey)) {
+                                $result = @{
+                                    success   = $false
+                                    errorCode = "IDEMPOTENCY_KEY_REQUIRED"
+                                    error     = "Idempotency-Key header or localId is required."
+                                }
+                                $response.StatusCode = 400
+                            }
+                            elseif (-not [string]::IsNullOrWhiteSpace([string]$bodyObj.localId) -and ([string]$bodyObj.localId).Trim() -ne $idempotencyKey.Trim()) {
+                                $result = @{
+                                    success   = $false
+                                    errorCode = "IDEMPOTENCY_KEY_MISMATCH"
+                                    error     = "Idempotency-Key must match localId."
+                                }
+                                $response.StatusCode = 400
+                            }
+                            else {
+                                $bodyObj | Add-Member -MemberType NoteProperty -Name "localId" -Value $idempotencyKey.Trim() -Force
+
+                                try {
+                                    $result = Sync-OfflineVoucher -Data $bodyObj -CurrentUser $authResult.user
+
+                                    if ($null -eq $result) {
+                                        $result = @{
+                                            success   = $false
+                                            localId   = $idempotencyKey.Trim()
+                                            errorCode = "EMPTY_SYNC_RESULT"
+                                            error     = "Offline synchronization returned no result."
+                                        }
+                                        $response.StatusCode = 500
+                                    }
+                                    elseif ($result.success -eq $false) {
+                                        if ($result.conflict -eq $true) { $response.StatusCode = 409 }
+                                        else { $response.StatusCode = 400 }
+                                    }
+                                    else {
+                                        $response.StatusCode = 200
+                                    }
+                                }
+                                catch {
+                                    $message = $_.Exception.Message
+                                    $statusCode = 500
+                                    $errorCode = "OFFLINE_SYNC_FAILED"
+                                    $isConflict = $false
+
+                                    if ($message -match "already being processed") {
+                                        $statusCode = 409
+                                        $errorCode = "OFFLINE_SYNC_IN_PROGRESS"
+                                        $isConflict = $true
+                                    }
+                                    elseif ($message -match "required" -or $message -match "invalid" -or $message -match "not found") {
+                                        $statusCode = 400
+                                        $errorCode = "OFFLINE_SYNC_VALIDATION_FAILED"
+                                    }
+
+                                    $result = @{
+                                        success   = $false
+                                        localId   = $idempotencyKey.Trim()
+                                        conflict  = $isConflict
+                                        errorCode = $errorCode
+                                        error     = $message
+                                    }
+                                    $response.StatusCode = $statusCode
+                                }
+                            }
+                        }
+                    }
+                }
 
             } elseif ($path -eq "/busy/voucher/modify" -and $method -eq "POST") {
                 $bodyObj = Read-RequestBody $request | ConvertFrom-Json
@@ -476,6 +599,174 @@ function Start-BUSYServer {
                 $data = Read-RequestBody $request | ConvertFrom-Json
                 $result = Save-ColumnConfig -Data $data -InstanceId $instanceId -CompanyCode $companyCode
 
+            # --- VOUCHER NUMBERING ADMIN CONFIGURATION ---
+            } elseif ($path -eq "/busy/voucher-numbering-admin" -and $method -eq "GET") {
+                $vchTypeStr = Get-QueryStringValue $request.QueryString "vchType" ""
+                if ([string]::IsNullOrWhiteSpace($vchTypeStr)) {
+                    $vchTypeStr = Get-QueryStringValue $request.QueryString "params[vchType]" ""
+                }
+
+                $seriesName = Get-QueryStringValue $request.QueryString "seriesName" ""
+                if ([string]::IsNullOrWhiteSpace($seriesName)) {
+                    $seriesName = Get-QueryStringValue $request.QueryString "params[seriesName]" ""
+                }
+
+                $voucherDate = Get-QueryStringValue $request.QueryString "voucherDate" ""
+                if ([string]::IsNullOrWhiteSpace($voucherDate)) {
+                    $voucherDate = Get-QueryStringValue $request.QueryString "params[voucherDate]" ""
+                }
+
+                if (
+                    [string]::IsNullOrWhiteSpace($vchTypeStr) -or
+                    [string]::IsNullOrWhiteSpace($seriesName)
+                ) {
+                    $result = @{
+                        success = $false
+                        error   = "vchType and seriesName are required"
+                    }
+                    $response.StatusCode = 400
+                }
+                elseif (
+                    -not [string]::IsNullOrWhiteSpace($voucherDate) -and
+                    -not (
+                        $voucherDate -match '^\d{4}-\d{2}-\d{2}$' -or
+                        $voucherDate -match '^\d{2}-\d{2}-\d{4}$'
+                    )
+                ) {
+                    $result = @{
+                        success = $false
+                        error   = "voucherDate must use yyyy-MM-dd or dd-MM-yyyy format"
+                    }
+                    $response.StatusCode = 400
+                }
+                else {
+                    $result = Get-WebNumberingConfig `
+                        -VchType ([int]$vchTypeStr) `
+                        -SeriesName $seriesName.Trim() `
+                        -VoucherDate $voucherDate `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false) {
+                        $response.StatusCode = 400
+                    }
+                }
+
+            } elseif ($path -eq "/busy/voucher-numbering-admin" -and $method -eq "POST") {
+                $normalRole = ""
+
+                if (
+                    $requireAuth -and
+                    $null -ne $authResult -and
+                    $null -ne $authResult.user
+                ) {
+                    $normalRole = ([string]$authResult.user.role).Trim().ToLower()
+                    $normalRole = $normalRole.Replace(" ", "").Replace("_", "").Replace("-", "")
+                }
+
+                if ($normalRole -ne "superadmin") {
+                    $result = @{
+                        success = $false
+                        error   = "Only Super Admin can change voucher numbering configuration."
+                    }
+                    $response.StatusCode = 403
+                }
+                else {
+                    $rawBody = Read-RequestBody $request
+
+                    if ([string]::IsNullOrWhiteSpace($rawBody)) {
+                        $result = @{
+                            success = $false
+                            error   = "Voucher numbering configuration payload is required."
+                        }
+                        $response.StatusCode = 400
+                    }
+                    else {
+                        $data = $null
+
+                        try {
+                            $data = $rawBody | ConvertFrom-Json
+                        }
+                        catch {
+                            $result = @{
+                                success = $false
+                                error   = "The request body is not valid JSON."
+                            }
+                            $response.StatusCode = 400
+                        }
+
+                        if ($null -ne $data) {
+                            $effectiveInstanceId = $instanceId
+                            $effectiveCompanyCode = $companyCode
+
+                            if (
+                                [string]::IsNullOrWhiteSpace($effectiveInstanceId) -and
+                                $data.instance_id
+                            ) {
+                                $effectiveInstanceId = [string]$data.instance_id
+                            }
+
+                            if (
+                                [string]::IsNullOrWhiteSpace($effectiveCompanyCode) -and
+                                $data.company_code
+                            ) {
+                                $effectiveCompanyCode = [string]$data.company_code
+                            }
+
+                            $dateBasis = "VOUCHER_DATE"
+                            $dateBasisProperty = $data.PSObject.Properties["date_basis"]
+
+                            if ($null -ne $dateBasisProperty) {
+                                $candidateDateBasis = ([string]$dateBasisProperty.Value).Trim().ToUpperInvariant()
+
+                                if (
+                                    $candidateDateBasis -notin @(
+                                        "VOUCHER_DATE",
+                                        "REAL_TIME"
+                                    )
+                                ) {
+                                    $result = @{
+                                        success = $false
+                                        error   = "date_basis must be VOUCHER_DATE or REAL_TIME."
+                                    }
+                                    $response.StatusCode = 400
+                                }
+                                else {
+                                    $dateBasis = $candidateDateBasis
+                                }
+                            }
+
+                            if ($null -eq $result) {
+                                $data |
+                                    Add-Member `
+                                        -MemberType NoteProperty `
+                                        -Name "date_basis" `
+                                        -Value $dateBasis `
+                                        -Force
+
+                                $updatedBy = ""
+
+                                if (
+                                    $null -ne $authResult -and
+                                    $null -ne $authResult.user
+                                ) {
+                                    $updatedBy = [string]$authResult.user.name
+                                }
+
+                                $result = Save-WebNumberingConfig `
+                                    -Data $data `
+                                    -UpdatedBy $updatedBy `
+                                    -InstanceId $effectiveInstanceId `
+                                    -CompanyCode $effectiveCompanyCode
+
+                                if ($result.success -eq $false) {
+                                    $response.StatusCode = 400
+                                }
+                            }
+                        }
+                    }
+                }
+
             # --- USER PERMISSIONS (db.bds OLEDB Integration) ---
             } elseif ($path -eq "/busy/permissions" -and $method -eq "GET") {
                 $result = Get-UserPermissions -InstanceId $instanceId -CompanyCode $companyCode
@@ -554,28 +845,196 @@ function Start-BUSYServer {
                 $data = Read-RequestBody $request | ConvertFrom-Json
                 if (-not $data.name -or -not $data.group) { $result = @{success=$false;error="name and group required"}; $response.StatusCode=400 } else { $result = Update-Account -Data $data -InstanceId $instanceId -CompanyCode $companyCode }
 
-            } elseif ($path -eq "/busy/reports/outstanding" -and $method -eq "GET") {
+} elseif ($path -eq "/busy/reports/outstanding" -and $method -eq "GET") {
+                $fromVal = Get-QueryStringValue $request.QueryString "from" ""
+                $toVal = Get-QueryStringValue $request.QueryString "to" ""
                 $asOfVal = Get-QueryStringValue $request.QueryString "asOf" ""
+
                 $typeVal = Get-QueryStringValue $request.QueryString "type" "all"
+                $accountVal = Get-QueryStringValue $request.QueryString "account" ""
                 $searchVal = Get-QueryStringValue $request.QueryString "search" ""
                 $groupVal = Get-QueryStringValue $request.QueryString "group" ""
                 $statusVal = Get-QueryStringValue $request.QueryString "status" "all"
+                $agingVal = Get-QueryStringValue $request.QueryString "aging" "all"
+
+                $voucherTypeVal = Get-QueryStringValue $request.QueryString "voucherType" "0"
                 $minAmountVal = Get-QueryStringValue $request.QueryString "minAmount" "0"
+                $maxAmountVal = Get-QueryStringValue $request.QueryString "maxAmount" "0"
                 $includeZeroVal = Get-QueryStringValue $request.QueryString "includeZero" "false"
+
                 $pageVal = Get-QueryStringValue $request.QueryString "page" "1"
-                $pageSizeVal = Get-QueryStringValue $request.QueryString "pageSize" "100"
+                $pageSizeVal = Get-QueryStringValue $request.QueryString "pageSize" "50"
+                $sortByVal = Get-QueryStringValue $request.QueryString "sortBy" "dueDate"
+                $sortDirectionVal = Get-QueryStringValue $request.QueryString "sortDirection" "asc"
+
+                $safePage = 1
+                $safePageSize = 50
+                $safeVoucherType = 0
+                $safeMinAmount = 0.0
+                $safeMaxAmount = 0.0
+
+                try {
+                    $safePage = [Math]::Max(1, [int]$pageVal)
+                }
+                catch {
+                    $safePage = 1
+                }
+
+                try {
+                    $requestedPageSize = [int]$pageSizeVal
+
+                    if ($requestedPageSize -eq 0) {
+                        # pageSize=0 means "All matching rows".
+                        $safePageSize = 0
+                    }
+                    else {
+                        $safePageSize = [Math]::Min(
+                            2500,
+                            [Math]::Max(1, $requestedPageSize)
+                        )
+                    }
+                }
+                catch {
+                    $safePageSize = 50
+                }
+
+                try {
+                    $safeVoucherType = [Math]::Max(
+                        0,
+                        [int]$voucherTypeVal
+                    )
+                }
+                catch {
+                    $safeVoucherType = 0
+                }
+
+                # The report supports only:
+                # 0  = All Sale/Purchase transaction types
+                # 2  = Purchase
+                # 3  = Sale Return
+                # 9  = Sale
+                # 10 = Purchase Return
+                if ($safeVoucherType -notin @(0, 2, 3, 9, 10)) {
+                    $safeVoucherType = 0
+                }
+
+                try {
+                    $safeMinAmount = [Math]::Max(
+                        0,
+                        [double]$minAmountVal
+                    )
+                }
+                catch {
+                    $safeMinAmount = 0.0
+                }
+
+                try {
+                    $safeMaxAmount = [Math]::Max(
+                        0,
+                        [double]$maxAmountVal
+                    )
+                }
+                catch {
+                    $safeMaxAmount = 0.0
+                }
+
+                if (
+                    $safeMaxAmount -gt 0 -and
+                    $safeMinAmount -gt $safeMaxAmount
+                ) {
+                    $temporaryAmount = $safeMinAmount
+                    $safeMinAmount = $safeMaxAmount
+                    $safeMaxAmount = $temporaryAmount
+                }
+
+                $validTypes = @(
+                    "all",
+                    "receivable",
+                    "payable"
+                )
+
+                if ($typeVal -notin $validTypes) {
+                    $typeVal = "all"
+                }
+
+                $validStatuses = @(
+                    "all",
+                    "due",
+                    "overdue",
+                    "not-due",
+                    "partially-adjusted",
+                    "unadjusted"
+                )
+
+                if ($statusVal -notin $validStatuses) {
+                    $statusVal = "all"
+                }
+
+                $validAgingValues = @(
+                    "all",
+                    "notDue",
+                    "days0To30",
+                    "days31To60",
+                    "days61To90",
+                    "days91To180",
+                    "above180"
+                )
+
+                if ($agingVal -notin $validAgingValues) {
+                    $agingVal = "all"
+                }
+
+                $validSortFields = @(
+                    "dueDate",
+                    "refDate",
+                    "account",
+                    "pending",
+                    "daysOverdue"
+                )
+
+                if ($sortByVal -notin $validSortFields) {
+                    $sortByVal = "dueDate"
+                }
+
+                if ($sortDirectionVal -notin @("asc", "desc")) {
+                    $sortDirectionVal = "asc"
+                }
+
+                $includeZero = (
+                    $includeZeroVal -eq "true" -or
+                    $includeZeroVal -eq "1"
+                )
+
+                Write-Host (
+                    "  [OUTSTANDING-ROUTE] " +
+                    "from='$fromVal'; to='$toVal'; asOf='$asOfVal'; " +
+                    "type='$typeVal'; status='$statusVal'; aging='$agingVal'; " +
+                    "account='$accountVal'; search='$searchVal'; group='$groupVal'; " +
+                    "voucherType=$safeVoucherType; min=$safeMinAmount; " +
+                    "max=$safeMaxAmount; includeZero=$includeZero; " +
+                    "page=$safePage; pageSize=$safePageSize; " +
+                    "sortBy='$sortByVal'; direction='$sortDirectionVal'"
+                ) -ForegroundColor DarkCyan
 
                 $result = Get-OutstandingReport `
-                    -AsOf        $asOfVal `
-                    -Type        $typeVal `
-                    -Search      $searchVal `
-                    -Group       $groupVal `
-                    -Status      $statusVal `
-                    -MinAmount   ([double]$minAmountVal) `
-                    -IncludeZero ($includeZeroVal -eq "true" -or $includeZeroVal -eq "1") `
-                    -Page        ([int]$pageVal) `
-                    -PageSize    ([int]$pageSizeVal) `
-                    -InstanceId  $instanceId `
+                    -From $fromVal `
+                    -To $toVal `
+                    -AsOf $asOfVal `
+                    -Type $typeVal `
+                    -Account $accountVal `
+                    -Search $searchVal `
+                    -Group $groupVal `
+                    -Status $statusVal `
+                    -Aging $agingVal `
+                    -VoucherType $safeVoucherType `
+                    -MinAmount $safeMinAmount `
+                    -MaxAmount $safeMaxAmount `
+                    -IncludeZero $includeZero `
+                    -Page $safePage `
+                    -PageSize $safePageSize `
+                    -SortBy $sortByVal `
+                    -SortDirection $sortDirectionVal `
+                    -InstanceId $instanceId `
                     -CompanyCode $companyCode
 
             } elseif ($path -eq "/busy/reports/stock-status" -and $method -eq "GET") {
@@ -726,20 +1185,41 @@ function Start-BUSYServer {
 
             # --- MISC UTILITIES & CONFIGURATIONS ---
             } elseif ($path -eq "/busy/numbering-config" -and $method -eq "GET") {
-                $vchTypeStr = $request.QueryString["vchType"]
-                if (-not $vchTypeStr) { $vchTypeStr = $request.QueryString["params[vchType]"] }
+                $vchTypeStr = Get-QueryStringValue $request.QueryString "vchType" ""
+                if ([string]::IsNullOrWhiteSpace($vchTypeStr)) {
+                    $vchTypeStr = Get-QueryStringValue $request.QueryString "params[vchType]" ""
+                }
 
                 $seriesName = Get-QueryStringValue $request.QueryString "seriesName" ""
-                if ($seriesName -eq "") { $seriesName = Get-QueryStringValue $request.QueryString "params[seriesName]" "" }
+                if ([string]::IsNullOrWhiteSpace($seriesName)) {
+                    $seriesName = Get-QueryStringValue $request.QueryString "params[seriesName]" ""
+                }
 
-                if (-not $vchTypeStr -or $seriesName -eq "") {
-                    $result = @{success=$false; error="vchType and seriesName required"}; $response.StatusCode=400
+                $voucherDate = Get-QueryStringValue $request.QueryString "voucherDate" ""
+                if ([string]::IsNullOrWhiteSpace($voucherDate)) {
+                    $voucherDate = Get-QueryStringValue $request.QueryString "params[voucherDate]" ""
+                }
+
+                if (
+                    [string]::IsNullOrWhiteSpace($vchTypeStr) -or
+                    [string]::IsNullOrWhiteSpace($seriesName)
+                ) {
+                    $result = @{
+                        success = $false
+                        error   = "vchType and seriesName required"
+                    }
+                    $response.StatusCode = 400
                 } else {
-                    $result = Get-NumberingConfig `
-                        -VchType     ([int]$vchTypeStr) `
-                        -SeriesName  $seriesName `
-                        -InstanceId  $instanceId `
+                    $result = Get-EffectiveNumberingConfig `
+                        -VchType ([int]$vchTypeStr) `
+                        -SeriesName $seriesName.Trim() `
+                        -VoucherDate $voucherDate `
+                        -InstanceId $instanceId `
                         -CompanyCode $companyCode
+
+                    if ($result.success -eq $false) {
+                        $response.StatusCode = 400
+                    }
                 }
 
             } elseif ($path -eq "/busy/voucher-series" -and $method -eq "GET") {

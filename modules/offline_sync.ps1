@@ -1,0 +1,8 @@
+Set-StrictMode -Version Latest
+function Sync-OfflineVoucher {param([Parameter(Mandatory=$true)]$Data,[Parameter(Mandatory=$true)]$CurrentUser)
+ foreach($f in @('localId','instanceId','companyCode','userName','vchType','seriesName','voucherDate','payload')){if(-not $Data.PSObject.Properties.Name.Contains($f)){throw "Missing required field: $f"}}
+ $cfg=Get-InstanceConfig -InstanceId ([string]$Data.instanceId);if(-not $cfg){throw 'BUSY instance not found.'};$isSql=([int]$cfg.dbType -eq 1);$cn=Open-BusyDatabaseConnection -InstanceConfig $cfg -CompanyCode ([string]$Data.companyCode)
+ try{Ensure-OfflineSyncStore -DbConnection $cn -IsSqlServer $isSql;$old=Get-OfflineSyncRecord -DbConnection $cn -IsSqlServer $isSql -LocalId $Data.localId -InstanceId $Data.instanceId -CompanyCode $Data.companyCode;if($old -and $old.Status -eq 'SYNCED'){return @{success=$true;alreadyProcessed=$true;localId=$Data.localId;finalVchNo=$old.FinalVchNo;syncedAt=(Get-Date).ToString('o')}};Add-OfflineSyncPendingRecord -DbConnection $cn -IsSqlServer $isSql -Data $Data
+  try{$final=Get-OfflineVoucherFinalNumber -Data $Data -InstanceConfig $cfg;$payload=$Data.payload;$payload.vchNo=$final;$payload.vchSeries=$Data.seriesName;$payload.date=$Data.voucherDate;$null=Save-BusyVoucher -Data $payload -InstanceConfig $cfg -CompanyCode $Data.companyCode -CurrentUser $CurrentUser;Complete-OfflineSyncRecord -DbConnection $cn -IsSqlServer $isSql -Data $Data -FinalVchNo $final;return @{success=$true;alreadyProcessed=$false;localId=$Data.localId;finalVchNo=$final;syncedAt=(Get-Date).ToString('o');negativeStockWarnings=@()}}
+  catch{Fail-OfflineSyncRecord -DbConnection $cn -IsSqlServer $isSql -Data $Data -ErrorMessage $_.Exception.Message;throw}}
+ finally{if($cn){$cn.Close();$cn.Dispose()}}}

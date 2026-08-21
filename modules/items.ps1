@@ -387,7 +387,8 @@ function Get-ItemsForVoucher {
         $itemQuery = @"
 SELECT TOP $limit
     Master1.Code,
-    Master1.Name
+    Master1.Name,
+    Master1.Alias
 FROM Master1
 WHERE $where
 ORDER BY Master1.Name
@@ -402,17 +403,28 @@ ORDER BY Master1.Name
             while (-not $rst.EOF -and $items.Count -lt $limit) {
                 $codeRaw = $rst.Fields.Item("Code").Value
                 $nameRaw = $rst.Fields.Item("Name").Value
+                $aliasRaw = $rst.Fields.Item("Alias").Value
 
                 if ($codeRaw -ne [System.DBNull]::Value) {
                     $items.Add(@{
-                        code    = [int][string]$codeRaw
-                        name    = if (
+                        code = [int][string]$codeRaw
+
+                        name = if (
                             $nameRaw -ne [System.DBNull]::Value
                         ) {
                             $nameRaw.ToString()
                         } else {
                             ""
                         }
+
+                        alias = if (
+                            $aliasRaw -ne [System.DBNull]::Value
+                        ) {
+                            $aliasRaw.ToString()
+                        } else {
+                            ""
+                        }
+
                         stock   = 0.0
                         mcStock = @()
                     })

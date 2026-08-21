@@ -25,6 +25,9 @@ $script:VoucherConfig = @{
     19 = @{ xmlRoot = "Payment";        hasBillNo = $false; isAccounting = $true;  requiredKeys = @("vchSeries","date","accounts") }
     5  = @{ xmlRoot = "StockTransfer";  typeField = "VchSeriesName"; typeDataKey = "vchSeries"; hasBillNo = $false; isAccounting = $false; requiredKeys = @("vchSeries","date","party","items") }
     8  = @{ xmlRoot = "StockJournal";   typeField = "VchSeriesName"; typeDataKey = "vchSeries"; hasBillNo = $false; isAccounting = $false; requiredKeys = @("vchSeries","date","party","items") }
+    6 = @{xmlRoot = "Production";  typeField = "VchSeriesName";  typeDataKey = "vchSeries";  hasBillNo = $false;  isAccounting = $false;
+    requiredKeys = @("vchSeries","date","items")
+}
 }
 
 function Safe-ParseDate {
@@ -468,98 +471,393 @@ function Update-CheckListCreator {
 #  XML GENERATOR HELPERS
 # ═══════════════════════════════════════════════════════
 function Build-ItemsXml {
-    param($items, [string]$defaultMC = "Main Store")
+    param(
+        $items,
+        [string]$defaultMC = "Main Store"
+    )
+
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+
+    function Format-XmlNumber {
+        param(
+            [double]$Value,
+            [string]$Format = "0.####"
+        )
+
+        return $Value.ToString($Format, $culture)
+    }
 
     $xml = "<ItemEntries>"
-    foreach ($item in $items) {
-        $mc = if ($item.mc) { $item.mc } else { $defaultMC }
-        $conFactor = if ($item.conFactor -and [double]$item.conFactor -ne 0) { [double]$item.conFactor } else { 1 }
-        $altQtyConFactor = if ($item.altQtyConFactor -and [double]$item.altQtyConFactor -ne 0) { [double]$item.altQtyConFactor } else { $conFactor }
-        $conType = if ($item.conType) { [int]$item.conType } else { 1 }
-        $enteredInAltUnit = ($item.enteredInAltUnit -eq $true) -or ($item.altUnit -and [string]$item.unit -eq [string]$item.altUnit)
-        
-        $qty = [double]$item.qty
-        $price = [double]$item.price
-        $altPrice = if ($item.altPrice) { [double]$item.altPrice } else { 0 }
-        $amt = [double]$item.amount
-        
-        $listPrice = if ($item.listPrice) { [double]$item.listPrice } else { $price }
-        $discType = if ($item.discType) { $item.discType } else { "U" }
-        $discVal = if ($item.discVal) { [double]$item.discVal } else { 0 }
+
+    foreach ($item in @($items)) {
+        if (
+            -not $item.itemName -or
+            [string]::IsNullOrWhiteSpace([string]$item.itemName)
+        ) {
+            continue
+        }
+
+        # ─────────────────────────────────────────────────────
+        # Basic item values
+        # ─────────────────────────────────────────────────────
+
+        $mc = if (
+            $item.mc -and
+            -not [string]::IsNullOrWhiteSpace([string]$item.mc)
+        ) {
+            [string]$item.mc
+        }
+        else {
+            $defaultMC
+        }
+
+        $qty = if ($null -ne $item.qty) {
+            [double]$item.qty
+        }
+        else {
+            0.0
+        }
+
+        $frontendNetPrice = if ($null -ne $item.price) {
+            [double]$item.price
+        }
+        else {
+            0.0
+        }
+
+        $frontendAmount = if ($null -ne $item.amount) {
+            [double]$item.amount
+        }
+        else {
+            0.0
+        }
+
+        $listPrice = if (
+            $null -ne $item.listPrice -and
+            [double]$item.listPrice -gt 0
+        ) {
+            [double]$item.listPrice
+        }
+        else {
+            $frontendNetPrice
+        }
+
+        $discType = if ($item.discType) {
+            [string]$item.discType
+        }
+        else {
+            "U"
+        }
+
+        $discVal = if ($null -ne $item.discVal) {
+            [double]$item.discVal
+        }
+        else {
+            0.0
+        }
+
+        # ─────────────────────────────────────────────────────
+        # Unit conversion values
+        # ─────────────────────────────────────────────────────
+
+        $conFactor = if (
+            $null -ne $item.conFactor -and
+            [double]$item.conFactor -ne 0
+        ) {
+            [double]$item.conFactor
+        }
+        else {
+            1.0
+        }
+
+        $altQtyConFactor = if (
+            $null -ne $item.altQtyConFactor -and
+            [double]$item.altQtyConFactor -ne 0
+        ) {
+            [double]$item.altQtyConFactor
+        }
+        else {
+            $conFactor
+        }
+
+        $conType = if ($item.conType) {
+            [int]$item.conType
+        }
+        else {
+            1
+        }
+
+        $hasAltUnit =
+            $item.altUnit -and
+            -not [string]::IsNullOrWhiteSpace([string]$item.altUnit)
+
+        $enteredInAltUnit =
+            ($item.enteredInAltUnit -eq $true) -or
+            (
+                $hasAltUnit -and
+                [string]$item.unit -eq [string]$item.altUnit
+            )
 
         if ($enteredInAltUnit) {
             $qtyAlt = $qty
-            $qtyMain = if ($altQtyConFactor -ne 0) { [Math]::Round($qtyAlt / $altQtyConFactor, 3) } else { $qty }
+
+            $qtyMain = if ($altQtyConFactor -ne 0) {
+                [Math]::Round(
+                    $qtyAlt / $altQtyConFactor,
+                    4
+                )
+            }
+            else {
+                $qty
+            }
+
             $qtyOut = $qtyMain
-        } else {
+        }
+        else {
             $qtyMain = $qty
-            $qtyAlt = [Math]::Round($qty * $altQtyConFactor, 3)
+
+            $qtyAlt = if ($hasAltUnit) {
+                [Math]::Round(
+                    $qtyMain * $altQtyConFactor,
+                    4
+                )
+            }
+            else {
+                $qtyMain
+            }
+
             $qtyOut = $qtyMain
         }
 
-        $sendAltPrice = $false
+        # ─────────────────────────────────────────────────────
+        # Discount values
+        #
+        # BUSY Discount = discount amount per unit.
+        # ─────────────────────────────────────────────────────
 
-        if ($enteredInAltUnit -and $conType -eq 1) {
-            if ($altPrice -ne 0) {
-                $amt = [Math]::Round($qtyAlt * $altPrice, 2)
-                $price = if ($qtyMain -ne 0) { [Math]::Round($amt / $qtyMain, 2) } else { 0 }
+        $discountPerUnit = 0.0
+        $discountPercent = 0.0
+        $compoundDiscount = 0.0
+
+        if ($discVal -gt 0) {
+            if ($discType -eq "%") {
+                $discountPercent = [Math]::Round(
+                    $discVal,
+                    4
+                )
+
+                $discountPerUnit = [Math]::Round(
+                    $listPrice * $discountPercent / 100,
+                    4
+                )
+
+                $compoundDiscount = $discountPercent
             }
-            $sendAltPrice = $true
-        } elseif (-not $enteredInAltUnit -and $conType -eq 1) {
-            if ($price -ne 0) {
-                $amt = [Math]::Round($qtyMain * $price, 2)
+            else {
+                # Fixed discount per unit.
+                $discountPerUnit = [Math]::Round(
+                    $discVal,
+                    4
+                )
             }
-            $altPrice = 0
-            $sendAltPrice = $false
-        } elseif ($conType -eq 2) {
-            if ($price -ne 0) {
-                $amt = [Math]::Round($qtyOut * $price, 2)
-            }
-            $sendAltPrice = ($altPrice -ne 0)
         }
+
+        # ─────────────────────────────────────────────────────
+        # Final net price
+        #
+        # Prefer the value already calculated by the frontend.
+        # Only calculate it here when frontend price is missing.
+        # This prevents discount from being applied twice.
+        # ─────────────────────────────────────────────────────
+
+        if ($frontendNetPrice -gt 0) {
+            $netPrice = [Math]::Round(
+                $frontendNetPrice,
+                4
+            )
+        }
+        elseif ($discVal -gt 0) {
+            $netPrice = [Math]::Round(
+                $listPrice - $discountPerUnit,
+                4
+            )
+        }
+        else {
+            $netPrice = [Math]::Round(
+                $listPrice,
+                4
+            )
+        }
+
+        if ($netPrice -lt 0) {
+            $netPrice = 0
+        }
+
+        # ─────────────────────────────────────────────────────
+        # Final net amount
+        # ─────────────────────────────────────────────────────
+
+        if ($frontendAmount -gt 0) {
+            $netAmount = [Math]::Round(
+                $frontendAmount,
+                2
+            )
+        }
+        else {
+            $netAmount = [Math]::Round(
+                $qtyMain * $netPrice,
+                2
+            )
+        }
+
+        # ─────────────────────────────────────────────────────
+        # Alternative-unit price
+        # ─────────────────────────────────────────────────────
+
+        $frontendAltPrice = if (
+            $null -ne $item.altPrice -and
+            [double]$item.altPrice -gt 0
+        ) {
+            [double]$item.altPrice
+        }
+        else {
+            0.0
+        }
+
+        if ($hasAltUnit) {
+            if ($enteredInAltUnit -and $frontendAltPrice -gt 0) {
+                # The frontend altPrice is already the final alt-unit price.
+                $priceAltUnit = [Math]::Round(
+                    $frontendAltPrice,
+                    4
+                )
+            }
+            elseif ($qtyAlt -ne 0) {
+                $priceAltUnit = [Math]::Round(
+                    $netAmount / $qtyAlt,
+                    4
+                )
+            }
+            else {
+                $priceAltUnit = $netPrice
+            }
+        }
+        else {
+            $priceAltUnit = $netPrice
+        }
+
+        # ─────────────────────────────────────────────────────
+        # XML-safe formatted values
+        # ─────────────────────────────────────────────────────
+
+        $qtyOutText = Format-XmlNumber $qtyOut
+        $qtyMainText = Format-XmlNumber $qtyMain
+        $qtyAltText = Format-XmlNumber $qtyAlt
+
+        $conFactorText = Format-XmlNumber $conFactor
+        $altQtyConFactorText = Format-XmlNumber $altQtyConFactor
+
+        $netPriceText = Format-XmlNumber $netPrice
+        $priceAltUnitText = Format-XmlNumber $priceAltUnit
+        $listPriceText = Format-XmlNumber $listPrice
+        $netAmountText = Format-XmlNumber $netAmount "0.##"
+
+        $discountPerUnitText = Format-XmlNumber $discountPerUnit
+        $discountPercentText = Format-XmlNumber $discountPercent
+        $compoundDiscountText = Format-XmlNumber $compoundDiscount "0.00"
+
+        # ─────────────────────────────────────────────────────
+        # Build ItemDetail XML
+        # ─────────────────────────────────────────────────────
 
         $xml += "<ItemDetail>"
+
         $xml += "<SrNo>$($item.srNo)</SrNo>"
-        $xml += "<ItemName>$([System.Security.SecurityElement]::Escape($item.itemName))</ItemName>"
-         # Inject ItemType inside ItemDetail for Stock Journal transactions
+
+        $xml += "<ItemName>$(
+            [System.Security.SecurityElement]::Escape(
+                [string]$item.itemName
+            )
+        )</ItemName>"
+
         if ($item.itemType) {
             $xml += "<ItemType>$($item.itemType)</ItemType>"
         }
-        $xml += "<UnitName>$([System.Security.SecurityElement]::Escape($item.unit))</UnitName>"
-        $xml += "<Qty>$qtyOut</Qty>"
-        $xml += "<QtyMainUnit>$qtyMain</QtyMainUnit>"
 
-        if ($item.altUnit -and $item.altUnit -ne "") {
-            $xml += "<AltUnitName>$([System.Security.SecurityElement]::Escape($item.altUnit))</AltUnitName>"
-            $xml += "<ConFactor>$conFactor</ConFactor>"
-            $xml += "<AltQtyConFactor>$altQtyConFactor</AltQtyConFactor>"
-            $xml += "<ConFactorType>$conType</ConFactorType>"
-            $xml += "<QtyAltUnit>$qtyAlt</QtyAltUnit>"
-            if ($sendAltPrice) {
-                $xml += "<PriceAltUnit>$altPrice</PriceAltUnit>"
-            }
-        } else {
-            $xml += "<QtyAltUnit>$qtyOut</QtyAltUnit>"
+        $xml += "<UnitName>$(
+            [System.Security.SecurityElement]::Escape(
+                [string]$item.unit
+            )
+        )</UnitName>"
+
+        if ($hasAltUnit) {
+            $xml += "<AltUnitName>$(
+                [System.Security.SecurityElement]::Escape(
+                    [string]$item.altUnit
+                )
+            )</AltUnitName>"
+
+            $xml += "<ConFactor>$conFactorText</ConFactor>"
         }
 
-        $xml += "<Price>$price</Price>"
-        $xml += "<Amt>$amt</Amt>"
-        $xml += "<MC>$([System.Security.SecurityElement]::Escape($mc))</MC>"
+        $xml += "<Qty>$qtyOutText</Qty>"
+        $xml += "<QtyMainUnit>$qtyMainText</QtyMainUnit>"
+        $xml += "<QtyAltUnit>$qtyAltText</QtyAltUnit>"
+
+        if ($hasAltUnit) {
+            $xml += "<AltQtyConFactor>$altQtyConFactorText</AltQtyConFactor>"
+            $xml += "<ConFactorType>$conType</ConFactorType>"
+        }
+
+        # Manual BUSY XML stores the final net price here.
+        $xml += "<Price>$netPriceText</Price>"
+
+        if ($hasAltUnit) {
+            $xml += "<PriceAltUnit>$priceAltUnitText</PriceAltUnit>"
+        }
+
+        # Original price before discount.
+        $xml += "<ListPrice>$listPriceText</ListPrice>"
+
+        # Manual BUSY XML stores the final net amount in both fields.
+        $xml += "<Amt>$netAmountText</Amt>"
+        $xml += "<NettAmount>$netAmountText</NettAmount>"
+
+        # Native BUSY discount information.
+        $xml += "<Discount>$discountPerUnitText</Discount>"
+
+        if (
+            $discVal -gt 0 -and
+            $discType -eq "%"
+        ) {
+            $xml += "<DiscountPercent>$discountPercentText</DiscountPercent>"
+        }
+
+        $xml += "<CompoundDiscount>$compoundDiscountText</CompoundDiscount>"
+
+        # Original list/MRP price.
+        $xml += "<ItemMRP>$listPriceText</ItemMRP>"
+
+        # Final effective net price.
+        $xml += "<tmpNettPrice>$netPriceText</tmpNettPrice>"
+
+        $xml += "<MC>$(
+            [System.Security.SecurityElement]::Escape(
+                [string]$mc
+            )
+        )</MC>"
+
+        $xml += "<tmpDiscountBasis>1</tmpDiscountBasis>"
 
         if ($discVal -gt 0) {
-            $xml += "<ListPrice>$listPrice</ListPrice>"
-            if ($discType -eq '%') {
-                $xml += "<DiscountPercent>$discVal</DiscountPercent>"
-                $discAmt = [Math]::Round($listPrice * $discVal / 100, 2)
-                $xml += "<Discount>" + $discAmt + "</Discount>"
-            } else {
-                $xml += "<Discount>" + $discVal + "</Discount>"
-            }
-            $xml += "<DiscountStructure>Simple Discount, % of Price</DiscountStructure>"
+            $xml += "<DiscountStructure>Simple Discount % of Amount</DiscountStructure>"
         }
+
+        $xml += "<tmpNettPriceAfterDisc>$netPriceText</tmpNettPriceAfterDisc>"
 
         $xml += "</ItemDetail>"
     }
+
     $xml += "</ItemEntries>"
 
     return $xml
@@ -1103,11 +1401,257 @@ function Build-PendingChallansXml {
     return ""
 }
 
+function Get-BusyAutoVchNoFromVoucherNo {
+    param(
+        $fi,
+        [int]$VchType,
+        [string]$SeriesName,
+        [string]$VchNo
+    )
+
+    if ($null -eq $fi) {
+        throw "BUSY connection is unavailable."
+    }
+
+    if ([string]::IsNullOrWhiteSpace($VchNo)) {
+        throw "Voucher number is empty."
+    }
+
+    $cleanSeriesName = ([string]$SeriesName).Trim()
+    $cleanVchNo = ([string]$VchNo).Trim()
+
+    $typePrefix = "{0:D2}" -f $VchType
+    $prefixedSeriesName = $cleanSeriesName
+
+    if (
+        -not $cleanSeriesName.StartsWith(
+            $typePrefix,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    ) {
+        $prefixedSeriesName = "$typePrefix$cleanSeriesName"
+    }
+
+    $safeSeriesName =
+        $cleanSeriesName.Replace("'", "''")
+
+    $safePrefixedSeriesName =
+        $prefixedSeriesName.Replace("'", "''")
+
+    $seriesCode = 0
+    $seriesRst = $null
+
+    try {
+        $seriesQuery = @"
+SELECT Code
+FROM Master1
+WHERE MasterType = 21
+  AND (
+        Name = '$safeSeriesName'
+        OR Name = '$safePrefixedSeriesName'
+      )
+"@
+
+        $seriesRst = $fi.GetRecordset($seriesQuery)
+
+        if ($seriesRst -and -not $seriesRst.EOF) {
+            $value =
+                $seriesRst.Fields.Item("Code").Value
+
+            if (
+                $null -ne $value -and
+                $value -ne [System.DBNull]::Value
+            ) {
+                $seriesCode = [int]$value
+            }
+        }
+    }
+    finally {
+        if ($seriesRst) {
+            try {
+                $seriesRst.Close()
+            }
+            catch {
+            }
+        }
+    }
+
+    if ($seriesCode -le 0) {
+        throw "BUSY series '$cleanSeriesName' was not found."
+    }
+
+    $prefix = ""
+    $suffix = ""
+    $separator = ""
+    $dateEnabled = 0
+    $frequency = 0
+    $datePosition = 0
+    $dateFormat = 0
+
+    $cfgRst = $null
+
+    try {
+        $configQuery = @"
+SELECT C1, C2, C4, I1, I2, I7, I8
+FROM Config
+WHERE RecType = 6
+  AND L1 = $seriesCode
+"@
+
+        $cfgRst = $fi.GetRecordset($configQuery)
+
+        if ($cfgRst -and -not $cfgRst.EOF) {
+            $readString = {
+                param([string]$Name)
+
+                $value =
+                    $cfgRst.Fields.Item($Name).Value
+
+                if (
+                    $null -eq $value -or
+                    $value -eq [System.DBNull]::Value
+                ) {
+                    return ""
+                }
+
+                return ([string]$value).Trim()
+            }
+
+            $readInt = {
+                param([string]$Name)
+
+                $value =
+                    $cfgRst.Fields.Item($Name).Value
+
+                if (
+                    $null -eq $value -or
+                    $value -eq [System.DBNull]::Value
+                ) {
+                    return 0
+                }
+
+                return [int]$value
+            }
+
+            $suffix = & $readString "C1"
+            $prefix = & $readString "C2"
+            $separator = & $readString "C4"
+
+            $dateEnabled = & $readInt "I1"
+            $frequency = & $readInt "I2"
+            $datePosition = & $readInt "I7"
+            $dateFormat = & $readInt "I8"
+        }
+    }
+    finally {
+        if ($cfgRst) {
+            try {
+                $cfgRst.Close()
+            }
+            catch {
+            }
+        }
+    }
+
+    $working = $cleanVchNo
+
+    if (
+        $prefix -ne "" -and
+        $working.StartsWith(
+            $prefix,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    ) {
+        $working =
+            $working.Substring($prefix.Length)
+    }
+
+    if (
+        $suffix -ne "" -and
+        $working.EndsWith(
+            $suffix,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    ) {
+        $working =
+            $working.Substring(
+                0,
+                $working.Length - $suffix.Length
+            )
+    }
+
+    if ($separator -ne "") {
+        $parts = $working.Split(
+            @($separator),
+            [System.StringSplitOptions]::RemoveEmptyEntries
+        )
+
+        $numericParts = @(
+            $parts |
+            Where-Object {
+                $_ -match '^\d+$'
+            }
+        )
+
+        if ($numericParts.Count -gt 0) {
+            # In BUSY formats such as 2026-27-8AZQ,
+            # the running number is the final numeric component.
+            $candidate =
+                $numericParts[$numericParts.Count - 1]
+
+            $parsed = 0L
+
+            if (
+                [long]::TryParse(
+                    $candidate,
+                    [ref]$parsed
+                ) -and
+                $parsed -gt 0
+            ) {
+                return $parsed
+            }
+        }
+    }
+
+    # Fallback: use the last numeric block before trailing letters.
+    #
+    # Example:
+    # 2026-27-8AZQ -> 8
+    # ABC-001XYZ   -> 001
+    $match = [regex]::Match(
+        $cleanVchNo,
+        '(\d+)(?=[A-Za-z_-]*$)'
+    )
+
+    if ($match.Success) {
+        $parsed = 0L
+
+        if (
+            [long]::TryParse(
+                $match.Groups[1].Value,
+                [ref]$parsed
+            ) -and
+            $parsed -gt 0
+        ) {
+            return $parsed
+        }
+    }
+
+    throw (
+        "Could not extract BUSY AutoVchNo from voucher number " +
+        "'$cleanVchNo'."
+    )
+}
+
 function Build-VoucherXml {
     param($Data, $Cfg, [int]$VchType, [string]$VchNo, [bool]$SkipBBA = $false, $fi = $null)
 
     # Resolve sequential count to populate AutoVchNo natively in database
-    $autoVchNo = Get-VoucherAutoSequence -fi $fi -VchType $VchType -SeriesName $Data.vchSeries -VchNo $VchNo -VchDateStr $Data.date
+    $autoVchNo = Get-BusyAutoVchNoFromVoucherNo `
+    -fi $fi `
+    -VchType $VchType `
+    -SeriesName ([string]$Data.vchSeries) `
+    -VchNo $VchNo
 
     $root = $Cfg.xmlRoot
     $typeField = $Cfg.typeField
@@ -1138,14 +1682,107 @@ function Build-VoucherXml {
         $xml += "<AutoVchNo>$autoVchNo</AutoVchNo>"
     }
 
-    $xml += "<$typeField>$([System.Security.SecurityElement]::Escape($typeValue))</$typeField>"
-  $xml += "<MasterName1>$([System.Security.SecurityElement]::Escape($Data.party))</MasterName1>"
-$xml += "<MasterName2>$([System.Security.SecurityElement]::Escape($matCentre))</MasterName2>"
+$xml += "<$typeField>$([System.Security.SecurityElement]::Escape($typeValue))</$typeField>"
 
-# IMPORTANT FOR STOCK JOURNAL:
-# BUSY uses ConMCName for consumed material centre.
-if ($VchType -eq 8) {
-    $xml += "<ConMCName>$([System.Security.SecurityElement]::Escape([string]$Data.party))</ConMCName>"
+# ============================================================
+# PRODUCTION VOUCHER - VchType 6
+# ============================================================
+if ($VchType -eq 6) {
+
+    # Production XML mapping discovered from actual BUSY voucher:
+    #
+    # MasterName1       = Generated Material Centre
+    # MasterName2       = BOM Name
+    # ConMCName         = Consumed Material Centre
+    # ExtraExpenseInBOM = Extra Expense / Unit
+
+    $generatedMC = if ($Data.matCentre) {
+        ([string]$Data.matCentre).Trim()
+    } else {
+        ""
+    }
+
+    $consumedMC = if ($Data.party) {
+        ([string]$Data.party).Trim()
+    } else {
+        ""
+    }
+
+    $bomName = if ($Data.bomName) {
+        ([string]$Data.bomName).Trim()
+    } else {
+        ""
+    }
+
+    $extraExpenseInBOM = 0.0
+
+    try {
+        if ($null -ne $Data.extraExpenseInBOM) {
+            $extraExpenseInBOM =
+                [double]$Data.extraExpenseInBOM
+        }
+    }
+    catch {
+        $extraExpenseInBOM = 0.0
+    }
+
+    if ([string]::IsNullOrWhiteSpace($bomName)) {
+        throw "Production BOM name is required."
+    }
+
+    if ([string]::IsNullOrWhiteSpace($generatedMC)) {
+        throw "Generated material centre is required."
+    }
+
+    if ([string]::IsNullOrWhiteSpace($consumedMC)) {
+        throw "Consumed material centre is required."
+    }
+
+    $xml += "<MasterName1>$([System.Security.SecurityElement]::Escape($generatedMC))</MasterName1>"
+
+    $xml += "<MasterName2>$([System.Security.SecurityElement]::Escape($bomName))</MasterName2>"
+
+    $xml += "<ConMCName>$([System.Security.SecurityElement]::Escape($consumedMC))</ConMCName>"
+
+    $extraExpenseText =
+        $extraExpenseInBOM.ToString(
+            "0.####",
+            [System.Globalization.CultureInfo]::InvariantCulture
+        )
+
+    $xml += "<ExtraExpenseInBOM>$extraExpenseText</ExtraExpenseInBOM>"
+
+    # Frontend sends the actual selected BOM code.
+    # This matches BUSY's native Production XML tmpMasterCode2.
+    $bomCode = 0
+
+    try {
+        if ($null -ne $Data.bomCode) {
+            $bomCode = [int]$Data.bomCode
+        }
+    }
+    catch {
+        $bomCode = 0
+    }
+
+    if ($bomCode -gt 0) {
+        $xml += "<tmpMasterCode2>$bomCode</tmpMasterCode2>"
+    }
+}
+else {
+
+    # ========================================================
+    # EXISTING NON-PRODUCTION VOUCHER BEHAVIOUR
+    # ========================================================
+
+    $xml += "<MasterName1>$([System.Security.SecurityElement]::Escape([string]$Data.party))</MasterName1>"
+
+    $xml += "<MasterName2>$([System.Security.SecurityElement]::Escape($matCentre))</MasterName2>"
+
+    # Stock Journal consumed material centre
+    if ($VchType -eq 8) {
+        $xml += "<ConMCName>$([System.Security.SecurityElement]::Escape([string]$Data.party))</ConMCName>"
+    }
 }
 
 $xml += "<TranCurName>Rs.</TranCurName>"
@@ -1188,30 +1825,56 @@ $xml += "<TranCurName>Rs.</TranCurName>"
     $xml += "<Narration1>$([System.Security.SecurityElement]::Escape($narration))</Narration1>"
     $xml += "</VchOtherInfoDetails>"
 
-if ($VchType -eq 8) {
-    # Stock Journal:
+if ($VchType -eq 8 -or $VchType -eq 6) {
+
+    # ========================================================
+    # STOCK JOURNAL + PRODUCTION
+    #
     # ItemEntries  = Items Generated
     # ItemEntries1 = Items Consumed
+    # ========================================================
 
     $genItems = @(
         $Data.items | Where-Object {
-            $null -eq $_.itemType -or [int]$_.itemType -eq 1
+            $null -eq $_.itemType -or
+            [int]$_.itemType -eq 1
         }
     )
 
     $conItems = @(
         $Data.items | Where-Object {
-            $null -ne $_.itemType -and [int]$_.itemType -eq 2
+            $null -ne $_.itemType -and
+            [int]$_.itemType -eq 2
         }
     )
 
-    Write-Host "[StockJournal Save DEBUG] Generated items=$($genItems.Count), Consumed items=$($conItems.Count)" -ForegroundColor Cyan
-    Write-Host "[StockJournal Save DEBUG] Generated MC=$matCentre, Consumed MC=$($Data.party)" -ForegroundColor Cyan
+    $debugLabel =
+        if ($VchType -eq 6) {
+            "Production"
+        }
+        else {
+            "StockJournal"
+        }
 
-    $xml += Build-ItemsXml -items $genItems -defaultMC $matCentre
-    $xml += Build-ConsumedItemsXml -items $conItems -defaultMC ([string]$Data.party)
-} else {
-    $xml += Build-ItemsXml -items $Data.items -defaultMC $matCentre
+    Write-Host "[$debugLabel Save DEBUG] Generated items=$($genItems.Count), Consumed items=$($conItems.Count)" -ForegroundColor Cyan
+    Write-Host "[$debugLabel Save DEBUG] Generated MC=$matCentre, Consumed MC=$($Data.party)" -ForegroundColor Cyan
+
+    # Generated section
+    $xml += Build-ItemsXml `
+        -items $genItems `
+        -defaultMC $matCentre
+
+    # Consumed section
+    $xml += Build-ConsumedItemsXml `
+        -items $conItems `
+        -defaultMC ([string]$Data.party)
+}
+else {
+
+    # Existing behaviour for Sales / Purchase / Challan etc.
+    $xml += Build-ItemsXml `
+        -items $Data.items `
+        -defaultMC $matCentre
 }
     $xml += Build-BillSundriesXml -billSundries $Data.billSundries
 
@@ -1301,7 +1964,11 @@ function Build-AccountingVoucherXml {
     param($Data, $Cfg,[int]$VchType,[string]$VchNo, [bool]$SkipBBA = $false, $fi = $null)
 
     # Resolve sequential count to populate AutoVchNo natively in database
-    $autoVchNo = Get-VoucherAutoSequence -fi $fi -VchType $VchType -SeriesName $Data.vchSeries -VchNo $VchNo -VchDateStr $Data.date
+    $autoVchNo = Get-BusyAutoVchNoFromVoucherNo `
+    -fi $fi `
+    -VchType $VchType `
+    -SeriesName ([string]$Data.vchSeries) `
+    -VchNo $VchNo
 
     $root = $Cfg.xmlRoot
     $narration = if ($Data.narration) { $Data.narration } else { "" }
@@ -2926,208 +3593,95 @@ WHERE VchType = $VchType
 }
 
 function Create-Voucher {
-    param(
-        $Data,
-        [string]$InstanceId = "",
-        [string]$CompanyCode = ""
-    )
+    param($Data, [string]$InstanceId = "", [string]$CompanyCode = "")
 
     $vchType = [int]$Data.vchType
     $cfg = $script:VoucherConfig[$vchType]
-
-    if (-not $cfg) {
-        return @{
-            success = $false
-            error   = "Unsupported vchType: $vchType"
-        }
-    }
+    if (-not $cfg) { return @{ success=$false; error="Unsupported vchType: $vchType" } }
 
     $validationError = Validate-VoucherData $Data $cfg
+    if ($validationError) { return @{ success=$false; error=$validationError } }
 
-    if ($validationError) {
-        return @{
-            success = $false
-            error   = $validationError
-        }
-    }
-
-    $isChallanType = (
-        $vchType -eq 11 -or
-        $vchType -eq 4
-    )
-
+    $isChallanType = ($vchType -eq 11 -or $vchType -eq 4)
     $maxAttempts = 2
     $attempt = 1
     $lastExceptionMsg = ""
 
     while ($attempt -le $maxAttempts) {
-        $fi = $null
+        $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
+        if (-not $fi) { return @{ success=$false; error="BUSY connection failed" } }
 
         try {
-            $fi = Connect-BUSY `
+            $seriesName = ([string]$Data.vchSeries).Trim()
+            $busyDateText = [string]$Data.date
+            $voucherDate = [datetime]::Now.Date
+            if ($busyDateText -match '^\d{2}-\d{2}-\d{4}$') {
+                $voucherDate = [datetime]::ParseExact($busyDateText, 'dd-MM-yyyy', [System.Globalization.CultureInfo]::InvariantCulture)
+            } elseif ($busyDateText -match '^\d{4}-\d{2}-\d{2}$') {
+                $voucherDate = [datetime]::ParseExact($busyDateText, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
+            }
+
+            # Read the administrator-selected source for this type + series.
+            $adminConfigResult = Get-WebNumberingConfig `
+                -VchType $vchType `
+                -SeriesName $seriesName `
+                -VoucherDate $voucherDate.ToString('yyyy-MM-dd') `
                 -InstanceId $InstanceId `
                 -CompanyCode $CompanyCode
 
-            if (-not $fi) {
-                return @{
-                    success = $false
-                    error   = "BUSY connection failed"
-                }
+            if (-not $adminConfigResult.success) { throw $adminConfigResult.error }
+            $adminConfig = $adminConfigResult.data
+
+            # WEB source is authoritative. BUSY source keeps the number submitted by
+            # the existing BUSY numbering flow.
+            $vchNo = if ($adminConfig.source -eq 'WEB' -and $adminConfig.is_active) {
+                ([string]$adminConfig.next_vch_no).Trim()
+            } else {
+                ([string]$Data.vchNo).Trim()
             }
 
-            $vchNo = ([string]$Data.vchNo).Trim()
-            $vchSeries = ([string]$Data.vchSeries).Trim()
+            if ([string]::IsNullOrWhiteSpace($vchNo)) { return @{ success=$false; error='Voucher number is required.' } }
 
-            if ([string]::IsNullOrWhiteSpace($vchNo)) {
-                return @{
-                    success = $false
-                    error   = "Voucher number is required."
-                }
+            $exists = Test-VoucherNumberExists -fi $fi -VchType $vchType -SeriesName $seriesName -VchNo $vchNo
+            if ($exists) {
+                return @{ success=$false; error="Voucher number '$vchNo' already exists in series '$seriesName'. Refresh and try again." }
             }
 
-            if ([string]::IsNullOrWhiteSpace($vchSeries)) {
-                return @{
-                    success = $false
-                    error   = "Voucher series is required."
-                }
-            }
-
-            # --------------------------------------------------------
-            # Prevent duplicate voucher creation
-            # --------------------------------------------------------
-
-            $voucherAlreadyExists = Test-VoucherNumberExists `
-                -fi $fi `
-                -VchType $vchType `
-                -SeriesName $vchSeries `
-                -VchNo $vchNo
-
-            if ($voucherAlreadyExists) {
-                return @{
-                    success = $false
-                    error   = (
-                        "Voucher number '$vchNo' already exists " +
-                        "in series '$vchSeries'."
-                    )
-                }
-            }
-
-            # --------------------------------------------------------
-            # Build voucher XML only after duplicate validation
-            # --------------------------------------------------------
-
+            # Ensure XML builders receive the final backend-selected number.
+            $Data.vchNo = $vchNo
             $xml = if ($cfg.isAccounting) {
-                Build-AccountingVoucherXml `
-                    -Data $Data `
-                    -Cfg $cfg `
-                    -VchType $vchType `
-                    -VchNo $vchNo `
-                    -SkipBBA $false `
-                    -fi $fi
-            }
-            else {
-                Build-VoucherXml `
-                    -Data $Data `
-                    -Cfg $cfg `
-                    -VchType $vchType `
-                    -VchNo $vchNo `
-                    -SkipBBA $isChallanType `
-                    -fi $fi
-            }
-
-            if ([string]::IsNullOrWhiteSpace($xml)) {
-                throw "Generated voucher XML is empty."
+                Build-AccountingVoucherXml -Data $Data -Cfg $cfg -VchType $vchType -VchNo $vchNo -SkipBBA $false -fi $fi
+            } else {
+                Build-VoucherXml -Data $Data -Cfg $cfg -VchType $vchType -VchNo $vchNo -SkipBBA $isChallanType -fi $fi
             }
 
             $errMsg = ""
-
-            $saved = $fi.SaveVchFromXML(
-                $vchType,
-                $xml,
-                [ref]$errMsg
-            )
-
+            $saved = $fi.SaveVchFromXML($vchType, $xml, [ref]$errMsg)
             if ($saved -ne $true) {
-                return @{
-                    success = $false
-                    error   = if ($errMsg) {
-                        $errMsg
-                    }
-                    else {
-                        "Unknown BUSY error"
-                    }
-                }
+                return @{ success=$false; error=if ($errMsg) { $errMsg } else { 'Unknown BUSY error' } }
             }
 
             if ($Data.bridgeUserName) {
-                Update-CheckListCreator `
-                    -fi $fi `
-                    -VchType $vchType `
-                    -VchNo $vchNo `
-                    -VchDate $Data.date `
-                    -UserName $Data.bridgeUserName `
-                    -InstanceId $InstanceId `
-                    -CompanyCode $CompanyCode
+                Update-CheckListCreator -fi $fi -VchType $vchType -VchNo $vchNo -VchDate $Data.date -UserName $Data.bridgeUserName -InstanceId $InstanceId -CompanyCode $CompanyCode
             }
 
-            Clear-StockCaches `
-                -InstanceId $InstanceId `
-                -CompanyCode $CompanyCode
-
+            Clear-StockCaches -InstanceId $InstanceId -CompanyCode $CompanyCode
             return @{
-                success = $true
-                message = "$($cfg.xmlRoot) created successfully"
-                data    = @{
-                    vchType   = $vchType
-                    vchSeries = $vchSeries
-                    vchNo     = $vchNo
-                    date      = $Data.date
-                    party     = $Data.party
-                }
+                success=$true
+                message="$($cfg.xmlRoot) created successfully"
+                data=@{ vchType=$vchType; vchSeries=$seriesName; vchNo=$vchNo; date=$Data.date; party=$Data.party; numberingSource=$adminConfig.source }
             }
-        }
-        catch {
+        } catch {
             $lastExceptionMsg = $_.Exception.Message
-
             $script:ActiveConnection = $null
-
-            if ($fi) {
-                try {
-                    [System.Runtime.InteropServices.Marshal]::ReleaseComObject(
-                        $fi
-                    ) | Out-Null
-                }
-                catch {
-                }
-            }
-
-            if ($attempt -eq 1) {
-                Write-Host (
-                    "2026-06-01 [WARNING] Save failed. " +
-                    "Reconnecting for Attempt 2..."
-                ) -ForegroundColor Yellow
-            }
-
+            try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($fi) | Out-Null } catch {}
             $attempt++
-        }
-        finally {
-            if ($fi) {
-                try {
-                    Disconnect-BUSY $fi
-                }
-                catch {
-                }
-            }
+        } finally {
+            Disconnect-BUSY $fi
         }
     }
 
-    return @{
-        success = $false
-        error   = (
-            "Database error. Connection reset. Details: " +
-            $lastExceptionMsg
-        )
-    }
+    return @{ success=$false; error="Database error. Connection reset. Details: $lastExceptionMsg" }
 }
 
 function Get-Vouchers {
@@ -3547,6 +4101,11 @@ function Get-VoucherDetail {
         }
     }
 
+    # Item master lookup populated after the BUSY connection is opened.
+    # Key: lower-case item name
+    # Value: @{ code = <item master code>; alias = <item alias> }
+    $itemMasterByName = @{}
+
     function Convert-VoucherXmlItemToHash {
         param(
             $d,
@@ -3559,6 +4118,27 @@ function Get-VoucherDetail {
         $itemName = Get-NodeTextSafe $d.ItemName
         $unitName = Get-NodeTextSafe $d.UnitName
         $mcName   = Get-NodeTextSafe $d.MC
+
+        # Resolve the BUSY item master code and alias from the lookup.
+        $itemCode = 0
+        $itemAlias = ""
+
+        try {
+            $itemKey = $itemName.Trim().ToLowerInvariant()
+
+            if (
+                $itemKey -ne "" -and
+                $null -ne $itemMasterByName -and
+                $itemMasterByName.ContainsKey($itemKey)
+            ) {
+                $itemMaster = $itemMasterByName[$itemKey]
+                $itemCode = [int]$itemMaster.code
+                $itemAlias = [string]$itemMaster.alias
+            }
+        } catch {
+            $itemCode = 0
+            $itemAlias = ""
+        }
 
         $qty      = Get-DoubleSafe $d.Qty 0.0
         $price    = Get-DoubleSafe $d.Price 0.0
@@ -3614,7 +4194,11 @@ function Get-VoucherDetail {
 
         return @{
             srNo            = $OutputSrNo
+            itemCode        = $itemCode
+            code            = $itemCode
             itemName        = $itemName
+            alias           = $itemAlias
+            itemAlias       = $itemAlias
             unit            = $unitName
             qty             = $qty
             listPrice       = $listPrice
@@ -3735,6 +4319,76 @@ function Get-VoucherDetail {
     if (-not $fi) { return @{ success = $false; error = "BUSY connection failed" } }
 
     try {
+        # Load all item codes and aliases once.
+        # This avoids one database query per voucher row.
+        try {
+            $itemRst = $fi.GetRecordset(@"
+SELECT
+    Code,
+    Name,
+    Alias
+FROM Master1
+WHERE MasterType = 6
+"@)
+
+            if ($itemRst -and -not $itemRst.EOF) {
+                $itemRst.MoveFirst()
+
+                while (-not $itemRst.EOF) {
+                    $codeRaw = $itemRst.Fields.Item("Code").Value
+                    $nameRaw = $itemRst.Fields.Item("Name").Value
+                    $aliasRaw = $itemRst.Fields.Item("Alias").Value
+
+                    $masterName = ""
+                    $masterCode = 0
+                    $masterAlias = ""
+
+                    if (
+                        $null -ne $nameRaw -and
+                        $nameRaw -ne [System.DBNull]::Value
+                    ) {
+                        $masterName = $nameRaw.ToString().Trim()
+                    }
+
+                    if (
+                        $null -ne $codeRaw -and
+                        $codeRaw -ne [System.DBNull]::Value
+                    ) {
+                        try {
+                            $masterCode = [int][string]$codeRaw
+                        } catch {
+                            $masterCode = 0
+                        }
+                    }
+
+                    if (
+                        $null -ne $aliasRaw -and
+                        $aliasRaw -ne [System.DBNull]::Value
+                    ) {
+                        $masterAlias = $aliasRaw.ToString().Trim()
+                    }
+
+                    if (-not [string]::IsNullOrWhiteSpace($masterName)) {
+                        $itemKey = $masterName.ToLowerInvariant()
+
+                        $itemMasterByName[$itemKey] = @{
+                            code  = $masterCode
+                            alias = $masterAlias
+                        }
+                    }
+
+                    $itemRst.MoveNext()
+                }
+
+                try { $itemRst.Close() } catch {}
+            }
+
+            Write-SJDebug "Loaded item alias lookup count=$($itemMasterByName.Count)"
+        } catch {
+            Write-SJDebug "Could not load item alias lookup: $($_.Exception.Message)"
+            $itemMasterByName = @{}
+        }
+
         $errMsg = ""
         $xmlStr = ""
         try {
@@ -3742,6 +4396,13 @@ function Get-VoucherDetail {
         } catch {
             $xmlStr = $fi.GetVchXML($vchCode)
         }
+        if ($VchType -eq 6) {
+    Write-Host ""
+    Write-Host "========== PRODUCTION RAW XML ==========" -ForegroundColor Yellow
+    Write-Host $xmlStr
+    Write-Host "========== END PRODUCTION RAW XML ======" -ForegroundColor Yellow
+    Write-Host ""
+}
 
         if (-not $xmlStr) {
             return @{ success = $false; error = if ($errMsg) { $errMsg } else { "Voucher XML is empty" } }
@@ -3777,10 +4438,61 @@ function Get-VoucherDetail {
         try { if ($root.STPTName) { $stptName = ([string]$root.STPTName).Trim() } } catch {}
 
         $matCentre = ""
-        try { if ($root.MasterName2) { $matCentre = ([string]$root.MasterName2).Trim() } } catch {}
-
         $party = ""
-        try { if ($root.MasterName1) { $party = ([string]$root.MasterName1).Trim() } } catch {}
+        $bomName = ""
+        $extraExpenseInBOM = 0.0
+
+        if ($VchType -eq 6) {
+
+            # ─────────────────────────────────────────────
+            # PRODUCTION VOUCHER
+            #
+            # MasterName1 = Generated Material Centre
+            # ConMCName   = Consumed Material Centre
+            # MasterName2 = BOM Name
+            # ─────────────────────────────────────────────
+
+            try {
+                if ($root.MasterName1) {
+                    $matCentre = ([string]$root.MasterName1).Trim()
+                }
+            } catch {}
+
+            try {
+                if ($root.ConMCName) {
+                    $party = ([string]$root.ConMCName).Trim()
+                }
+            } catch {}
+
+            try {
+                if ($root.MasterName2) {
+                    $bomName = ([string]$root.MasterName2).Trim()
+                }
+            } catch {}
+
+            try {
+                if ($root.ExtraExpenseInBOM) {
+                    $extraExpenseInBOM =
+                        Get-DoubleSafe $root.ExtraExpenseInBOM 0.0
+                }
+            } catch {}
+
+        }
+        else {
+
+            # Existing voucher behaviour
+            try {
+                if ($root.MasterName2) {
+                    $matCentre = ([string]$root.MasterName2).Trim()
+                }
+            } catch {}
+
+            try {
+                if ($root.MasterName1) {
+                    $party = ([string]$root.MasterName1).Trim()
+                }
+            } catch {}
+        }
 
         $consumptionMap = @{}
         if ($VchType -eq 12 -or $VchType -eq 13) {
@@ -3839,7 +4551,7 @@ function Get-VoucherDetail {
         $items = @()
         $srNo = 1
 
-        if ($VchType -eq 8) {
+        if ($VchType -eq 8 -or $VchType -eq 6) {
             # Stock Journal is special:
             #   ItemEntries          = Items Generated
             #   ConsumedItemEntries  = Items Consumed
@@ -3997,23 +4709,32 @@ function Get-VoucherDetail {
         return @{
             success = $true
             data = @{
-                vchType        = $VchType
-                inputType      = $inputType
-                vchNo          = $VchNo
-                vchSeries      = $VchSeries
-                date           = $vchDateStr
-                party          = $party
-                matCentre      = $matCentre
-                saleType       = $stptName
-                purchaseType   = $stptName
-                narration      = $narration
-                supplierBillNo = $supplierBillNo
-                items          = @($items)
-                billSundries   = @($billSundries)
-                settlements    = $settlements
-                refEntries     = @($refEntries)
-                linkedChallans = @($linkedChallans)
-                optionalFields = $optionalFields
+                vchType          = $VchType
+                inputType        = $inputType
+                vchNo            = $VchNo
+                vchSeries        = $VchSeries
+                date             = $vchDateStr
+
+                # party is reused by the shared frontend as Consumed MC.
+                party            = $party
+
+                # matCentre is reused by the shared frontend as Generated MC.
+                matCentre        = $matCentre
+
+                # Production-specific fields.
+                bomName          = $bomName
+                extraExpenseInBOM = $extraExpenseInBOM
+
+                saleType         = $stptName
+                purchaseType     = $stptName
+                narration        = $narration
+                supplierBillNo   = $supplierBillNo
+                items            = @($items)
+                billSundries     = @($billSundries)
+                settlements      = $settlements
+                refEntries       = @($refEntries)
+                linkedChallans   = @($linkedChallans)
+                optionalFields   = $optionalFields
             }
         }
     } catch {
@@ -5326,6 +6047,565 @@ function Get-ReturnHistory {
     }
 }
 
+# ═══════════════════════════════════════════════════════════════
+#  PRODUCTION BOM HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+function Get-BomList {
+    param(
+        [string]$Search = "",
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $fi = Connect-BUSY `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $fi) {
+        return @{
+            success = $false
+            error   = "BUSY connection failed"
+        }
+    }
+
+    try {
+
+        $safeSearch = ""
+        if ($Search) {
+            $safeSearch = $Search.Trim() -replace "'", "''"
+        }
+
+        $where = "MasterType = 15"
+
+        if (-not [string]::IsNullOrWhiteSpace($safeSearch)) {
+            $where += " AND (Name LIKE '*$safeSearch*' OR Alias LIKE '*$safeSearch*')"
+        }
+
+        $sql = @"
+SELECT
+    Code,
+    Name,
+    Alias,
+    CM1,
+    CM2,
+    CM3,
+    CM4,
+    D1,
+    D2
+FROM Master1
+WHERE $where
+ORDER BY Name
+"@
+
+        $rst = $fi.GetRecordset($sql)
+
+        $result = @()
+
+        if ($rst -and -not $rst.EOF) {
+
+            $rst.MoveFirst()
+
+            while (-not $rst.EOF) {
+
+                $code = 0
+                $name = ""
+                $alias = ""
+
+                $mainItemCode = 0
+                $unitCode = 0
+                $generatedMCCode = 0
+                $consumedMCCode = 0
+
+                $baseQty = 0.0
+                $extraExpense = 0.0
+
+                try {
+                    $code = [int]$rst.Fields.Item("Code").Value
+                } catch {}
+
+                try {
+                    $name = $rst.Fields.Item("Name").Value.ToString().Trim()
+                } catch {}
+
+                try {
+                    $aliasRaw = $rst.Fields.Item("Alias").Value
+
+                    if (
+                        $null -ne $aliasRaw -and
+                        $aliasRaw -ne [System.DBNull]::Value
+                    ) {
+                        $alias = $aliasRaw.ToString().Trim()
+                    }
+                } catch {}
+
+                try {
+                    $mainItemCode = [int]$rst.Fields.Item("CM1").Value
+                } catch {}
+
+                try {
+                    $unitCode = [int]$rst.Fields.Item("CM2").Value
+                } catch {}
+
+                try {
+                    $generatedMCCode = [int]$rst.Fields.Item("CM3").Value
+                } catch {}
+
+                try {
+                    $consumedMCCode = [int]$rst.Fields.Item("CM4").Value
+                } catch {}
+
+                try {
+                    $baseQty = [double]$rst.Fields.Item("D1").Value
+                } catch {}
+
+                try {
+                    $extraExpense = [double]$rst.Fields.Item("D2").Value
+                } catch {}
+
+                $result += @{
+                    code             = $code
+                    name             = $name
+                    alias            = $alias
+                    mainItemCode     = $mainItemCode
+                    unitCode         = $unitCode
+                    generatedMCCode  = $generatedMCCode
+                    consumedMCCode   = $consumedMCCode
+                    baseQty          = $baseQty
+                    extraExpense     = $extraExpense
+                }
+
+                $rst.MoveNext()
+            }
+
+            try {
+                $rst.Close()
+            } catch {}
+        }
+
+        return @{
+            success = $true
+            count   = $result.Count
+            data    = @($result)
+        }
+    }
+    catch {
+
+        return @{
+            success = $false
+            error   = $_.Exception.Message
+        }
+    }
+    finally {
+
+        Disconnect-BUSY $fi
+    }
+}
+
+
+function Get-BomDetail {
+    param(
+        [int]$BomCode = 0,
+        [string]$BomName = "",
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $fi = Connect-BUSY `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $fi) {
+        return @{
+            success = $false
+            error   = "BUSY connection failed"
+        }
+    }
+
+    try {
+
+        # -------------------------------------------------------
+        # Helper: get one Master1 record by Code
+        # -------------------------------------------------------
+        function Get-MasterByCode {
+            param([int]$Code)
+
+            if ($Code -le 0) {
+                return $null
+            }
+
+            $rst = $fi.GetRecordset(
+                "SELECT Code, MasterType, Name, Alias FROM Master1 WHERE Code=$Code"
+            )
+
+            if (-not $rst -or $rst.EOF) {
+                return $null
+            }
+
+            $name = ""
+            $alias = ""
+            $masterType = 0
+
+            try {
+                $name = $rst.Fields.Item("Name").Value.ToString().Trim()
+            } catch {}
+
+            try {
+                $masterType = [int]$rst.Fields.Item("MasterType").Value
+            } catch {}
+
+            try {
+                $aliasRaw = $rst.Fields.Item("Alias").Value
+
+                if (
+                    $null -ne $aliasRaw -and
+                    $aliasRaw -ne [System.DBNull]::Value
+                ) {
+                    $alias = $aliasRaw.ToString().Trim()
+                }
+            } catch {}
+
+            try {
+                $rst.Close()
+            } catch {}
+
+            return @{
+                code       = $Code
+                name       = $name
+                alias      = $alias
+                masterType = $masterType
+            }
+        }
+
+
+        # -------------------------------------------------------
+        # 1. Resolve BOM header
+        # -------------------------------------------------------
+        $headerSql = ""
+
+        if ($BomCode -gt 0) {
+
+            $headerSql = @"
+SELECT *
+FROM Master1
+WHERE MasterType=15
+AND Code=$BomCode
+"@
+        }
+        else {
+
+            $safeBomName = $BomName.Trim() -replace "'", "''"
+
+            $headerSql = @"
+SELECT *
+FROM Master1
+WHERE MasterType=15
+AND Name='$safeBomName'
+"@
+        }
+
+        $bomRst = $fi.GetRecordset($headerSql)
+
+        if (-not $bomRst -or $bomRst.EOF) {
+
+            return @{
+                success = $false
+                error   = "BOM not found"
+            }
+        }
+
+
+        # -------------------------------------------------------
+        # 2. Read BOM header
+        # -------------------------------------------------------
+        $resolvedBomCode = 0
+        $resolvedBomName = ""
+        $bomAlias = ""
+
+        $mainItemCode = 0
+        $unitCode = 0
+
+        $generatedMCCode = 0
+        $consumedMCCode = 0
+
+        $baseQty = 0.0
+        $extraExpense = 0.0
+
+        try {
+            $resolvedBomCode =
+                [int]$bomRst.Fields.Item("Code").Value
+        } catch {}
+
+        try {
+            $resolvedBomName =
+                $bomRst.Fields.Item("Name").Value.ToString().Trim()
+        } catch {}
+
+        try {
+            $aliasRaw = $bomRst.Fields.Item("Alias").Value
+
+            if (
+                $null -ne $aliasRaw -and
+                $aliasRaw -ne [System.DBNull]::Value
+            ) {
+                $bomAlias = $aliasRaw.ToString().Trim()
+            }
+        } catch {}
+
+        try {
+            $mainItemCode =
+                [int]$bomRst.Fields.Item("CM1").Value
+        } catch {}
+
+        try {
+            $unitCode =
+                [int]$bomRst.Fields.Item("CM2").Value
+        } catch {}
+
+        try {
+            $generatedMCCode =
+                [int]$bomRst.Fields.Item("CM3").Value
+        } catch {}
+
+        try {
+            $consumedMCCode =
+                [int]$bomRst.Fields.Item("CM4").Value
+        } catch {}
+
+        try {
+            $baseQty =
+                [double]$bomRst.Fields.Item("D1").Value
+        } catch {}
+
+        try {
+            $extraExpense =
+                [double]$bomRst.Fields.Item("D2").Value
+        } catch {}
+
+        try {
+            $bomRst.Close()
+        } catch {}
+
+
+        # -------------------------------------------------------
+        # 3. Resolve header master names
+        # -------------------------------------------------------
+        $mainItemMaster =
+            Get-MasterByCode -Code $mainItemCode
+
+        $unitMaster =
+            Get-MasterByCode -Code $unitCode
+
+        $generatedMCMaster =
+            Get-MasterByCode -Code $generatedMCCode
+
+        $consumedMCMaster =
+            Get-MasterByCode -Code $consumedMCCode
+
+
+        # -------------------------------------------------------
+        # 4. Read BOM components from MasterSupport
+        #
+        # I1 = 2 -> Raw Material Consumed
+        # I1 = 3 -> By-product Generated
+        #
+        # I2 = sequence within its section
+        # CM1 = item code
+        # CM2 = unit code
+        # D1  = quantity
+        # -------------------------------------------------------
+        $supportSql = @"
+SELECT
+    CM1,
+    CM2,
+    D1,
+    I1,
+    I2
+FROM MasterSupport
+WHERE MasterCode=$resolvedBomCode
+AND MasterType=15
+ORDER BY I1, I2
+"@
+
+        $supportRst =
+            $fi.GetRecordset($supportSql)
+
+        $rawMaterials = @()
+        $byProducts = @()
+
+        if (
+            $supportRst -and
+            -not $supportRst.EOF
+        ) {
+
+            $supportRst.MoveFirst()
+
+            while (-not $supportRst.EOF) {
+
+                $componentItemCode = 0
+                $componentUnitCode = 0
+
+                $componentQty = 0.0
+
+                $componentType = 0
+                $componentSequence = 0
+
+                try {
+                    $componentItemCode =
+                        [int]$supportRst.Fields.Item("CM1").Value
+                } catch {}
+
+                try {
+                    $componentUnitCode =
+                        [int]$supportRst.Fields.Item("CM2").Value
+                } catch {}
+
+                try {
+                    $componentQty =
+                        [double]$supportRst.Fields.Item("D1").Value
+                } catch {}
+
+                try {
+                    $componentType =
+                        [int]$supportRst.Fields.Item("I1").Value
+                } catch {}
+
+                try {
+                    $componentSequence =
+                        [int]$supportRst.Fields.Item("I2").Value
+                } catch {}
+
+                $itemMaster =
+                    Get-MasterByCode -Code $componentItemCode
+
+                $componentUnit =
+                    Get-MasterByCode -Code $componentUnitCode
+
+                $component = @{
+                    code      = $componentItemCode
+                    name      = if ($itemMaster) {
+                        $itemMaster.name
+                    } else {
+                        ""
+                    }
+
+                    alias     = if ($itemMaster) {
+                        $itemMaster.alias
+                    } else {
+                        ""
+                    }
+
+                    unitCode  = $componentUnitCode
+
+                    unit      = if ($componentUnit) {
+                        $componentUnit.name
+                    } else {
+                        ""
+                    }
+
+                    qty       = $componentQty
+                    sequence  = $componentSequence
+                }
+
+
+                if ($componentType -eq 2) {
+
+                    $rawMaterials += $component
+                }
+                elseif ($componentType -eq 3) {
+
+                    $byProducts += $component
+                }
+
+                $supportRst.MoveNext()
+            }
+
+            try {
+                $supportRst.Close()
+            } catch {}
+        }
+
+
+        # -------------------------------------------------------
+        # 5. Return clean BOM object
+        # -------------------------------------------------------
+        return @{
+            success = $true
+
+            data = @{
+
+                code = $resolvedBomCode
+                name = $resolvedBomName
+                alias = $bomAlias
+
+                baseQty = $baseQty
+                extraExpensePerUnit = $extraExpense
+
+                mainItem = @{
+                    code = $mainItemCode
+
+                    name = if ($mainItemMaster) {
+                        $mainItemMaster.name
+                    } else {
+                        ""
+                    }
+
+                    alias = if ($mainItemMaster) {
+                        $mainItemMaster.alias
+                    } else {
+                        ""
+                    }
+
+                    qty = $baseQty
+
+                    unitCode = $unitCode
+
+                    unit = if ($unitMaster) {
+                        $unitMaster.name
+                    } else {
+                        ""
+                    }
+                }
+
+                generatedMaterialCentre = @{
+                    code = $generatedMCCode
+
+                    name = if ($generatedMCMaster) {
+                        $generatedMCMaster.name
+                    } else {
+                        ""
+                    }
+                }
+
+                consumedMaterialCentre = @{
+                    code = $consumedMCCode
+
+                    name = if ($consumedMCMaster) {
+                        $consumedMCMaster.name
+                    } else {
+                        ""
+                    }
+                }
+
+                rawMaterials = @($rawMaterials)
+
+                byProducts = @($byProducts)
+            }
+        }
+    }
+    catch {
+
+        return @{
+            success = $false
+            error   = $_.Exception.Message
+        }
+    }
+    finally {
+
+        Disconnect-BUSY $fi
+    }
+}
+
 
 # ═══════════════════════════════════════════════════════════════
 #  MODIFY VOUCHER
@@ -5393,6 +6673,8 @@ function Modify-Voucher {
 
     return @{ success = $false; error = "Database error. Connection reset. Details: $lastExceptionMsg" }
 }
+
+
 
 # ═══════════════════════════════════════════════════════════════
 #  DELETE VOUCHER

@@ -1,0 +1,2 @@
+CREATE TABLE BridgeOfflineVoucherSync(Id AUTOINCREMENT PRIMARY KEY,LocalId TEXT(100) NOT NULL,InstanceId TEXT(100) NOT NULL,CompanyCode TEXT(50) NOT NULL,VchType LONG NOT NULL,SeriesName TEXT(100),TemporaryVchNo TEXT(100),FinalVchNo TEXT(100),Status TEXT(20) NOT NULL,RequestPayload LONGTEXT,ErrorMessage LONGTEXT,CreatedAt DATETIME,SyncedAt DATETIME);
+CREATE UNIQUE INDEX UX_BridgeOfflineVoucherSync ON BridgeOfflineVoucherSync(LocalId,InstanceId,CompanyCode);

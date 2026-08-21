@@ -62,27 +62,62 @@ Write-Host "  Loaded: reports.ps1" -ForegroundColor Gray
 . (Load-Module "scan_login.ps1")
 Write-Host "  Loaded: scan_login.ps1" -ForegroundColor Gray
 
+# Offline synchronization modules.
+# These files currently enable StrictMode internally.
+# They are loaded here, then StrictMode is turned off again so older
+# BUSY modules keep their previous behavior with optional/missing properties.
+. (Load-Module "offline_sync_db.ps1")
+Write-Host "  Loaded: offline_sync_db.ps1" -ForegroundColor Gray
+
+. (Load-Module "offline_sync_store.ps1")
+Write-Host "  Loaded: offline_sync_store.ps1" -ForegroundColor Gray
+
+. (Load-Module "offline_sync_validation.ps1")
+Write-Host "  Loaded: offline_sync_validation.ps1" -ForegroundColor Gray
+
+. (Load-Module "offline_sync_idempotency.ps1")
+Write-Host "  Loaded: offline_sync_idempotency.ps1" -ForegroundColor Gray
+
+. (Load-Module "offline_sync_numbering.ps1")
+Write-Host "  Loaded: offline_sync_numbering.ps1" -ForegroundColor Gray
+
+. (Load-Module "offline_sync_logging.ps1")
+Write-Host "  Loaded: offline_sync_logging.ps1" -ForegroundColor Gray
+
+. (Load-Module "offline_sync.ps1")
+Write-Host "  Loaded: offline_sync.ps1" -ForegroundColor Gray
+
+# IMPORTANT:
+# Restore the original non-strict behavior used by existing vouchers.ps1.
+# Without this, optional fields such as AltUnitReq throw:
+# "The property 'AltUnitReq' cannot be found on this object."
+Set-StrictMode -Off
+
 # Load routes last because routes depend on all other functions.
 . (Load-Module "routes.ps1")
 Write-Host "  Loaded: routes.ps1" -ForegroundColor Gray
 
-# Optional startup validation
-$requiredReportFunctions = @(
+# Startup validation
+$requiredFunctions = @(
     "Get-OutstandingReport",
-    "Get-StockStatusReport"
+    "Get-StockStatusReport",
+    "Get-VoucherItemDetail",
+    "Create-Voucher",
+    "Sync-OfflineVoucher",
+    "Start-BUSYServer"
 )
 
-foreach ($functionName in $requiredReportFunctions) {
+foreach ($functionName in $requiredFunctions) {
     if (-not (Get-Command $functionName -ErrorAction SilentlyContinue)) {
         Write-Host `
-            "  [ERROR] Required report function was not loaded: $functionName" `
+            "  [ERROR] Required function was not loaded: $functionName" `
             -ForegroundColor Red
 
         exit 1
     }
 }
 
-Write-Host "  Report functions verified successfully." `
+Write-Host "  Required functions verified successfully." `
     -ForegroundColor Green
 
 # Start server listener
