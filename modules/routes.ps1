@@ -84,6 +84,7 @@ function Start-BUSYServer {
 
         try {
             $result = $null
+            $authResult = $null
 
             # ════════════════════════════════════════════════
             #  PUBLIC ENDPOINTS (no auth required)
@@ -779,7 +780,7 @@ function Start-BUSYServer {
                     if ($myPerm) {
                         $result = @{ success = $true; data = $myPerm }
                     } else {
-                        $result = @{ success = $true; data = @{ name = $activeName; C1=1;C2=1;C3=1;C4=1;C5=1;C6=1;C7=1;C8=1;C9=1;C10=1;I1=1;I2=1;I3=1;I4=1;I5=1;I6=1;I7=1;I8=1;I9=1;I10=1;I11=1;I12=1;I13=1;I14=1;M1="{}";M2="{}" } }
+                        $result = @{ success = $true; data = @{ name = $activeName; C1=1;C2=1;C3=1;C4=1;C5=1;C6=1;C7=1;C8=1;C9=1;C10=1;I1=1;I2=1;I3=1;I4=1;I5=1;I6=1;I7=1;I8=1;I9=1;I10=1;I11=1;I12=1;I13=1;I14=1;I15=1;I16=1;I17=1;I18=1;I19=1;I20=1;I21=1;I22=1;B33=1;B34=1;M1="{}";M2="{}" } }
                     }
                 } else {
                     $result = $userRes
@@ -1139,30 +1140,82 @@ function Start-BUSYServer {
                     -CompanyCode $companyCode
 
             } elseif ($path -eq "/busy/reports/stock-status" -and $method -eq "GET") {
+                # Single-page BUSY-like Stock Status report.  Legacy query
+                # parameters remain supported; the extra parameters power the
+                # Detailed / Columnar / Grouped / Hierarchical web views.
+                $fromVal = Get-QueryStringValue $request.QueryString "from" ""
+                $toVal = Get-QueryStringValue $request.QueryString "to" ""
                 $asOfVal = Get-QueryStringValue $request.QueryString "asOf" ""
+                $viewVal = Get-QueryStringValue $request.QueryString "view" "balances"
+
                 $materialCentreVal = Get-QueryStringValue $request.QueryString "materialCentre" ""
+                $materialCentresVal = Get-QueryStringValue $request.QueryString "materialCentres" ""
                 $itemGroupVal = Get-QueryStringValue $request.QueryString "itemGroup" ""
                 $searchVal = Get-QueryStringValue $request.QueryString "search" ""
                 $statusVal = Get-QueryStringValue $request.QueryString "status" "all"
+
                 $includeZeroVal = Get-QueryStringValue $request.QueryString "includeZero" "true"
                 $lowStockLevelVal = Get-QueryStringValue $request.QueryString "lowStockLevel" "5"
-                $valueByVal = Get-QueryStringValue $request.QueryString "valueBy" "purchase"
+                $valueByVal = Get-QueryStringValue $request.QueryString "valueBy" "busy"
+                $unitModeVal = Get-QueryStringValue $request.QueryString "unitMode" "both"
+                $showValueVal = Get-QueryStringValue $request.QueryString "showValue" "true"
+                $includeTransfersVal = Get-QueryStringValue $request.QueryString "includeStockTransfers" "true"
+                $salePurchaseSeparateVal = Get-QueryStringValue $request.QueryString "showSalePurchaseSeparately" "true"
+                $mastersModeVal = Get-QueryStringValue $request.QueryString "mastersMode" "moved-closing"
+                $showParentGroupVal = Get-QueryStringValue $request.QueryString "showParentGroup" "true"
+
                 $pageVal = Get-QueryStringValue $request.QueryString "page" "1"
-                $pageSizeVal = Get-QueryStringValue $request.QueryString "pageSize" "100"
+                $pageSizeVal = Get-QueryStringValue $request.QueryString "pageSize" "5000"
+
+                $safeLowStockLevel = 5.0
+                [double]::TryParse(
+                    [string]$lowStockLevelVal,
+                    [System.Globalization.NumberStyles]::Any,
+                    [System.Globalization.CultureInfo]::InvariantCulture,
+                    [ref]$safeLowStockLevel
+                ) | Out-Null
+
+                $safePage = 1
+                [int]::TryParse([string]$pageVal, [ref]$safePage) | Out-Null
+                if ($safePage -lt 1) { $safePage = 1 }
+
+                $safePageSize = 5000
+                [int]::TryParse([string]$pageSizeVal, [ref]$safePageSize) | Out-Null
+                if ($safePageSize -lt 1) { $safePageSize = 250 }
+                if ($safePageSize -gt 5000) { $safePageSize = 5000 }
+
+                $toBool = {
+                    param([string]$Value, [bool]$Default)
+                    if ([string]::IsNullOrWhiteSpace($Value)) { return $Default }
+                    $v = $Value.Trim().ToLowerInvariant()
+                    if ($v -in @("1", "true", "yes", "y", "on")) { return $true }
+                    if ($v -in @("0", "false", "no", "n", "off")) { return $false }
+                    return $Default
+                }
 
                 $result = Get-StockStatusReport `
-                    -AsOf           $asOfVal `
-                    -MaterialCentre $materialCentreVal `
-                    -ItemGroup      $itemGroupVal `
-                    -Search         $searchVal `
-                    -Status         $statusVal `
-                    -IncludeZero    ($includeZeroVal -eq "true" -or $includeZeroVal -eq "1") `
-                    -LowStockLevel  ([double]$lowStockLevelVal) `
-                    -ValueBy        $valueByVal `
-                    -Page           ([int]$pageVal) `
-                    -PageSize       ([int]$pageSizeVal) `
-                    -InstanceId     $instanceId `
-                    -CompanyCode    $companyCode
+                    -From                    $fromVal `
+                    -To                      $toVal `
+                    -AsOf                    $asOfVal `
+                    -View                    $viewVal `
+                    -MaterialCentre          $materialCentreVal `
+                    -MaterialCentres         $materialCentresVal `
+                    -ItemGroup               $itemGroupVal `
+                    -Search                  $searchVal `
+                    -Status                  $statusVal `
+                    -IncludeZero             (& $toBool $includeZeroVal $true) `
+                    -LowStockLevel           $safeLowStockLevel `
+                    -ValueBy                 $valueByVal `
+                    -UnitMode                $unitModeVal `
+                    -ShowValue               (& $toBool $showValueVal $true) `
+                    -IncludeStockTransfers   (& $toBool $includeTransfersVal $true) `
+                    -ShowSalePurchaseSeparately (& $toBool $salePurchaseSeparateVal $true) `
+                    -MastersMode             $mastersModeVal `
+                    -ShowParentGroup         (& $toBool $showParentGroupVal $true) `
+                    -Page                    $safePage `
+                    -PageSize                $safePageSize `
+                    -InstanceId              $instanceId `
+                    -CompanyCode             $companyCode
 
             } elseif ($path -eq "/busy/item-groups" -and $method -eq "GET") {
                 $result = Get-ItemGroups -InstanceId $instanceId -CompanyCode $companyCode
@@ -1202,6 +1255,79 @@ function Start-BUSYServer {
                     -Search      $searchVal `
                     -InstanceId  $instanceId `
                     -CompanyCode $companyCode
+
+            } elseif ($path -eq "/busy/vouchers/item-cost" -and $method -eq "GET") {
+                # ---------------------------------------------------------
+                # Material-centre-specific current average inventory cost.
+                #
+                # Used by consumed rows in Stock Journal and Production.
+                # Cost = remaining stock value / remaining stock quantity.
+                # ---------------------------------------------------------
+                $codeStr = Get-QueryStringValue $request.QueryString "code" ""
+                if ($codeStr -eq "") {
+                    $codeStr = Get-QueryStringValue $request.QueryString "params[code]" ""
+                }
+
+                $materialCentreVal = Get-QueryStringValue $request.QueryString "materialCentre" ""
+                if ($materialCentreVal -eq "") {
+                    $materialCentreVal = Get-QueryStringValue $request.QueryString "params[materialCentre]" ""
+                }
+
+                $asOfVal = Get-QueryStringValue $request.QueryString "asOf" ""
+                if ($asOfVal -eq "") {
+                    $asOfVal = Get-QueryStringValue $request.QueryString "params[asOf]" ""
+                }
+                if ($asOfVal -eq "") {
+                    $asOfVal = Get-QueryStringValue $request.QueryString "date" ""
+                }
+
+                # Optional edit-mode safeguard: exclude the voucher being edited
+                # so its already-posted stock movement does not affect the cost
+                # calculated immediately before that voucher.
+                $excludeVchCodeStr = Get-QueryStringValue $request.QueryString "excludeVchCode" "0"
+                if ($excludeVchCodeStr -eq "") {
+                    $excludeVchCodeStr = Get-QueryStringValue $request.QueryString "params[excludeVchCode]" "0"
+                }
+                $excludeVchCode = 0
+                $null = [int]::TryParse($excludeVchCodeStr.ToString(), [ref]$excludeVchCode)
+
+                $itemCode = 0
+                $isValidCode = $false
+
+                if (-not [string]::IsNullOrWhiteSpace($codeStr)) {
+                    $isValidCode = [int]::TryParse(
+                        $codeStr.ToString(),
+                        [ref]$itemCode
+                    )
+                }
+
+                if (-not $isValidCode -or $itemCode -le 0) {
+                    $result = @{
+                        success = $false
+                        error   = "Valid item code is required"
+                    }
+                    $response.StatusCode = 400
+                }
+                elseif ([string]::IsNullOrWhiteSpace($materialCentreVal)) {
+                    $result = @{
+                        success = $false
+                        error   = "Material centre is required"
+                    }
+                    $response.StatusCode = 400
+                }
+                else {
+                    $result = Get-ItemMaterialCentreAverageCost `
+                        -ItemCode       $itemCode `
+                        -MaterialCentre $materialCentreVal `
+                        -AsOf           $asOfVal `
+                        -ExcludeVchCode $excludeVchCode `
+                        -InstanceId     $instanceId `
+                        -CompanyCode    $companyCode
+
+                    if ($null -ne $result -and $result.success -eq $false) {
+                        $response.StatusCode = 400
+                    }
+                }
 
             } elseif ($path -eq "/busy/vouchers/item-detail" -and $method -eq "GET") {
                 $codeStr = Get-QueryStringValue $request.QueryString "code" ""

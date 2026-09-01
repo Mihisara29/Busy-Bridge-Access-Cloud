@@ -82,7 +82,9 @@ function Open-SqlConnection {
     return $conn
 }
 
-# SQL Table Creator - Includes columns B21 through B32
+# SQL Table Creator - Includes quotation permissions I19-I22 and master columns B21-B32
+# Production permissions use pre-existing BUSY columns B33/B34 when present.
+# IMPORTANT: this module does NOT add B33/B34 to the database schema.
 function Ensure-MobileUserPreferenceTable {
     param([System.Data.SqlClient.SqlConnection]$Conn)
     try {
@@ -99,7 +101,7 @@ CREATE TABLE MobileUserPreference (
     I9  INT DEFAULT 0, I10 INT DEFAULT 0, I11 INT DEFAULT 0, I12 INT DEFAULT 0,
     I13 INT DEFAULT 0, I14 INT DEFAULT 0,
     I15 INT DEFAULT 0, I16 INT DEFAULT 0, I17 INT DEFAULT 0, I18 INT DEFAULT 0,
-    I19 INT DEFAULT 0, I20 INT DEFAULT 0,
+    I19 INT DEFAULT 0, I20 INT DEFAULT 0, I21 INT DEFAULT 0, I22 INT DEFAULT 0,
     B21 INT DEFAULT 0, B22 INT DEFAULT 0, B23 INT DEFAULT 0, B24 INT DEFAULT 0,
     B25 INT DEFAULT 0, B26 INT DEFAULT 0, B27 INT DEFAULT 0, B28 INT DEFAULT 0,
     B29 INT DEFAULT 0, B30 INT DEFAULT 0, B31 INT DEFAULT 0, B32 INT DEFAULT 0,
@@ -120,8 +122,9 @@ function Read-PermissionRow {
         C1=0; C2=0; C3=0; C4=0; C5=0; C6=0; C7=0; C8=0; C9=0; C10=0
         I1=0; I2=0; I3=0; I4=0; I5=0; I6=0; I7=0; I8=0; I9=0; I10=0
         I11=0; I12=0; I13=0; I14=0
-        I15=0; I16=0; I17=0; I18=0; I19=0; I20=0
+        I15=0; I16=0; I17=0; I18=0; I19=0; I20=0; I21=0; I22=0
         B21=0; B22=0; B23=0; B24=0; B25=0; B26=0; B27=0; B28=0; B29=0; B30=0; B31=0; B32=0
+        B33=0; B34=0
         M1="{}"; M2="{}"
     }
     foreach ($col in @($userObj.Keys)) {
@@ -136,8 +139,8 @@ function Read-PermissionRow {
     
     foreach ($col in @("C1","C2","C3","C4","C5","C6","C7","C8","C9","C10",
                        "I1","I2","I3","I4","I5","I6","I7","I8","I9","I10","I11","I12","I13","I14",
-                       "I15","I16","I17","I18","I19","I20",
-                       "B21","B22","B23","B24","B25","B26","B27","B28","B29","B30","B31","B32")) {
+                       "I15","I16","I17","I18","I19","I20","I21","I22",
+                       "B21","B22","B23","B24","B25","B26","B27","B28","B29","B30","B31","B32","B33","B34")) {
         $userObj[$col] = Normalize-PermissionValue $userObj[$col]
     }
     return $userObj
@@ -277,7 +280,9 @@ function Get-UserPermissions {
     }
 }
 
-# UPDATED: Included B21 through B32 in both Access and SQL Server write paths
+# UPDATED: Includes quotation permissions I19-I22, master permissions B21-B32,
+# and Production permissions B33/B34 in both Access and SQL Server write paths.
+# B33/B34 are existing BUSY columns and are never created/altered here.
 function Save-UserPermissions {
     param($Data, [string]$InstanceId = "", [string]$CompanyCode = "")
     $found = Get-InstanceForCompany -CompanyCode $CompanyCode -InstanceId $InstanceId
@@ -290,8 +295,9 @@ function Save-UserPermissions {
     $intCols = @(
         "C1","C2","C3","C4","C5","C6","C7","C8","C9","C10",
         "I1","I2","I3","I4","I5","I6","I7","I8","I9","I10","I11","I12","I13","I14",
-        "I15","I16","I17","I18","I19","I20",
-        "B21","B22","B23","B24","B25","B26","B27","B28","B29","B30","B31","B32"
+        "I15","I16","I17","I18","I19","I20","I21","I22",
+        "B21","B22","B23","B24","B25","B26","B27","B28","B29","B30","B31","B32",
+        "B33","B34"
     )
 
     $m1Val = if ($null -ne $Data.M1) { $Data.M1 } else { "{}" }
@@ -304,8 +310,10 @@ function Save-UserPermissions {
             $conn = Open-SqlConnection -SqlServer $inst.sqlServer -Database $sqlDb -SqlUser $inst.sqlUser -SqlPassword $inst.sqlPassword
             Ensure-MobileUserPreferenceTable -Conn $conn
             
-            # Dynamic check/expansion of columns B21 to B32 for SQL database instances
-            foreach ($col in $intCols) {
+            # Dynamic check/expansion of permission columns for SQL database instances
+            # Do not alter BUSY schema for Production. B33/B34 must already exist.
+            $schemaManagedCols = @($intCols | Where-Object { $_ -ne "B33" -and $_ -ne "B34" })
+            foreach ($col in $schemaManagedCols) {
                 try {
                     $chkColCmd = $conn.CreateCommand()
                     $chkColCmd.CommandText = "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='MobileUserPreference' AND COLUMN_NAME='$col'"
@@ -369,7 +377,7 @@ function Save-UserPermissions {
 
             if (-not $tableExists) {
                 $cmd = $conn.CreateCommand()
-                $cmd.CommandText = "CREATE TABLE MobileUserPreference ([Name] TEXT(50) PRIMARY KEY, C1 INTEGER, C2 INTEGER, C3 INTEGER, C4 INTEGER, C5 INTEGER, C6 INTEGER, C7 INTEGER, C8 INTEGER, C9 INTEGER, C10 INTEGER, I1 INTEGER, I2 INTEGER, I3 INTEGER, I4 INTEGER, I5 INTEGER, I6 INTEGER, I7 INTEGER, I8 INTEGER, I9 INTEGER, I10 INTEGER, I11 INTEGER, I12 INTEGER, I13 INTEGER, I14 INTEGER, B21 INTEGER, B22 INTEGER, B23 INTEGER, B24 INTEGER, B25 INTEGER, B26 INTEGER, B27 INTEGER, B28 INTEGER, B29 INTEGER, B30 INTEGER, B31 INTEGER, B32 INTEGER, M1 MEMO, M2 MEMO)"
+                $cmd.CommandText = "CREATE TABLE MobileUserPreference ([Name] TEXT(50) PRIMARY KEY, C1 INTEGER, C2 INTEGER, C3 INTEGER, C4 INTEGER, C5 INTEGER, C6 INTEGER, C7 INTEGER, C8 INTEGER, C9 INTEGER, C10 INTEGER, I1 INTEGER, I2 INTEGER, I3 INTEGER, I4 INTEGER, I5 INTEGER, I6 INTEGER, I7 INTEGER, I8 INTEGER, I9 INTEGER, I10 INTEGER, I11 INTEGER, I12 INTEGER, I13 INTEGER, I14 INTEGER, I15 INTEGER, I16 INTEGER, I17 INTEGER, I18 INTEGER, I19 INTEGER, I20 INTEGER, I21 INTEGER, I22 INTEGER, B21 INTEGER, B22 INTEGER, B23 INTEGER, B24 INTEGER, B25 INTEGER, B26 INTEGER, B27 INTEGER, B28 INTEGER, B29 INTEGER, B30 INTEGER, B31 INTEGER, B32 INTEGER, M1 MEMO, M2 MEMO)"
                 $cmd.ExecuteNonQuery() | Out-Null
             }
 
@@ -383,8 +391,8 @@ function Save-UserPermissions {
             }
             $rdrSchema.Close()
 
-            # Dynamic check/expansion of columns B21 to B32 for Access OLEDB database instances
-            foreach ($f in @("I1","I2","I3","I4","I5","I6","I7","I8","I9","I10","I11","I12","I13","I14","I15","I16","I17","I18","I19","I20","B21","B22","B23","B24","B25","B26","B27","B28","B29","B30","B31","B32","M1","M2")) {
+            # Dynamic check/expansion of permission columns for Access OLEDB database instances
+            foreach ($f in @("I1","I2","I3","I4","I5","I6","I7","I8","I9","I10","I11","I12","I13","I14","I15","I16","I17","I18","I19","I20","I21","I22","B21","B22","B23","B24","B25","B26","B27","B28","B29","B30","B31","B32","M1","M2")) {
                 if ($existingCols -notcontains $f.ToLower()) {
                     $colType = if ($f -like "M*") { "MEMO" } else { "INTEGER" }
                     $cmd = $conn.CreateCommand()
@@ -580,9 +588,9 @@ function Invoke-BusyLogin {
 # default; everyone else must be granted access explicitly via
 # MobileUserPreference (set by an admin on the Permissions page).
 if ($assignedRole -eq "superadmin") {
-    $permissions = @{ name = $matchedUser; C1=1;C2=1;C3=1;C4=1;C5=1;C6=1;C7=1;C8=1;C9=1;C10=1;I1=1;I2=1;I3=1;I4=1;I5=1;I6=1;I7=1;I8=1;I9=1;I10=1;I11=1;I12=1;I13=1;I14=1;I15=1;I16=1;I17=1;I18=1;I19=1;I20=1;M1="{}"; M2="{}" }
+    $permissions = @{ name = $matchedUser; C1=1;C2=1;C3=1;C4=1;C5=1;C6=1;C7=1;C8=1;C9=1;C10=1;I1=1;I2=1;I3=1;I4=1;I5=1;I6=1;I7=1;I8=1;I9=1;I10=1;I11=1;I12=1;I13=1;I14=1;I15=1;I16=1;I17=1;I18=1;I19=1;I20=1;I21=1;I22=1;B33=1;B34=1;M1="{}"; M2="{}" }
 } else {
-    $permissions = @{ name = $matchedUser; C1=0;C2=0;C3=0;C4=0;C5=0;C6=0;C7=0;C8=0;C9=0;C10=0;I1=0;I2=0;I3=0;I4=0;I5=0;I6=0;I7=0;I8=0;I9=0;I10=0;I11=0;I12=0;I13=0;I14=0;I15=0;I16=0;I17=0;I18=0;I19=0;I20=0;M1="{}"; M2="{}" }
+    $permissions = @{ name = $matchedUser; C1=0;C2=0;C3=0;C4=0;C5=0;C6=0;C7=0;C8=0;C9=0;C10=0;I1=0;I2=0;I3=0;I4=0;I5=0;I6=0;I7=0;I8=0;I9=0;I10=0;I11=0;I12=0;I13=0;I14=0;I15=0;I16=0;I17=0;I18=0;I19=0;I20=0;I21=0;I22=0;B33=0;B34=0;M1="{}"; M2="{}" }
 }
 
 if ($assignedRole -ne "superadmin") {
