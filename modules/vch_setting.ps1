@@ -40,36 +40,89 @@ function Get-ColumnConfig {
             return $Default
         }
 
+        # Account voucher forms use the same RecType=201 record identity
+        # (voucher type + device type) but interpret I1..I10 as account-form settings.
+        # Receipt (14) and Payment (19) support Quick/Double.
+        # Contra (15) and Journal (16) are Double-entry only.
+        $isAccountVoucher = @(14, 15, 16, 19) -contains $VchType
+        $supportsQuickMode = @(14, 19) -contains $VchType
+
         $config = $null
         if ($rst -and -not $rst.EOF) {
-            $config = @{
-                vch_type             = $VchType
-                device_type          = $DeviceType
-                enable_item_discount = ([int](Get-SafeVal $rst "I1" 1) -eq 1)
-                enable_alt_units     = ([int](Get-SafeVal $rst "I2" 1) -eq 1)
-                col_qty              = Map-IntToBehavior ([int](Get-SafeVal $rst "I3" 1))
-                col_unit             = Map-IntToBehavior ([int](Get-SafeVal $rst "I4" 1))
-                col_price            = Map-IntToBehavior ([int](Get-SafeVal $rst "I5" 1))
-                col_amount           = Map-IntToBehavior ([int](Get-SafeVal $rst "I6" 1))
-                col_discount         = Map-IntToBehavior ([int](Get-SafeVal $rst "I7" 1))
-                col_cfact            = Map-IntToBehavior ([int](Get-SafeVal $rst "I8" 1))
-                col_alt_qty          = Map-IntToBehavior ([int](Get-SafeVal $rst "I9" 1))
-                col_alt_price        = Map-IntToBehavior ([int](Get-SafeVal $rst "I10" 1))
-                enable_pos           = ([int](Get-SafeVal $rst "I11" 0) -eq 1)
-                def_card_acc         = [string](Get-SafeVal $rst "C1" "")
-                def_gift_acc         = [string](Get-SafeVal $rst "C2" "")
+            if ($isAccountVoucher) {
+                $storedMode = [int](Get-SafeVal $rst "I1" 1)
+                $defaultMode = if ($supportsQuickMode -and $storedMode -eq 1) { "single" } else { "double" }
+
+                $config = @{
+                    vch_type                         = $VchType
+                    device_type                      = $DeviceType
+                    account_default_mode             = $defaultMode
+                    account_allow_mode_switch        = if ($supportsQuickMode) { ([int](Get-SafeVal $rst "I2" 1) -eq 1) } else { $false }
+
+                    # Quick-entry field behavior
+                    acc_quick_col_account            = Map-IntToBehavior ([int](Get-SafeVal $rst "I3" 1))
+                    acc_quick_col_amount             = Map-IntToBehavior ([int](Get-SafeVal $rst "I4" 1))
+                    acc_quick_col_short_narration    = Map-IntToBehavior ([int](Get-SafeVal $rst "I5" 1))
+
+                    # Double-entry field behavior
+                    acc_double_col_dc                = Map-IntToBehavior ([int](Get-SafeVal $rst "I6" 1))
+                    acc_double_col_account           = Map-IntToBehavior ([int](Get-SafeVal $rst "I7" 1))
+                    acc_double_col_debit             = Map-IntToBehavior ([int](Get-SafeVal $rst "I8" 1))
+                    acc_double_col_credit            = Map-IntToBehavior ([int](Get-SafeVal $rst "I9" 1))
+                    acc_double_col_short_narration   = Map-IntToBehavior ([int](Get-SafeVal $rst "I10" 1))
+                }
+            } else {
+                $config = @{
+                    vch_type             = $VchType
+                    device_type          = $DeviceType
+                    enable_item_discount = ([int](Get-SafeVal $rst "I1" 1) -eq 1)
+                    enable_alt_units     = ([int](Get-SafeVal $rst "I2" 1) -eq 1)
+                    col_qty              = Map-IntToBehavior ([int](Get-SafeVal $rst "I3" 1))
+                    col_unit             = Map-IntToBehavior ([int](Get-SafeVal $rst "I4" 1))
+                    col_price            = Map-IntToBehavior ([int](Get-SafeVal $rst "I5" 1))
+                    col_amount           = Map-IntToBehavior ([int](Get-SafeVal $rst "I6" 1))
+                    col_discount         = Map-IntToBehavior ([int](Get-SafeVal $rst "I7" 1))
+                    col_cfact            = Map-IntToBehavior ([int](Get-SafeVal $rst "I8" 1))
+                    col_alt_qty          = Map-IntToBehavior ([int](Get-SafeVal $rst "I9" 1))
+                    col_alt_price        = Map-IntToBehavior ([int](Get-SafeVal $rst "I10" 1))
+                    enable_pos           = ([int](Get-SafeVal $rst "I11" 0) -eq 1)
+
+                    # C3 is free for RecType 201 inventory-voucher rows and stores whether
+                    # material-centre stock balances are shown in item search UIs.
+                    # Default to enabled so existing companies keep the current behavior.
+                    show_stock_balance    = ([string](Get-SafeVal $rst "C3" "1") -ne "0")
+                    def_card_acc          = [string](Get-SafeVal $rst "C1" "")
+                    def_gift_acc          = [string](Get-SafeVal $rst "C2" "")
+                }
             }
         }
 
         if ($rst) { try { $rst.Close() } catch {} }
 
         if ($null -eq $config) {
-            $config = @{
-                vch_type=$VchType; device_type=$DeviceType
-                enable_item_discount=$true; enable_alt_units=$true
-                col_qty="variable"; col_unit="variable"; col_price="variable"; col_amount="variable"
-                col_discount="variable"; col_cfact="variable"; col_alt_qty="variable"; col_alt_price="variable"
-                enable_pos=$false; def_card_acc=""; def_gift_acc=""
+            if ($isAccountVoucher) {
+                $config = @{
+                    vch_type                         = $VchType
+                    device_type                      = $DeviceType
+                    account_default_mode             = if ($supportsQuickMode) { "single" } else { "double" }
+                    account_allow_mode_switch        = if ($supportsQuickMode) { $true } else { $false }
+                    acc_quick_col_account            = "variable"
+                    acc_quick_col_amount             = "variable"
+                    acc_quick_col_short_narration    = "variable"
+                    acc_double_col_dc                = "variable"
+                    acc_double_col_account           = "variable"
+                    acc_double_col_debit             = "variable"
+                    acc_double_col_credit            = "variable"
+                    acc_double_col_short_narration   = "variable"
+                }
+            } else {
+                $config = @{
+                    vch_type=$VchType; device_type=$DeviceType
+                    enable_item_discount=$true; enable_alt_units=$true
+                    col_qty="variable"; col_unit="variable"; col_price="variable"; col_amount="variable"
+                    col_discount="variable"; col_cfact="variable"; col_alt_qty="variable"; col_alt_price="variable"
+                    enable_pos=$false; show_stock_balance=$true; def_card_acc=""; def_gift_acc=""
+                }
             }
         }
 
@@ -97,30 +150,71 @@ function Save-ColumnConfig {
             return 1
         }
 
-        $i1  = if ($Data.enable_item_discount -eq $true -or $Data.enable_item_discount -eq "true") { 1 } else { 0 }
-        $i2  = if ($Data.enable_alt_units -eq $true -or $Data.enable_alt_units -eq "true") { 1 } else { 0 }
-        $i3  = Map-BehaviorToInt $Data.col_qty
-        $i4  = Map-BehaviorToInt $Data.col_unit
-        $i5  = Map-BehaviorToInt $Data.col_price
-        $i6  = Map-BehaviorToInt $Data.col_amount
-        $i7  = Map-BehaviorToInt $Data.col_discount
-        $i8  = Map-BehaviorToInt $Data.col_cfact
-        $i9  = Map-BehaviorToInt $Data.col_alt_qty
-        $i10 = Map-BehaviorToInt $Data.col_alt_price
-        $i11 = if ($Data.enable_pos -eq $true -or $Data.enable_pos -eq "true") { 1 } else { 0 }
-        $c1 = if ($Data.def_card_acc) { ([string]$Data.def_card_acc).Replace("'", "''") } else { "" }
-        $c2 = if ($Data.def_gift_acc) { ([string]$Data.def_gift_acc).Replace("'", "''") } else { "" }
+        $isAccountVoucher = @(14, 15, 16, 19) -contains $vchType
+        $supportsQuickMode = @(14, 19) -contains $vchType
 
         $exists = $false
         $rst = $fi.GetRecordset("SELECT RecType FROM Config WHERE RecType=201 AND [Type]=$vchType AND D15=$deviceType")
         if ($rst -and -not $rst.EOF) { $exists = $true }
         if ($rst) { try { $rst.Close() } catch {} }
 
-        if ($exists) {
-            $sql = "UPDATE Config SET I1=$i1,I2=$i2,I3=$i3,I4=$i4,I5=$i5,I6=$i6,I7=$i7,I8=$i8,I9=$i9,I10=$i10,I11=$i11,C1='$c1',C2='$c2' WHERE RecType=201 AND [Type]=$vchType AND D15=$deviceType"
+        if ($isAccountVoucher) {
+            # Account voucher RecType=201 mapping:
+            # I1  = default entry mode: 1 Quick, 2 Double
+            # I2  = allow Quick/Double switching: 0/1
+            # I3  = Quick Account behavior
+            # I4  = Quick Amount behavior
+            # I5  = Quick Short Narration behavior
+            # I6  = Double D/C behavior
+            # I7  = Double Account behavior
+            # I8  = Double Debit behavior
+            # I9  = Double Credit behavior
+            # I10 = Double Short Narration behavior
+            $requestedMode = ([string]$Data.account_default_mode).ToLowerInvariant()
+            $i1 = if ($supportsQuickMode -and $requestedMode -eq "single") { 1 } else { 2 }
+            $i2 = if ($supportsQuickMode -and ($Data.account_allow_mode_switch -eq $true -or $Data.account_allow_mode_switch -eq "true")) { 1 } else { 0 }
+
+            $i3  = Map-BehaviorToInt $Data.acc_quick_col_account
+            $i4  = Map-BehaviorToInt $Data.acc_quick_col_amount
+            $i5  = Map-BehaviorToInt $Data.acc_quick_col_short_narration
+            $i6  = Map-BehaviorToInt $Data.acc_double_col_dc
+            $i7  = Map-BehaviorToInt $Data.acc_double_col_account
+            $i8  = Map-BehaviorToInt $Data.acc_double_col_debit
+            $i9  = Map-BehaviorToInt $Data.acc_double_col_credit
+            $i10 = Map-BehaviorToInt $Data.acc_double_col_short_narration
+
+            if ($exists) {
+                $sql = "UPDATE Config SET I1=$i1,I2=$i2,I3=$i3,I4=$i4,I5=$i5,I6=$i6,I7=$i7,I8=$i8,I9=$i9,I10=$i10 WHERE RecType=201 AND [Type]=$vchType AND D15=$deviceType"
+            } else {
+                $sql = "INSERT INTO Config (RecType,[Type],D15,I1,I2,I3,I4,I5,I6,I7,I8,I9,I10) VALUES (201,$vchType,$deviceType,$i1,$i2,$i3,$i4,$i5,$i6,$i7,$i8,$i9,$i10)"
+            }
         } else {
-            $sql = "INSERT INTO Config (RecType,[Type],D15,I1,I2,I3,I4,I5,I6,I7,I8,I9,I10,I11,C1,C2) VALUES (201,$vchType,$deviceType,$i1,$i2,$i3,$i4,$i5,$i6,$i7,$i8,$i9,$i10,$i11,'$c1','$c2')"
+            $i1  = if ($Data.enable_item_discount -eq $true -or $Data.enable_item_discount -eq "true") { 1 } else { 0 }
+            $i2  = if ($Data.enable_alt_units -eq $true -or $Data.enable_alt_units -eq "true") { 1 } else { 0 }
+            $i3  = Map-BehaviorToInt $Data.col_qty
+            $i4  = Map-BehaviorToInt $Data.col_unit
+            $i5  = Map-BehaviorToInt $Data.col_price
+            $i6  = Map-BehaviorToInt $Data.col_amount
+            $i7  = Map-BehaviorToInt $Data.col_discount
+            $i8  = Map-BehaviorToInt $Data.col_cfact
+            $i9  = Map-BehaviorToInt $Data.col_alt_qty
+            $i10 = Map-BehaviorToInt $Data.col_alt_price
+            $i11 = if ($Data.enable_pos -eq $true -or $Data.enable_pos -eq "true") { 1 } else { 0 }
+
+            # Keep stock visibility ON when older clients do not send this field.
+            # C3 is scoped to RecType 201 inventory-voucher rows, so it does not conflict
+            # with C3 used by RecType 202 numbering rows.
+            $c3 = if ($null -eq $Data.show_stock_balance) { "1" } elseif ($Data.show_stock_balance -eq $true -or $Data.show_stock_balance -eq "true") { "1" } else { "0" }
+            $c1 = if ($Data.def_card_acc) { ([string]$Data.def_card_acc).Replace("'", "''") } else { "" }
+            $c2 = if ($Data.def_gift_acc) { ([string]$Data.def_gift_acc).Replace("'", "''") } else { "" }
+
+            if ($exists) {
+                $sql = "UPDATE Config SET I1=$i1,I2=$i2,I3=$i3,I4=$i4,I5=$i5,I6=$i6,I7=$i7,I8=$i8,I9=$i9,I10=$i10,I11=$i11,C1='$c1',C2='$c2',C3='$c3' WHERE RecType=201 AND [Type]=$vchType AND D15=$deviceType"
+            } else {
+                $sql = "INSERT INTO Config (RecType,[Type],D15,I1,I2,I3,I4,I5,I6,I7,I8,I9,I10,I11,C1,C2,C3) VALUES (201,$vchType,$deviceType,$i1,$i2,$i3,$i4,$i5,$i6,$i7,$i8,$i9,$i10,$i11,'$c1','$c2','$c3')"
+            }
         }
+
         $fi.ExecuteQuery($sql)
         return @{ success = $true; message = "Voucher configuration updated successfully" }
     } catch {
