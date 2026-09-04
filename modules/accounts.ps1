@@ -528,6 +528,737 @@ function Get-CashBankAccounts {
 # ═══════════════════════════════════════════════════════
 #  GET PARTIES (Paginated, Searchable & Cash/Bank Capable)
 # ═══════════════════════════════════════════════════════
+# ===============================================================
+# PARTY ACCOUNT GROUP PERMISSIONS
+# ===============================================================
+# The permission tree is built from BUSY Master1:
+#   MasterType = 1 -> Account Group
+#   MasterType = 2 -> Account
+#   ParentGrp       -> parent Account Group Code
+#
+# Only the three exact BUSY roots below are eligible. Similar sibling groups
+# (for example "Sundry Debtors-Priyanwadh") are intentionally excluded.
+
+function Get-PartyGroupNormalizedName {
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        return ""
+    }
+
+    $value = $Name.Trim().ToLowerInvariant()
+    $value = $value -replace "[-_]+", " "
+    $value = $value -replace "\s+", " "
+    return $value.Trim()
+}
+
+function Get-PartyPermissionGroupRows {
+    param($fi)
+
+    $qry = @"
+SELECT
+    Code,
+    Name,
+    ParentGrp
+FROM Master1
+WHERE MasterType = 1
+ORDER BY Name
+"@
+
+    $rst = $fi.GetRecordset($qry)
+    $groups = @()
+
+    if ($rst -and -not $rst.EOF) {
+        try { $rst.MoveFirst() } catch {}
+
+        while (-not $rst.EOF) {
+            $codeValue = $rst.Fields.Item("Code").Value
+            $nameValue = $rst.Fields.Item("Name").Value
+            $parentValue = $rst.Fields.Item("ParentGrp").Value
+
+            $code = if ($codeValue -ne [System.DBNull]::Value) {
+                [int][string]$codeValue
+            } else { 0 }
+
+            $name = if ($nameValue -ne [System.DBNull]::Value) {
+                ([string]$nameValue).Trim()
+            } else { "" }
+
+            $parentGrp = if ($parentValue -ne [System.DBNull]::Value) {
+                [int][string]$parentValue
+            } else { 0 }
+
+            if ($code -gt 0) {
+                $groups += @{
+                    code      = $code
+                    name      = $name
+                    parentGrp = $parentGrp
+                }
+            }
+
+            $rst.MoveNext()
+        }
+
+        try { $rst.Close() } catch {}
+    }
+
+    return @($groups)
+}
+
+function Get-PartyPermissionTreeInfo {
+    param([array]$Groups)
+
+    $acceptedRootNames = @(
+        "sundry debtor",
+        "sundry debtors",
+        "sundry creditor",
+        "sundry creditors",
+        "cash in hand",
+        "cash in hands"
+    )
+
+    $groupByCode = @{}
+    $childrenByParent = @{}
+
+    foreach ($group in @($Groups)) {
+        $code = [int]$group.code
+        $parentCode = [int]$group.parentGrp
+        $groupByCode["$code"] = $group
+
+        if (-not $childrenByParent.ContainsKey("$parentCode")) {
+            $childrenByParent["$parentCode"] = @()
+        }
+        $childrenByParent["$parentCode"] += $group
+    }
+
+    $roots = @(
+        @($Groups) |
+        Where-Object {
+            $acceptedRootNames -contains (Get-PartyGroupNormalizedName ([string]$_.name))
+        }
+    )
+
+    $targetCodes = @{}
+    $rootForCode = @{}
+    $levelForCode = @{}
+    $pathForCode = @{}
+
+    $queue = New-Object System.Collections.Queue
+
+    foreach ($root in $roots) {
+        $queue.Enqueue(@{
+            group    = $root
+            rootCode = [int]$root.code
+            level    = 0
+            path     = @([string]$root.name)
+        })
+    }
+
+    while ($queue.Count -gt 0) {
+        $node = $queue.Dequeue()
+        $group = $node.group
+        $code = [int]$group.code
+        $key = "$code"
+
+        if ($targetCodes.ContainsKey($key)) {
+            continue
+        }
+
+        $targetCodes[$key] = $true
+        $rootForCode[$key] = [int]$node.rootCode
+        $levelForCode[$key] = [int]$node.level
+        $pathForCode[$key] = @($node.path)
+
+        if ($childrenByParent.ContainsKey($key)) {
+            foreach ($child in @($childrenByParent[$key])) {
+                $queue.Enqueue(@{
+                    group    = $child
+                    rootCode = [int]$node.rootCode
+                    level    = ([int]$node.level + 1)
+                    path     = @($node.path) + @([string]$child.name)
+                })
+            }
+        }
+    }
+
+    return @{
+        groups           = @($Groups)
+        roots            = @($roots)
+        groupByCode      = $groupByCode
+        childrenByParent = $childrenByParent
+        targetCodes      = $targetCodes
+        rootForCode      = $rootForCode
+        levelForCode     = $levelForCode
+        pathForCode      = $pathForCode
+    }
+}
+
+function Resolve-AllowedPartyGroupCodes {
+    param(
+        [array]$Groups,
+        [int[]]$SelectedGroupCodes = @()
+    )
+
+    if ($null -eq $SelectedGroupCodes -or @($SelectedGroupCodes).Count -eq 0) {
+        return @()
+    }
+
+    $tree = Get-PartyPermissionTreeInfo -Groups $Groups
+    $granted = @{}
+    $queue = New-Object System.Collections.Queue
+
+    foreach ($rawCode in @($SelectedGroupCodes)) {
+        $code = [int]$rawCode
+        $key = "$code"
+
+        # Ignore invalid groups and any group outside the exact three target
+        # root trees. This keeps the server authoritative even if M2 is edited.
+        if ($code -gt 0 -and $tree.targetCodes.ContainsKey($key)) {
+            $queue.Enqueue($code)
+        }
+    }
+
+    while ($queue.Count -gt 0) {
+        $code = [int]$queue.Dequeue()
+        $key = "$code"
+
+        if ($granted.ContainsKey($key)) {
+            continue
+        }
+
+        $granted[$key] = $true
+
+        if ($tree.childrenByParent.ContainsKey($key)) {
+            foreach ($child in @($tree.childrenByParent[$key])) {
+                $queue.Enqueue([int]$child.code)
+            }
+        }
+    }
+
+    return @(
+        $granted.Keys |
+        ForEach-Object { [int]$_ } |
+        Sort-Object
+    )
+}
+
+function Get-PartyAccountGroups {
+    param(
+        [string]$InstanceId  = "",
+        [string]$CompanyCode = ""
+    )
+
+    $fi = Connect-BUSY `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $fi) {
+        return @{ success = $false; error = "BUSY connection failed" }
+    }
+
+    try {
+        $groups = Get-PartyPermissionGroupRows -fi $fi
+        $tree = Get-PartyPermissionTreeInfo -Groups $groups
+        $output = @()
+
+        foreach ($group in @($groups)) {
+            $code = [int]$group.code
+            $key = "$code"
+
+            if (-not $tree.targetCodes.ContainsKey($key)) {
+                continue
+            }
+
+            $rootCode = [int]$tree.rootForCode[$key]
+            $root = $tree.groupByCode["$rootCode"]
+            $pathNames = @($tree.pathForCode[$key])
+
+            $output += @{
+                rootCode   = $rootCode
+                rootName   = [string]$root.name
+                code       = $code
+                name       = [string]$group.name
+                parentCode = [int]$group.parentGrp
+                level      = [int]$tree.levelForCode[$key]
+                pathText   = ($pathNames -join " > ")
+            }
+        }
+
+        $output = @(
+            $output |
+            Sort-Object rootName, pathText
+        )
+
+        return @{
+            success = $true
+            count   = $output.Count
+            data    = @($output)
+        }
+    }
+    catch {
+        return @{ success = $false; error = $_.Exception.Message }
+    }
+    finally {
+        Disconnect-BUSY $fi
+    }
+}
+
+function Test-PartyAccountsAllowed {
+    param(
+        [string[]]$AccountNames = @(),
+        [int[]]$AllowedGroupCodes = @(),
+        [bool]$AllowAllEligibleRoots = $false,
+        [string]$InstanceId  = "",
+        [string]$CompanyCode = ""
+    )
+
+    $requestedNames = @(
+        @($AccountNames) |
+        ForEach-Object { ([string]$_).Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -Unique
+    )
+
+    if ($requestedNames.Count -eq 0) {
+        return @{ success = $true; allowed = $true; deniedAccounts = @() }
+    }
+
+    if (
+        -not $AllowAllEligibleRoots -and
+        ($null -eq $AllowedGroupCodes -or @($AllowedGroupCodes).Count -eq 0)
+    ) {
+        return @{
+            success        = $true
+            allowed        = $false
+            deniedAccounts = @($requestedNames)
+        }
+    }
+
+    $fi = Connect-BUSY `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $fi) {
+        return @{ success = $false; allowed = $false; error = "BUSY connection failed"; deniedAccounts = $requestedNames }
+    }
+
+    try {
+        $groups = Get-PartyPermissionGroupRows -fi $fi
+        $selectedCodes = @($AllowedGroupCodes)
+
+        if ($AllowAllEligibleRoots) {
+            $tree = Get-PartyPermissionTreeInfo -Groups $groups
+            $selectedCodes = @($tree.roots | ForEach-Object { [int]$_.code })
+        }
+
+        $expandedCodes = @(
+            Resolve-AllowedPartyGroupCodes `
+                -Groups $groups `
+                -SelectedGroupCodes $selectedCodes
+        )
+
+        # Normal target-voucher users fail closed when no valid group branch
+        # has been assigned.
+        if ($expandedCodes.Count -eq 0) {
+            return @{
+                success        = $true
+                allowed        = $false
+                deniedAccounts = @($requestedNames)
+            }
+        }
+
+        $allowedSet = @{}
+        foreach ($code in $expandedCodes) {
+            $allowedSet["$([int]$code)"] = $true
+        }
+
+        $safeNames = @(
+            $requestedNames |
+            ForEach-Object { "'$(($_ -replace "'", "''"))'" }
+        )
+
+        $qry = @"
+SELECT
+    Name,
+    ParentGrp
+FROM Master1
+WHERE MasterType = 2
+  AND Name IN ($($safeNames -join ','))
+"@
+
+        $rst = $fi.GetRecordset($qry)
+        $allowedNames = @{}
+
+        if ($rst -and -not $rst.EOF) {
+            try { $rst.MoveFirst() } catch {}
+
+            while (-not $rst.EOF) {
+                $nameValue = $rst.Fields.Item("Name").Value
+                $parentValue = $rst.Fields.Item("ParentGrp").Value
+
+                $name = if ($nameValue -ne [System.DBNull]::Value) {
+                    ([string]$nameValue).Trim()
+                } else { "" }
+
+                $parentCode = if ($parentValue -ne [System.DBNull]::Value) {
+                    [int][string]$parentValue
+                } else { 0 }
+
+                if (
+                    -not [string]::IsNullOrWhiteSpace($name) -and
+                    $allowedSet.ContainsKey("$parentCode")
+                ) {
+                    $allowedNames[$name.ToLowerInvariant()] = $true
+                }
+
+                $rst.MoveNext()
+            }
+
+            try { $rst.Close() } catch {}
+        }
+
+        $denied = @()
+        foreach ($name in $requestedNames) {
+            if (-not $allowedNames.ContainsKey($name.ToLowerInvariant())) {
+                $denied += $name
+            }
+        }
+
+        return @{
+            success        = $true
+            allowed        = ($denied.Count -eq 0)
+            deniedAccounts = @($denied)
+        }
+    }
+    catch {
+        return @{
+            success        = $false
+            allowed        = $false
+            error          = $_.Exception.Message
+            deniedAccounts = @($requestedNames)
+        }
+    }
+    finally {
+        Disconnect-BUSY $fi
+    }
+}
+
+
+# ===============================================================
+# JOURNAL / CONTRA FULL ACCOUNT ACCESS PERMISSIONS
+# ===============================================================
+# These permissions are intentionally different from Party Account Access.
+# Journal and Contra may use ANY BUSY Account Group / Account, and Debit and
+# Credit selections are stored independently in MobileUserPreference.M2.
+
+function Resolve-AllowedAccountGroupCodes {
+    param(
+        [array]$Groups,
+        [int[]]$SelectedGroupCodes = @()
+    )
+
+    if ($null -eq $SelectedGroupCodes -or @($SelectedGroupCodes).Count -eq 0) {
+        return @()
+    }
+
+    $groupByCode = @{}
+    $childrenByParent = @{}
+
+    foreach ($group in @($Groups)) {
+        $code = [int]$group.code
+        $parentCode = [int]$group.parentGrp
+        $groupByCode["$code"] = $group
+
+        if (-not $childrenByParent.ContainsKey("$parentCode")) {
+            $childrenByParent["$parentCode"] = @()
+        }
+        $childrenByParent["$parentCode"] += $group
+    }
+
+    $granted = @{}
+    $queue = New-Object System.Collections.Queue
+
+    foreach ($rawCode in @($SelectedGroupCodes)) {
+        $code = 0
+        if ([int]::TryParse([string]$rawCode, [ref]$code) -and $code -gt 0) {
+            if ($groupByCode.ContainsKey("$code")) {
+                $queue.Enqueue($code)
+            }
+        }
+    }
+
+    while ($queue.Count -gt 0) {
+        $code = [int]$queue.Dequeue()
+        $key = "$code"
+
+        if ($granted.ContainsKey($key)) {
+            continue
+        }
+
+        $granted[$key] = $true
+
+        if ($childrenByParent.ContainsKey($key)) {
+            foreach ($child in @($childrenByParent[$key])) {
+                $queue.Enqueue([int]$child.code)
+            }
+        }
+    }
+
+    return @(
+        $granted.Keys |
+        ForEach-Object { [int]$_ } |
+        Sort-Object
+    )
+}
+
+function Get-AllAccountPermissionNodes {
+    param(
+        [string]$InstanceId  = "",
+        [string]$CompanyCode = ""
+    )
+
+    $fi = Connect-BUSY `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $fi) {
+        return @{ success = $false; error = "BUSY connection failed" }
+    }
+
+    try {
+        $groups = Get-PartyPermissionGroupRows -fi $fi
+        $groupByCode = @{}
+
+        foreach ($group in @($groups)) {
+            $groupByCode["$([int]$group.code)"] = $group
+        }
+
+        $resolveGroupPath = {
+            param([int]$StartCode)
+
+            $path = @()
+            $visited = @{}
+            $currentCode = $StartCode
+
+            for ($guard = 0; $guard -lt 100; $guard++) {
+                if ($currentCode -le 0 -or -not $groupByCode.ContainsKey("$currentCode")) {
+                    break
+                }
+                if ($visited.ContainsKey("$currentCode")) {
+                    break
+                }
+
+                $visited["$currentCode"] = $true
+                $group = $groupByCode["$currentCode"]
+                $path += $group
+                $currentCode = [int]$group.parentGrp
+            }
+
+            $ordered = @()
+            for ($i = $path.Count - 1; $i -ge 0; $i--) {
+                $ordered += $path[$i]
+            }
+            return @($ordered)
+        }
+
+        $nodes = @()
+
+        foreach ($group in @($groups)) {
+            $path = @(& $resolveGroupPath ([int]$group.code))
+            $root = if ($path.Count -gt 0) { $path[0] } else { $group }
+            $pathNames = @($path | ForEach-Object { [string]$_.name })
+
+            $nodes += @{
+                rootCode   = [int]$root.code
+                rootName   = [string]$root.name
+                nodeType   = "GROUP"
+                code       = [int]$group.code
+                name       = [string]$group.name
+                alias      = ""
+                parentCode = [int]$group.parentGrp
+                level      = [Math]::Max(0, $path.Count - 1)
+                pathText   = ($pathNames -join " > ")
+            }
+        }
+
+        $qry = @"
+SELECT
+    Code,
+    Name,
+    Alias,
+    ParentGrp
+FROM Master1
+WHERE MasterType = 2
+ORDER BY Name
+"@
+
+        $rst = $fi.GetRecordset($qry)
+
+        if ($rst -and -not $rst.EOF) {
+            try { $rst.MoveFirst() } catch {}
+
+            while (-not $rst.EOF) {
+                $codeValue = $rst.Fields.Item("Code").Value
+                $nameValue = $rst.Fields.Item("Name").Value
+                $aliasValue = $rst.Fields.Item("Alias").Value
+                $parentValue = $rst.Fields.Item("ParentGrp").Value
+
+                $code = if ($codeValue -ne [System.DBNull]::Value) { [int][string]$codeValue } else { 0 }
+                $name = if ($nameValue -ne [System.DBNull]::Value) { ([string]$nameValue).Trim() } else { "" }
+                $alias = if ($aliasValue -ne [System.DBNull]::Value) { ([string]$aliasValue).Trim() } else { "" }
+                $parentCode = if ($parentValue -ne [System.DBNull]::Value) { [int][string]$parentValue } else { 0 }
+
+                if ($code -gt 0) {
+                    $groupPath = @(& $resolveGroupPath $parentCode)
+                    $root = if ($groupPath.Count -gt 0) { $groupPath[0] } else { $null }
+                    $pathNames = @($groupPath | ForEach-Object { [string]$_.name }) + @($name)
+
+                    $nodes += @{
+                        rootCode   = if ($null -ne $root) { [int]$root.code } else { $parentCode }
+                        rootName   = if ($null -ne $root) { [string]$root.name } else { "" }
+                        nodeType   = "ACCOUNT"
+                        code       = $code
+                        name       = $name
+                        alias      = $alias
+                        parentCode = $parentCode
+                        level      = $groupPath.Count
+                        pathText   = ($pathNames -join " > ")
+                    }
+                }
+
+                $rst.MoveNext()
+            }
+
+            try { $rst.Close() } catch {}
+        }
+
+        $nodes = @($nodes | Sort-Object pathText, nodeType, name)
+
+        return @{
+            success = $true
+            count   = $nodes.Count
+            data    = @($nodes)
+        }
+    }
+    catch {
+        return @{ success = $false; error = $_.Exception.Message }
+    }
+    finally {
+        Disconnect-BUSY $fi
+    }
+}
+
+function Test-AccountsAllowedByCodes {
+    param(
+        [string[]]$AccountNames = @(),
+        [int[]]$AllowedGroupCodes = @(),
+        [int[]]$AllowedAccountCodes = @(),
+        [bool]$AllowAllAccounts = $false,
+        [string]$InstanceId  = "",
+        [string]$CompanyCode = ""
+    )
+
+    $requestedNames = @(
+        @($AccountNames) |
+        ForEach-Object { ([string]$_).Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -Unique
+    )
+
+    if ($requestedNames.Count -eq 0 -or $AllowAllAccounts) {
+        return @{ success = $true; allowed = $true; deniedAccounts = @() }
+    }
+
+    if (
+        ($null -eq $AllowedGroupCodes -or @($AllowedGroupCodes).Count -eq 0) -and
+        ($null -eq $AllowedAccountCodes -or @($AllowedAccountCodes).Count -eq 0)
+    ) {
+        return @{ success = $true; allowed = $false; deniedAccounts = @($requestedNames) }
+    }
+
+    $fi = Connect-BUSY `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $fi) {
+        return @{ success = $false; allowed = $false; error = "BUSY connection failed"; deniedAccounts = @($requestedNames) }
+    }
+
+    try {
+        $groups = Get-PartyPermissionGroupRows -fi $fi
+        $expandedGroups = @(Resolve-AllowedAccountGroupCodes -Groups $groups -SelectedGroupCodes @($AllowedGroupCodes))
+
+        $allowedGroupSet = @{}
+        foreach ($code in $expandedGroups) { $allowedGroupSet["$([int]$code)"] = $true }
+
+        $allowedAccountSet = @{}
+        foreach ($rawCode in @($AllowedAccountCodes)) {
+            $code = 0
+            if ([int]::TryParse([string]$rawCode, [ref]$code) -and $code -gt 0) {
+                $allowedAccountSet["$code"] = $true
+            }
+        }
+
+        $safeNames = @($requestedNames | ForEach-Object { "'$(($_ -replace "'", "''"))'" })
+        $qry = @"
+SELECT
+    Code,
+    Name,
+    ParentGrp
+FROM Master1
+WHERE MasterType = 2
+  AND Name IN ($($safeNames -join ','))
+"@
+
+        $rst = $fi.GetRecordset($qry)
+        $allowedNames = @{}
+
+        if ($rst -and -not $rst.EOF) {
+            try { $rst.MoveFirst() } catch {}
+
+            while (-not $rst.EOF) {
+                $codeValue = $rst.Fields.Item("Code").Value
+                $nameValue = $rst.Fields.Item("Name").Value
+                $parentValue = $rst.Fields.Item("ParentGrp").Value
+
+                $code = if ($codeValue -ne [System.DBNull]::Value) { [int][string]$codeValue } else { 0 }
+                $name = if ($nameValue -ne [System.DBNull]::Value) { ([string]$nameValue).Trim() } else { "" }
+                $parentCode = if ($parentValue -ne [System.DBNull]::Value) { [int][string]$parentValue } else { 0 }
+
+                if (
+                    -not [string]::IsNullOrWhiteSpace($name) -and
+                    ($allowedAccountSet.ContainsKey("$code") -or $allowedGroupSet.ContainsKey("$parentCode"))
+                ) {
+                    $allowedNames[$name.ToLowerInvariant()] = $true
+                }
+
+                $rst.MoveNext()
+            }
+
+            try { $rst.Close() } catch {}
+        }
+
+        $denied = @()
+        foreach ($name in $requestedNames) {
+            if (-not $allowedNames.ContainsKey($name.ToLowerInvariant())) {
+                $denied += $name
+            }
+        }
+
+        return @{
+            success        = $true
+            allowed        = ($denied.Count -eq 0)
+            deniedAccounts = @($denied)
+        }
+    }
+    catch {
+        return @{ success = $false; allowed = $false; error = $_.Exception.Message; deniedAccounts = @($requestedNames) }
+    }
+    finally {
+        Disconnect-BUSY $fi
+    }
+}
+
 function Get-Parties {
     param(
         [string]$Search      = "",
@@ -535,7 +1266,13 @@ function Get-Parties {
         [int]$Page           = 1,
         [int]$PageSize       = 30,
         [string]$InstanceId  = "",
-        [string]$CompanyCode = ""
+        [string]$CompanyCode = "",
+        [int[]]$AllowedGroupCodes = @(),
+        [bool]$EnforceGroupAccess = $false,
+        [bool]$AllowAllEligibleRoots = $false,
+        [int[]]$AllowedAccountCodes = @(),
+        [bool]$EnforceAllAccountAccess = $false,
+        [bool]$AllowAllAccounts = $false
     )
 
     if ($Page -lt 1) {
@@ -544,6 +1281,37 @@ function Get-Parties {
 
     if ($PageSize -lt 1) {
         $PageSize = 30
+    }
+
+    if (
+        $EnforceAllAccountAccess -and
+        -not $AllowAllAccounts -and
+        ($null -eq $AllowedGroupCodes -or @($AllowedGroupCodes).Count -eq 0) -and
+        ($null -eq $AllowedAccountCodes -or @($AllowedAccountCodes).Count -eq 0)
+    ) {
+        return @{
+            success    = $true
+            total      = 0
+            page       = $Page
+            pageSize   = $PageSize
+            totalPages = 1
+            data       = @()
+        }
+    }
+
+    if (
+        $EnforceGroupAccess -and
+        -not $AllowAllEligibleRoots -and
+        ($null -eq $AllowedGroupCodes -or @($AllowedGroupCodes).Count -eq 0)
+    ) {
+        return @{
+            success    = $true
+            total      = 0
+            page       = $Page
+            pageSize   = $PageSize
+            totalPages = 1
+            data       = @()
+        }
     }
 
     $fi = Connect-BUSY `
@@ -580,6 +1348,71 @@ function Get-Parties {
 
         $where = "M.MasterType = 2"
 
+        if ($EnforceAllAccountAccess) {
+            if (-not $AllowAllAccounts) {
+                $groupRows = Get-PartyPermissionGroupRows -fi $fi
+                $expandedAllowedGroups = @(
+                    Resolve-AllowedAccountGroupCodes `
+                        -Groups $groupRows `
+                        -SelectedGroupCodes @($AllowedGroupCodes)
+                )
+
+                $validAccountCodes = @(
+                    @($AllowedAccountCodes) |
+                    ForEach-Object {
+                        $parsed = 0
+                        if ([int]::TryParse([string]$_, [ref]$parsed) -and $parsed -gt 0) { $parsed }
+                    } |
+                    Select-Object -Unique
+                )
+
+                $accessConditions = @()
+                if ($expandedAllowedGroups.Count -gt 0) {
+                    $allowedGroupSql = ($expandedAllowedGroups | ForEach-Object { [string][int]$_ }) -join ","
+                    $accessConditions += "M.ParentGrp IN ($allowedGroupSql)"
+                }
+                if ($validAccountCodes.Count -gt 0) {
+                    $allowedAccountSql = ($validAccountCodes | ForEach-Object { [string][int]$_ }) -join ","
+                    $accessConditions += "M.Code IN ($allowedAccountSql)"
+                }
+
+                if ($accessConditions.Count -eq 0) {
+                    return @{ success=$true; total=0; page=$Page; pageSize=$PageSize; totalPages=1; data=@() }
+                }
+
+                $where += " AND (" + ($accessConditions -join " OR ") + ")"
+            }
+        }
+        elseif ($EnforceGroupAccess) {
+            $groupRows = Get-PartyPermissionGroupRows -fi $fi
+            $selectedCodes = @($AllowedGroupCodes)
+
+            if ($AllowAllEligibleRoots) {
+                $tree = Get-PartyPermissionTreeInfo -Groups $groupRows
+                $selectedCodes = @($tree.roots | ForEach-Object { [int]$_.code })
+            }
+
+            $expandedAllowedGroups = @(
+                Resolve-AllowedPartyGroupCodes `
+                    -Groups $groupRows `
+                    -SelectedGroupCodes $selectedCodes
+            )
+
+            if ($expandedAllowedGroups.Count -eq 0) {
+                return @{
+                    success    = $true
+                    total      = 0
+                    page       = $Page
+                    pageSize   = $PageSize
+                    totalPages = 1
+                    data       = @()
+                }
+            }
+
+            $allowedGroupSql = ($expandedAllowedGroups | ForEach-Object { [string][int]$_ }) -join ","
+            $where += " AND M.ParentGrp IN ($allowedGroupSql)"
+        }
+
         if ($CashBankOnly) {
             $where += @"
  AND M.ParentGrp IN (
@@ -609,6 +1442,8 @@ function Get-Parties {
         $countQry = @"
 SELECT COUNT(*) AS TotalCount
 FROM Master1 AS M
+LEFT JOIN MasterAddressInfo AS A
+ON A.MasterCode = M.Code
 WHERE $where
 "@
 
@@ -642,6 +1477,7 @@ SELECT
     M.Code,
     M.Name,
     M.Alias,
+    M.ParentGrp AS ParentGroupCode,
 
     (
         SELECT G.Name
@@ -712,6 +1548,11 @@ ORDER BY
                 $groupValue =
                     $rst.Fields.Item(
                         "ParentGrpName"
+                    ).Value
+
+                $parentGroupCodeValue =
+                    $rst.Fields.Item(
+                        "ParentGroupCode"
                     ).Value
 
                 $address1Value =
@@ -792,6 +1633,16 @@ ORDER BY
                 }
                 else {
                     ""
+                }
+
+                $parentGroupCode = if (
+                    $parentGroupCodeValue -ne
+                    [System.DBNull]::Value
+                ) {
+                    [int][string]$parentGroupCodeValue
+                }
+                else {
+                    0
                 }
 
                 $addressLines = @()
@@ -903,9 +1754,10 @@ ORDER BY
                 $parties += @{
                     code     = $code
                     name     = $name
-                    alias    = $alias
-                    group    = $parentGrp
-                    type     = $partyType
+                    alias           = $alias
+                    group           = $parentGrp
+                    parentGroupCode = $parentGroupCode
+                    type            = $partyType
 
                     address  = $address
                     address1 = if ($address1Value -ne [System.DBNull]::Value) {
