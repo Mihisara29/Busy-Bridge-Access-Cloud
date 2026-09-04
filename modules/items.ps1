@@ -19,6 +19,15 @@ function Clear-ItemCaches {
         $keysToRemove = @(); foreach ($k in $script:_cache.Keys) { if ($k -like "${prefix}items|*" -or $k -like "${prefix}item|*") { $keysToRemove += $k } }
         foreach ($k in $keysToRemove) { $script:_cache.Remove($k) }
     }
+
+    # Item-group permissions use a lightweight hierarchy cache so voucher
+    # searches do not have to reload the Item Group tree on every keystroke.
+    if ($null -ne $script:VoucherItemGroupHierarchyCache) {
+        $cacheKey = "$InstanceId|$CompanyCode".ToLowerInvariant()
+        if ($script:VoucherItemGroupHierarchyCache.ContainsKey($cacheKey)) {
+            $script:VoucherItemGroupHierarchyCache.Remove($cacheKey)
+        }
+    }
 }
 
 function Get-Items {
@@ -327,6 +336,157 @@ function Get-Items {
     }
 }
 
+
+# ═══════════════════════════════════════════════════════
+# VOUCHER ITEM GROUP PERMISSION HIERARCHY
+#
+# BUSY item groups are MasterType=5 and items are MasterType=6.
+# This cache contains ONLY the small Item Group tree (not all items).
+# It lets a selected parent group grant every descendant branch without
+# loading thousands of Item rows into PowerShell for each search.
+# ═══════════════════════════════════════════════════════
+if ($null -eq $script:VoucherItemGroupHierarchyCache) {
+    $script:VoucherItemGroupHierarchyCache = @{}
+}
+
+function Get-VoucherItemGroupHierarchy {
+    param(
+        $Fi,
+        [string]$InstanceId  = "",
+        [string]$CompanyCode = ""
+    )
+
+    $cacheKey = "$InstanceId|$CompanyCode".ToLowerInvariant()
+    $now = [DateTime]::UtcNow
+
+    if ($script:VoucherItemGroupHierarchyCache.ContainsKey($cacheKey)) {
+        $cached = $script:VoucherItemGroupHierarchyCache[$cacheKey]
+
+        if (
+            $null -ne $cached -and
+            $null -ne $cached.expiresAt -and
+            $cached.expiresAt -gt $now
+        ) {
+            return $cached
+        }
+
+        $script:VoucherItemGroupHierarchyCache.Remove($cacheKey)
+    }
+
+    $validCodes = @{}
+    $childrenByParent = @{}
+
+    $rst = $Fi.GetRecordset(@"
+SELECT
+    Code,
+    ParentGrp
+FROM Master1
+WHERE MasterType = 5
+"@)
+
+    if ($rst -and -not $rst.EOF) {
+        try { $rst.MoveFirst() } catch {}
+
+        while (-not $rst.EOF) {
+            $code = 0
+            $parentCode = 0
+
+            try {
+                $rawCode = $rst.Fields.Item("Code").Value
+                if ($null -ne $rawCode -and $rawCode -ne [System.DBNull]::Value) {
+                    $code = [int][string]$rawCode
+                }
+            }
+            catch {}
+
+            try {
+                $rawParent = $rst.Fields.Item("ParentGrp").Value
+                if ($null -ne $rawParent -and $rawParent -ne [System.DBNull]::Value) {
+                    $parentCode = [int][string]$rawParent
+                }
+            }
+            catch {}
+
+            if ($code -gt 0) {
+                $validCodes[$code] = $true
+
+                if (-not $childrenByParent.ContainsKey($parentCode)) {
+                    $childrenByParent[$parentCode] = [System.Collections.Generic.List[int]]::new()
+                }
+
+                $childrenByParent[$parentCode].Add($code)
+            }
+
+            $rst.MoveNext()
+        }
+
+        try { $rst.Close() } catch {}
+    }
+
+    $entry = @{
+        validCodes       = $validCodes
+        childrenByParent = $childrenByParent
+        expiresAt        = $now.AddMinutes(5)
+    }
+
+    $script:VoucherItemGroupHierarchyCache[$cacheKey] = $entry
+    return $entry
+}
+
+function Resolve-VoucherAllowedItemGroupCodes {
+    param(
+        $Fi,
+        [int[]]$AllowedGroupCodes,
+        [string]$InstanceId  = "",
+        [string]$CompanyCode = ""
+    )
+
+    $hierarchy = Get-VoucherItemGroupHierarchy `
+        -Fi $Fi `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    $resolved = @{}
+    $queue = [System.Collections.Generic.Queue[int]]::new()
+
+    foreach ($rawCode in @($AllowedGroupCodes)) {
+        $code = 0
+
+        if (
+            [int]::TryParse([string]$rawCode, [ref]$code) -and
+            $code -gt 0 -and
+            $hierarchy.validCodes.ContainsKey($code) -and
+            -not $resolved.ContainsKey($code)
+        ) {
+            $resolved[$code] = $true
+            $queue.Enqueue($code)
+        }
+    }
+
+    while ($queue.Count -gt 0) {
+        $parentCode = $queue.Dequeue()
+
+        if (-not $hierarchy.childrenByParent.ContainsKey($parentCode)) {
+            continue
+        }
+
+        foreach ($childCode in $hierarchy.childrenByParent[$parentCode]) {
+            $child = [int]$childCode
+
+            if (-not $resolved.ContainsKey($child)) {
+                $resolved[$child] = $true
+                $queue.Enqueue($child)
+            }
+        }
+    }
+
+    return @(
+        $resolved.Keys |
+        ForEach-Object { [int]$_ } |
+        Sort-Object
+    )
+}
+
 # ═══════════════════════════════════════════════════════
 # VOUCHER ITEM SEARCH
 # Returns only the information required by the dropdown:
@@ -336,10 +496,23 @@ function Get-ItemsForVoucher {
     param(
         [string]$Search      = "",
         [string]$InstanceId  = "",
-        [string]$CompanyCode = ""
+        [string]$CompanyCode = "",
+        [int[]]$AllowedGroupCodes = @(),
+        [bool]$EnforceGroupAccess = $false,
+        [int]$MaxResults = 0
     )
 
-    $limit = if ([string]::IsNullOrWhiteSpace($Search)) { 30 } else { 20 }
+    # Preserve the old admin behavior by default (30 blank / 20 while typing).
+    # Permission-controlled voucher searches explicitly pass MaxResults=30.
+    $limit = if ($MaxResults -gt 0) {
+        [Math]::Max(1, [Math]::Min(30, $MaxResults))
+    }
+    elseif ([string]::IsNullOrWhiteSpace($Search)) {
+        30
+    }
+    else {
+        20
+    }
 
     $fi = Connect-BUSY `
         -InstanceId $InstanceId `
@@ -371,6 +544,34 @@ function Get-ItemsForVoucher {
         $wildcard = if ($dbType -eq 1) { "%" } else { "*" }
 
         $where = "Master1.MasterType = 6"
+
+        if ($EnforceGroupAccess) {
+            # Permission filtering is part of the SAME item query used by the
+            # existing fast dropdown. We expand only the small Item Group tree,
+            # then query Master1 for matching items inside those groups.
+            $resolvedGroupCodes = @(
+                Resolve-VoucherAllowedItemGroupCodes `
+                    -Fi $fi `
+                    -AllowedGroupCodes @($AllowedGroupCodes) `
+                    -InstanceId $InstanceId `
+                    -CompanyCode $CompanyCode
+            )
+
+            if ($resolvedGroupCodes.Count -eq 0) {
+                return @{
+                    success = $true
+                    total   = 0
+                    data    = @()
+                }
+            }
+
+            $groupInList = (
+                $resolvedGroupCodes |
+                ForEach-Object { [string][int]$_ }
+            ) -join ","
+
+            $where += " AND Master1.ParentGrp IN ($groupInList)"
+        }
 
         if (-not [string]::IsNullOrWhiteSpace($Search)) {
             $safeSearch = $Search.Trim() -replace "'", "''"
