@@ -27,7 +27,8 @@
       "sqlUser": "SA",
       "sqlPassword": "23122",
       "companies": [
-        { "code": "Comp0001", "name": "Company One (SQL)", "sqlDatabase": "BusyComp0001_db" }
+        { "code": "Comp0001", "name": "Company One (SQL)", "sqlDatabase": "BusyComp0001_db" },
+        { "code": "Comp0002", "name": "Anuradha Agency", "sqlDatabase": "BusyComp0002_db" }
       ]
     }
   ]

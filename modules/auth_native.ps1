@@ -280,6 +280,67 @@ function Get-UserPermissions {
     }
 }
 
+# Keep already-issued in-memory auth tokens synchronized when an administrator
+# updates MobileUserPreference. Without this, server-side Party Account Access
+# would keep using the user's old M2 value until that user logged in again.
+function Sync-CachedUserPermissions {
+    param(
+        $Data,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if ($null -eq $Data -or [string]::IsNullOrWhiteSpace([string]$Data.name)) {
+        return
+    }
+
+    $targetName = ([string]$Data.name).Trim().ToLowerInvariant()
+    $targetInstance = ([string]$InstanceId).Trim().ToLowerInvariant()
+    $targetCompany = ([string]$CompanyCode).Trim().ToLowerInvariant()
+
+    $permissionCopy = @{}
+
+    if ($Data -is [System.Collections.IDictionary]) {
+        foreach ($key in $Data.Keys) {
+            $permissionCopy[[string]$key] = $Data[$key]
+        }
+    }
+    else {
+        foreach ($prop in $Data.PSObject.Properties) {
+            $permissionCopy[[string]$prop.Name] = $prop.Value
+        }
+    }
+
+    foreach ($token in @($script:_authCache.Keys)) {
+        $entry = $script:_authCache[$token]
+        if ($null -eq $entry -or $null -eq $entry.user) {
+            continue
+        }
+
+        $cachedUser = $entry.user
+        $cachedRole = ([string]$cachedUser.role).Trim().ToLowerInvariant()
+
+        # Superadmins intentionally retain their unrestricted permission set.
+        if ($cachedRole -eq "superadmin" -or $cachedRole -eq "companyadmin") {
+            continue
+        }
+
+        $cachedName = ([string]$cachedUser.name).Trim().ToLowerInvariant()
+        $cachedInstance = ([string]$cachedUser.instanceId).Trim().ToLowerInvariant()
+        $cachedCompany = ([string]$cachedUser.companyCode).Trim().ToLowerInvariant()
+
+        if (
+            $cachedName -eq $targetName -and
+            ($targetInstance -eq "" -or $cachedInstance -eq $targetInstance) -and
+            ($targetCompany -eq "" -or $cachedCompany -eq $targetCompany)
+        ) {
+            $cachedUser.permissions = @{} + $permissionCopy
+            $entry.user = $cachedUser
+            $script:_authCache[$token] = $entry
+        }
+    }
+}
+
 # UPDATED: Includes quotation permissions I19-I22, master permissions B21-B32,
 # and Production permissions B33/B34 in both Access and SQL Server write paths.
 # B33/B34 are existing BUSY columns and are never created/altered here.
@@ -351,6 +412,7 @@ function Save-UserPermissions {
             $writeCmd.Parameters.AddWithValue("@M2", $m2Val) | Out-Null
             $writeCmd.ExecuteNonQuery() | Out-Null
             
+            Sync-CachedUserPermissions -Data $Data -InstanceId $inst.id -CompanyCode $CompanyCode
             Write-Host "   [SUCCESS] SQL permissions saved successfully for user '$userName'" -ForegroundColor Green
             return @{ success = $true; message = "User permissions updated successfully" }
         } catch {
@@ -425,6 +487,7 @@ function Save-UserPermissions {
             }
             $cmd.ExecuteNonQuery() | Out-Null
             
+            Sync-CachedUserPermissions -Data $Data -InstanceId $inst.id -CompanyCode $CompanyCode
             Write-Host "   [SUCCESS] Access permissions saved successfully for user '$userName'" -ForegroundColor Green
             return @{ success = $true; message = "User permissions updated successfully" }
         } catch {

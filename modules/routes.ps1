@@ -29,6 +29,1154 @@ function Get-ServerId {
     return "busy-server-native-unified"
 }
 
+# ===============================================================
+# VOUCHER PARTY ACCOUNT ACCESS PERMISSIONS
+# ===============================================================
+
+function Test-IsPartyAccessVoucherType {
+    param([int]$VchType)
+
+    return @(
+        9, 26, 12, 11, 3, 14,
+        2, 27, 13, 4, 10, 19
+    ) -contains $VchType
+}
+
+function Test-IsPermissionAdminUser {
+    param($User)
+
+    if ($null -eq $User) {
+        return $false
+    }
+
+    $role = ([string]$User.role).Trim().ToLowerInvariant()
+    return ($role -eq "superadmin" -or $role -eq "companyadmin")
+}
+
+function Get-PartyGroupAccessForAuthUser {
+    param(
+        $AuthResult,
+        [int]$VchType,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = "",
+        [bool]$RequireAuth = $true
+    )
+
+    # Trusted bridge-secret/internal calls keep the existing unrestricted path.
+    if (-not $RequireAuth) {
+        return @{ enforce = $false; groupCodes = @(); allEligibleRoots = $false }
+    }
+
+    if (-not (Test-IsPartyAccessVoucherType -VchType $VchType)) {
+        return @{ enforce = $false; groupCodes = @(); allEligibleRoots = $false }
+    }
+
+    if (
+        $null -ne $AuthResult -and
+        $null -ne $AuthResult.user -and
+        (Test-IsPermissionAdminUser -User $AuthResult.user)
+    ) {
+        # Admins bypass user branch assignments, but the Party field itself is
+        # still limited to the three eligible BUSY roots required by the business.
+        return @{ enforce = $true; groupCodes = @(); allEligibleRoots = $true }
+    }
+
+    # IMPORTANT:
+    # Always read the normal user's CURRENT MobileUserPreference row from the
+    # selected BUSY company. Do not trust only the permission snapshot embedded
+    # in an existing auth token: the administrator may have changed M2 after the
+    # token was issued. Using the live row also makes permission changes effective
+    # immediately without requiring a new token.
+    $groupCodes = @()
+    $m2 = "{}"
+    $liveProfileFound = $false
+
+    if (
+        $null -ne $AuthResult -and
+        $null -ne $AuthResult.user -and
+        -not [string]::IsNullOrWhiteSpace([string]$AuthResult.user.name)
+    ) {
+        try {
+            $permissionResult = Get-UserPermissions `
+                -InstanceId $InstanceId `
+                -CompanyCode $CompanyCode
+
+            if ($permissionResult.success) {
+                $activeName = ([string]$AuthResult.user.name).Trim().ToLowerInvariant()
+                $profile = @($permissionResult.data) |
+                    Where-Object {
+                        ([string]$_.name).Trim().ToLowerInvariant() -eq $activeName
+                    } |
+                    Select-Object -First 1
+
+                if ($null -ne $profile) {
+                    $liveProfileFound = $true
+
+                    if ($null -ne $profile.M2) {
+                        $m2 = [string]$profile.M2
+                    }
+                }
+            }
+        }
+        catch {
+            # Fail closed below. We deliberately do not turn a DB read problem
+            # into unrestricted Party access.
+            $liveProfileFound = $false
+            $m2 = "{}"
+        }
+    }
+
+    # Compatibility fallback only when the live profile genuinely cannot be
+    # found. This supports older/native tokens while still preferring the DB.
+    if (
+        -not $liveProfileFound -and
+        $null -ne $AuthResult -and
+        $null -ne $AuthResult.user -and
+        $null -ne $AuthResult.user.permissions -and
+        $null -ne $AuthResult.user.permissions.M2
+    ) {
+        $m2 = [string]$AuthResult.user.permissions.M2
+    }
+
+    try {
+        $fieldsMap = $m2 | ConvertFrom-Json
+        $prop = $fieldsMap.PSObject.Properties["$VchType"]
+
+        if ($null -ne $prop -and $null -ne $prop.Value) {
+            $voucherConfig = $prop.Value
+
+            if ($null -ne $voucherConfig.partyGroupCodes) {
+                foreach ($rawCode in @($voucherConfig.partyGroupCodes)) {
+                    $code = 0
+                    if ([int]::TryParse([string]$rawCode, [ref]$code) -and $code -gt 0) {
+                        if ($groupCodes -notcontains $code) {
+                            $groupCodes += $code
+                        }
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        $groupCodes = @()
+    }
+
+    return @{
+        enforce          = $true
+        groupCodes       = @($groupCodes)
+        allEligibleRoots = $false
+    }
+}
+
+function Test-VoucherPartyAccountAccess {
+    param(
+        $AuthResult,
+        $Data,
+        [string]$InstanceId,
+        [string]$CompanyCode,
+        [bool]$RequireAuth = $true
+    )
+
+    if (-not $RequireAuth) {
+        return @{ success = $true; allowed = $true; deniedAccounts = @() }
+    }
+
+    if ($null -eq $Data -or $null -eq $Data.vchType) {
+        return @{ success = $true; allowed = $true; deniedAccounts = @() }
+    }
+
+    $vchType = [int]$Data.vchType
+
+    if (-not (Test-IsPartyAccessVoucherType -VchType $vchType)) {
+        return @{ success = $true; allowed = $true; deniedAccounts = @() }
+    }
+
+    $access = Get-PartyGroupAccessForAuthUser `
+        -AuthResult $AuthResult `
+        -VchType $vchType `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode `
+        -RequireAuth $RequireAuth
+
+    $accountNames = @()
+
+    if ($vchType -eq 14 -or $vchType -eq 19) {
+        # Receipt: Credit rows are the counterparty side.
+        # Payment: Debit rows are the counterparty side.
+        foreach ($account in @($Data.accounts)) {
+            if ($null -eq $account) { continue }
+
+            $dc = ([string]$account.dc).Trim().ToUpperInvariant()
+            $isPartySide =
+                ($vchType -eq 14 -and $dc -eq "C") -or
+                ($vchType -eq 19 -and $dc -eq "D")
+
+            if ($isPartySide) {
+                $name = ([string]$account.accountName).Trim()
+                if (-not [string]::IsNullOrWhiteSpace($name)) {
+                    $accountNames += $name
+                }
+            }
+        }
+    }
+    else {
+        $partyName = ([string]$Data.party).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($partyName)) {
+            $accountNames += $partyName
+        }
+    }
+
+    return Test-PartyAccountsAllowed `
+        -AccountNames @($accountNames) `
+        -AllowedGroupCodes @($access.groupCodes) `
+        -AllowAllEligibleRoots ([bool]$access.allEligibleRoots) `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+}
+
+
+# ===============================================================
+# JOURNAL / CONTRA DEBIT/CREDIT ACCOUNT ACCESS
+# ===============================================================
+
+function Test-IsDebitCreditAccessVoucherType {
+    param([int]$VchType)
+    return @(15, 16) -contains $VchType
+}
+
+function Get-AccountSideAccessForAuthUser {
+    param(
+        $AuthResult,
+        [int]$VchType,
+        [string]$Dc,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = "",
+        [bool]$RequireAuth = $true
+    )
+
+    if (-not $RequireAuth) {
+        return @{ enforce = $false; groupCodes = @(); accountCodes = @(); allAccounts = $true }
+    }
+
+    if (-not (Test-IsDebitCreditAccessVoucherType -VchType $VchType)) {
+        return @{ enforce = $false; groupCodes = @(); accountCodes = @(); allAccounts = $false }
+    }
+
+    $side = ([string]$Dc).Trim().ToUpperInvariant()
+    if ($side -ne "D" -and $side -ne "C") {
+        return @{ enforce = $true; groupCodes = @(); accountCodes = @(); allAccounts = $false; invalidSide = $true }
+    }
+
+    if (
+        $null -ne $AuthResult -and
+        $null -ne $AuthResult.user -and
+        (Test-IsPermissionAdminUser -User $AuthResult.user)
+    ) {
+        return @{ enforce = $true; groupCodes = @(); accountCodes = @(); allAccounts = $true }
+    }
+
+    $m2 = "{}"
+    $liveProfileFound = $false
+
+    if (
+        $null -ne $AuthResult -and
+        $null -ne $AuthResult.user -and
+        -not [string]::IsNullOrWhiteSpace([string]$AuthResult.user.name)
+    ) {
+        try {
+            $permissionResult = Get-UserPermissions `
+                -InstanceId $InstanceId `
+                -CompanyCode $CompanyCode
+
+            if ($permissionResult.success) {
+                $activeName = ([string]$AuthResult.user.name).Trim().ToLowerInvariant()
+                $profile = @($permissionResult.data) |
+                    Where-Object { ([string]$_.name).Trim().ToLowerInvariant() -eq $activeName } |
+                    Select-Object -First 1
+
+                if ($null -ne $profile) {
+                    $liveProfileFound = $true
+                    if ($null -ne $profile.M2) { $m2 = [string]$profile.M2 }
+                }
+            }
+        }
+        catch {
+            $liveProfileFound = $false
+            $m2 = "{}"
+        }
+    }
+
+    if (
+        -not $liveProfileFound -and
+        $null -ne $AuthResult -and
+        $null -ne $AuthResult.user -and
+        $null -ne $AuthResult.user.permissions -and
+        $null -ne $AuthResult.user.permissions.M2
+    ) {
+        $m2 = [string]$AuthResult.user.permissions.M2
+    }
+
+    $groupCodes = @()
+
+    try {
+        $fieldsMap = $m2 | ConvertFrom-Json
+        $prop = $fieldsMap.PSObject.Properties["$VchType"]
+
+        if ($null -ne $prop -and $null -ne $prop.Value) {
+            $voucherConfig = $prop.Value
+            $groupProperty = if ($side -eq "D") { "debitGroupCodes" } else { "creditGroupCodes" }
+
+            $groupProp = $voucherConfig.PSObject.Properties[$groupProperty]
+            if ($null -ne $groupProp -and $null -ne $groupProp.Value) {
+                foreach ($rawCode in @($groupProp.Value)) {
+                    $code = 0
+                    if ([int]::TryParse([string]$rawCode, [ref]$code) -and $code -gt 0 -and $groupCodes -notcontains $code) {
+                        $groupCodes += $code
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        $groupCodes = @()
+    }
+
+    # V4 Journal/Contra policy is GROUP-ONLY. Legacy debitAccountCodes /
+    # creditAccountCodes values are intentionally ignored server-side so an
+    # old V3 profile cannot continue granting an individual ledger.
+    return @{
+        enforce      = $true
+        groupCodes   = @($groupCodes)
+        accountCodes = @()
+        allAccounts  = $false
+    }
+}
+
+function Test-VoucherDebitCreditAccountAccess {
+    param(
+        $AuthResult,
+        $Data,
+        [string]$InstanceId,
+        [string]$CompanyCode,
+        [bool]$RequireAuth = $true
+    )
+
+    if (-not $RequireAuth -or $null -eq $Data -or $null -eq $Data.vchType) {
+        return @{ success = $true; allowed = $true; deniedAccounts = @() }
+    }
+
+    $vchType = [int]$Data.vchType
+    if (-not (Test-IsDebitCreditAccessVoucherType -VchType $vchType)) {
+        return @{ success = $true; allowed = $true; deniedAccounts = @() }
+    }
+
+    $debitNames = @()
+    $creditNames = @()
+    $invalidSideAccounts = @()
+
+    foreach ($account in @($Data.accounts)) {
+        if ($null -eq $account) { continue }
+        $name = ([string]$account.accountName).Trim()
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+
+        $dc = ([string]$account.dc).Trim().ToUpperInvariant()
+        if ($dc -eq "D") { $debitNames += $name }
+        elseif ($dc -eq "C") { $creditNames += $name }
+        else { $invalidSideAccounts += $name }
+    }
+
+    if ($invalidSideAccounts.Count -gt 0) {
+        return @{ success=$true; allowed=$false; deniedAccounts=@($invalidSideAccounts); deniedDebitAccounts=@(); deniedCreditAccounts=@() }
+    }
+
+    $debitAccess = Get-AccountSideAccessForAuthUser `
+        -AuthResult $AuthResult -VchType $vchType -Dc "D" `
+        -InstanceId $InstanceId -CompanyCode $CompanyCode -RequireAuth $RequireAuth
+
+    $creditAccess = Get-AccountSideAccessForAuthUser `
+        -AuthResult $AuthResult -VchType $vchType -Dc "C" `
+        -InstanceId $InstanceId -CompanyCode $CompanyCode -RequireAuth $RequireAuth
+
+    $debitCheck = Test-AccountsAllowedByCodes `
+        -AccountNames @($debitNames) `
+        -AllowedGroupCodes @($debitAccess.groupCodes) `
+        -AllowedAccountCodes @($debitAccess.accountCodes) `
+        -AllowAllAccounts ([bool]$debitAccess.allAccounts) `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $debitCheck.success) {
+        return @{ success=$false; allowed=$false; error=$debitCheck.error; deniedAccounts=@($debitCheck.deniedAccounts) }
+    }
+
+    $creditCheck = Test-AccountsAllowedByCodes `
+        -AccountNames @($creditNames) `
+        -AllowedGroupCodes @($creditAccess.groupCodes) `
+        -AllowedAccountCodes @($creditAccess.accountCodes) `
+        -AllowAllAccounts ([bool]$creditAccess.allAccounts) `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $creditCheck.success) {
+        return @{ success=$false; allowed=$false; error=$creditCheck.error; deniedAccounts=@($creditCheck.deniedAccounts) }
+    }
+
+    $denied = @($debitCheck.deniedAccounts) + @($creditCheck.deniedAccounts)
+    return @{
+        success              = $true
+        allowed              = ($denied.Count -eq 0)
+        deniedAccounts       = @($denied)
+        deniedDebitAccounts  = @($debitCheck.deniedAccounts)
+        deniedCreditAccounts = @($creditCheck.deniedAccounts)
+    }
+}
+
+
+# ===============================================================
+# VOUCHER ITEM GROUP ACCESS PERMISSIONS
+# ===============================================================
+
+function Test-IsItemGroupAccessVoucherType {
+    param([int]$VchType)
+
+    return @(
+        9, 2, 12, 13, 26, 27, 3, 10, 11, 4
+    ) -contains $VchType
+}
+
+function Get-LiveItemPermissionM2Fast {
+    param(
+        [string]$UserName = "",
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $trimmedUserName = ([string]$UserName).Trim()
+    if ([string]::IsNullOrWhiteSpace($trimmedUserName)) {
+        return @{ success = $true; found = $false; m2 = "{}" }
+    }
+
+    $conn = $null
+
+    try {
+        $found = Get-InstanceForCompany `
+            -CompanyCode $CompanyCode `
+            -InstanceId $InstanceId
+
+        if (-not $found) {
+            return @{
+                success = $false
+                found   = $false
+                m2      = "{}"
+                error   = "Company not found in instances.json"
+            }
+        }
+
+        $inst = $found.instance
+        $dbType = if ($null -ne $inst.dbType) { [int]$inst.dbType } else { 0 }
+
+        if ($dbType -eq 1) {
+            $sqlDb = Get-SqlDatabaseName `
+                -CompanyCode $CompanyCode `
+                -InstanceId $inst.id
+
+            $conn = Open-SqlConnection `
+                -SqlServer $inst.sqlServer `
+                -Database $sqlDb `
+                -SqlUser $inst.sqlUser `
+                -SqlPassword $inst.sqlPassword
+
+            $cmd = $conn.CreateCommand()
+            $cmd.CommandText = @"
+SELECT TOP 1
+    CASE
+        WHEN M2 IS NULL THEN '{}'
+        ELSE CAST(M2 AS NVARCHAR(MAX))
+    END
+FROM MobileUserPreference
+WHERE [Name] = @userName
+"@
+            $cmd.Parameters.AddWithValue("@userName", $trimmedUserName) | Out-Null
+
+            $rawM2 = $cmd.ExecuteScalar()
+
+            if ($null -eq $rawM2 -or $rawM2 -eq [System.DBNull]::Value) {
+                return @{ success = $true; found = $false; m2 = "{}" }
+            }
+
+            return @{
+                success = $true
+                found   = $true
+                m2      = [string]$rawM2
+            }
+        }
+
+        $permissionResult = Get-UserPermissions `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        if (-not $permissionResult.success) {
+            return @{
+                success = $false
+                found   = $false
+                m2      = "{}"
+                error   = $permissionResult.error
+            }
+        }
+
+        $activeName = $trimmedUserName.ToLowerInvariant()
+        $profile = @($permissionResult.data) |
+            Where-Object {
+                ([string]$_.name).Trim().ToLowerInvariant() -eq $activeName
+            } |
+            Select-Object -First 1
+
+        if ($null -eq $profile) {
+            return @{ success = $true; found = $false; m2 = "{}" }
+        }
+
+        $m2 = "{}"
+        if ($null -ne $profile.M2) {
+            $m2 = [string]$profile.M2
+        }
+
+        return @{ success = $true; found = $true; m2 = $m2 }
+    }
+    catch {
+        return @{
+            success = $false
+            found   = $false
+            m2      = "{}"
+            error   = $_.Exception.Message
+        }
+    }
+    finally {
+        if ($null -ne $conn) {
+            try { $conn.Close() } catch {}
+        }
+    }
+}
+
+function Get-ItemGroupAccessForAuthUser {
+    param(
+        $AuthResult,
+        [int]$VchType,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = "",
+        [bool]$RequireAuth = $true
+    )
+
+    # Trusted bridge-secret/internal calls keep the existing unrestricted path.
+    if (-not $RequireAuth) {
+        return @{ enforce = $false; groupCodes = @(); allItems = $true }
+    }
+
+    if (-not (Test-IsItemGroupAccessVoucherType -VchType $VchType)) {
+        return @{ enforce = $false; groupCodes = @(); allItems = $false }
+    }
+
+    if (
+        $null -ne $AuthResult -and
+        $null -ne $AuthResult.user -and
+        (Test-IsPermissionAdminUser -User $AuthResult.user)
+    ) {
+        return @{ enforce = $true; groupCodes = @(); allItems = $true }
+    }
+
+    # Read the CURRENT MobileUserPreference.M2 row so changes made by an
+    # administrator take effect immediately without requiring a new login token.
+    #
+    # SQL Server hot path: read only this user's M2 instead of loading all
+    # MobileUserPreference rows on every item-search request.
+    $groupCodes = @()
+    $m2 = "{}"
+    $liveProfileFound = $false
+
+    if (
+        $null -ne $AuthResult -and
+        $null -ne $AuthResult.user -and
+        -not [string]::IsNullOrWhiteSpace([string]$AuthResult.user.name)
+    ) {
+        $liveM2 = Get-LiveItemPermissionM2Fast `
+            -UserName ([string]$AuthResult.user.name) `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        if ($liveM2.success -and $liveM2.found) {
+            $liveProfileFound = $true
+            $m2 = [string]$liveM2.m2
+        }
+    }
+
+    # Compatibility fallback for older/native tokens only when the live row
+    # genuinely cannot be found.
+    if (
+        -not $liveProfileFound -and
+        $null -ne $AuthResult -and
+        $null -ne $AuthResult.user -and
+        $null -ne $AuthResult.user.permissions -and
+        $null -ne $AuthResult.user.permissions.M2
+    ) {
+        $m2 = [string]$AuthResult.user.permissions.M2
+    }
+
+    try {
+        $fieldsMap = $m2 | ConvertFrom-Json
+        $prop = $fieldsMap.PSObject.Properties["$VchType"]
+
+        if ($null -ne $prop -and $null -ne $prop.Value) {
+            $voucherConfig = $prop.Value
+            $groupProp = $voucherConfig.PSObject.Properties["itemGroupCodes"]
+
+            if ($null -ne $groupProp -and $null -ne $groupProp.Value) {
+                foreach ($rawCode in @($groupProp.Value)) {
+                    $code = 0
+                    if (
+                        [int]::TryParse([string]$rawCode, [ref]$code) -and
+                        $code -gt 0 -and
+                        $groupCodes -notcontains $code
+                    ) {
+                        $groupCodes += $code
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        $groupCodes = @()
+    }
+
+    return @{
+        enforce    = $true
+        groupCodes = @($groupCodes)
+        allItems   = $false
+    }
+}
+
+function Get-AllItemGroupPermissionNodes {
+    param(
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $fi) {
+        return @{ success = $false; error = "BUSY connection failed"; data = @() }
+    }
+
+    try {
+        # BUSY Item Groups are MasterType=5. Return ALL Item Groups, including
+        # currently empty groups, so permissions remain valid when new items are
+        # created later under an already-granted branch.
+        $rst = $fi.GetRecordset(@"
+SELECT
+    Code,
+    Name,
+    Alias,
+    ParentGrp
+FROM Master1
+WHERE MasterType = 5
+ORDER BY Name
+"@)
+
+        $rows = @()
+        $byCode = @{}
+
+        if ($rst -and -not $rst.EOF) {
+            try { $rst.MoveFirst() } catch {}
+
+            while (-not $rst.EOF) {
+                $code = 0
+                $parentCode = 0
+                $name = ""
+                $alias = ""
+
+                try {
+                    $raw = $rst.Fields.Item("Code").Value
+                    if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                        $code = [int]$raw
+                    }
+                } catch {}
+
+                try {
+                    $raw = $rst.Fields.Item("ParentGrp").Value
+                    if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                        $parentCode = [int]$raw
+                    }
+                } catch {}
+
+                try {
+                    $raw = $rst.Fields.Item("Name").Value
+                    if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                        $name = $raw.ToString().Trim()
+                    }
+                } catch {}
+
+                try {
+                    $raw = $rst.Fields.Item("Alias").Value
+                    if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                        $alias = $raw.ToString().Trim()
+                    }
+                } catch {}
+
+                if ($code -gt 0) {
+                    $row = [pscustomobject]@{
+                        code       = $code
+                        name       = $name
+                        alias      = $alias
+                        parentCode = $parentCode
+                    }
+                    $rows += $row
+                    $byCode[$code] = $row
+                }
+
+                $rst.MoveNext()
+            }
+
+            try { $rst.Close() } catch {}
+        }
+
+        $nodes = @()
+
+        foreach ($row in $rows) {
+            $chain = @()
+            $current = [int]$row.code
+            $visited = @{}
+
+            for ($guard = 0; $guard -lt 100; $guard++) {
+                if ($current -le 0 -or -not $byCode.ContainsKey($current)) {
+                    break
+                }
+
+                if ($visited.ContainsKey($current)) {
+                    break
+                }
+
+                $visited[$current] = $true
+                $chain += $byCode[$current]
+                $current = [int]$byCode[$current].parentCode
+            }
+
+            $ordered = @()
+            for ($i = $chain.Count - 1; $i -ge 0; $i--) {
+                $ordered += $chain[$i]
+            }
+
+            $pathNames = @($ordered | ForEach-Object { [string]$_.name })
+            $rootCode = if ($ordered.Count -gt 0) { [int]$ordered[0].code } else { [int]$row.code }
+            $rootName = if ($ordered.Count -gt 0) { [string]$ordered[0].name } else { [string]$row.name }
+
+            $nodes += [pscustomobject]@{
+                rootCode  = $rootCode
+                rootName  = $rootName
+                nodeType  = "GROUP"
+                code      = [int]$row.code
+                name      = [string]$row.name
+                alias     = [string]$row.alias
+                parentCode = [int]$row.parentCode
+                level     = [Math]::Max(0, $ordered.Count - 1)
+                pathText  = ($pathNames -join " > ")
+            }
+        }
+
+        $sorted = @($nodes | Sort-Object pathText, name)
+
+        return @{
+            success = $true
+            count   = $sorted.Count
+            data    = $sorted
+        }
+    }
+    catch {
+        return @{ success = $false; error = $_.Exception.Message; data = @() }
+    }
+    finally {
+        Disconnect-BUSY $fi
+    }
+}
+
+function Get-ItemPermissionSnapshot {
+    param(
+        [int[]]$AllowedGroupCodes,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $fi) {
+        return @{ success = $false; error = "BUSY connection failed" }
+    }
+
+    try {
+        $rst = $fi.GetRecordset(@"
+SELECT
+    Code,
+    MasterType,
+    Name,
+    Alias,
+    ParentGrp
+FROM Master1
+WHERE MasterType = 5 OR MasterType = 6
+"@)
+
+        $groups = @()
+        $items = @()
+        $groupByCode = @{}
+        $itemByCode = @{}
+        $itemByName = @{}
+
+        if ($rst -and -not $rst.EOF) {
+            try { $rst.MoveFirst() } catch {}
+
+            while (-not $rst.EOF) {
+                $code = 0
+                $masterType = 0
+                $parentCode = 0
+                $name = ""
+                $alias = ""
+
+                try {
+                    $raw = $rst.Fields.Item("Code").Value
+                    if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                        $code = [int]$raw
+                    }
+                } catch {}
+
+                try {
+                    $raw = $rst.Fields.Item("MasterType").Value
+                    if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                        $masterType = [int]$raw
+                    }
+                } catch {}
+
+                try {
+                    $raw = $rst.Fields.Item("ParentGrp").Value
+                    if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                        $parentCode = [int]$raw
+                    }
+                } catch {}
+
+                try {
+                    $raw = $rst.Fields.Item("Name").Value
+                    if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                        $name = $raw.ToString().Trim()
+                    }
+                } catch {}
+
+                try {
+                    $raw = $rst.Fields.Item("Alias").Value
+                    if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                        $alias = $raw.ToString().Trim()
+                    }
+                } catch {}
+
+                if ($code -gt 0 -and $masterType -eq 5) {
+                    $row = [pscustomobject]@{
+                        code       = $code
+                        parentCode = $parentCode
+                        name       = $name
+                    }
+                    $groups += $row
+                    $groupByCode[$code] = $row
+                }
+                elseif ($code -gt 0 -and $masterType -eq 6) {
+                    $row = [pscustomobject]@{
+                        code       = $code
+                        parentCode = $parentCode
+                        name       = $name
+                        alias      = $alias
+                    }
+                    $items += $row
+                    $itemByCode[$code] = $row
+
+                    $nameKey = $name.Trim().ToLowerInvariant()
+                    if (-not [string]::IsNullOrWhiteSpace($nameKey)) {
+                        $itemByName[$nameKey] = $row
+                    }
+                }
+
+                $rst.MoveNext()
+            }
+
+            try { $rst.Close() } catch {}
+        }
+
+        $allowedGroupMap = @{}
+
+        foreach ($rawCode in @($AllowedGroupCodes)) {
+            $code = 0
+            if (
+                [int]::TryParse([string]$rawCode, [ref]$code) -and
+                $code -gt 0 -and
+                $groupByCode.ContainsKey($code)
+            ) {
+                $allowedGroupMap[$code] = $true
+            }
+        }
+
+        # Expand every selected Item Group recursively.
+        $changed = $true
+        while ($changed) {
+            $changed = $false
+
+            foreach ($group in $groups) {
+                $code = [int]$group.code
+                $parentCode = [int]$group.parentCode
+
+                if (
+                    -not $allowedGroupMap.ContainsKey($code) -and
+                    $allowedGroupMap.ContainsKey($parentCode)
+                ) {
+                    $allowedGroupMap[$code] = $true
+                    $changed = $true
+                }
+            }
+        }
+
+        $allowedItemCodeMap = @{}
+
+        foreach ($item in $items) {
+            if ($allowedGroupMap.ContainsKey([int]$item.parentCode)) {
+                $allowedItemCodeMap[[int]$item.code] = $true
+            }
+        }
+
+        return @{
+            success            = $true
+            groupByCode        = $groupByCode
+            itemByCode         = $itemByCode
+            itemByName         = $itemByName
+            allowedGroupMap    = $allowedGroupMap
+            allowedItemCodeMap = $allowedItemCodeMap
+        }
+    }
+    catch {
+        return @{ success = $false; error = $_.Exception.Message }
+    }
+    finally {
+        Disconnect-BUSY $fi
+    }
+}
+
+function Test-ItemsAllowedByGroupCodes {
+    param(
+        $Items,
+        [int[]]$AllowedGroupCodes,
+        [bool]$AllowAllItems = $false,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if ($AllowAllItems) {
+        return @{ success = $true; allowed = $true; deniedItems = @() }
+    }
+
+    $submittedItems = @($Items)
+    if ($submittedItems.Count -eq 0) {
+        return @{ success = $true; allowed = $true; deniedItems = @() }
+    }
+
+    if (@($AllowedGroupCodes).Count -eq 0) {
+        $denied = @(
+            $submittedItems |
+            ForEach-Object {
+                $name = ([string]$_.itemName).Trim()
+                if ([string]::IsNullOrWhiteSpace($name)) { $name = ([string]$_.name).Trim() }
+                if ([string]::IsNullOrWhiteSpace($name)) { $name = "Unknown Item" }
+                $name
+            }
+        )
+
+        return @{ success = $true; allowed = $false; deniedItems = @($denied) }
+    }
+
+    $snapshot = Get-ItemPermissionSnapshot `
+        -AllowedGroupCodes @($AllowedGroupCodes) `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $snapshot.success) {
+        return @{
+            success     = $false
+            allowed     = $false
+            error       = $snapshot.error
+            deniedItems = @()
+        }
+    }
+
+    $deniedItems = @()
+
+    foreach ($item in $submittedItems) {
+        if ($null -eq $item) { continue }
+
+        $itemCode = 0
+
+        foreach ($propName in @("itemCode", "code", "masterCode")) {
+            try {
+                $raw = $item.PSObject.Properties[$propName]
+                if ($null -ne $raw -and $null -ne $raw.Value) {
+                    $candidate = 0
+                    if (
+                        [int]::TryParse([string]$raw.Value, [ref]$candidate) -and
+                        $candidate -gt 0
+                    ) {
+                        $itemCode = $candidate
+                        break
+                    }
+                }
+            }
+            catch {}
+        }
+
+        $itemName = ([string]$item.itemName).Trim()
+        if ([string]::IsNullOrWhiteSpace($itemName)) {
+            $itemName = ([string]$item.name).Trim()
+        }
+
+        $resolved = $null
+
+        if ($itemCode -gt 0 -and $snapshot.itemByCode.ContainsKey($itemCode)) {
+            $resolved = $snapshot.itemByCode[$itemCode]
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($itemName)) {
+            $nameKey = $itemName.ToLowerInvariant()
+            if ($snapshot.itemByName.ContainsKey($nameKey)) {
+                $resolved = $snapshot.itemByName[$nameKey]
+                $itemCode = [int]$resolved.code
+            }
+        }
+
+        if (
+            $null -eq $resolved -or
+            -not $snapshot.allowedItemCodeMap.ContainsKey([int]$resolved.code)
+        ) {
+            if ([string]::IsNullOrWhiteSpace($itemName) -and $itemCode -gt 0) {
+                $itemName = "Item #$itemCode"
+            }
+            if ([string]::IsNullOrWhiteSpace($itemName)) {
+                $itemName = "Unknown Item"
+            }
+
+            if ($deniedItems -notcontains $itemName) {
+                $deniedItems += $itemName
+            }
+        }
+    }
+
+    return @{
+        success     = $true
+        allowed     = ($deniedItems.Count -eq 0)
+        deniedItems = @($deniedItems)
+    }
+}
+
+function Test-VoucherItemGroupAccess {
+    param(
+        $AuthResult,
+        $Data,
+        [string]$InstanceId,
+        [string]$CompanyCode,
+        [bool]$RequireAuth = $true
+    )
+
+    if (-not $RequireAuth -or $null -eq $Data -or $null -eq $Data.vchType) {
+        return @{ success = $true; allowed = $true; deniedItems = @() }
+    }
+
+    $vchType = [int]$Data.vchType
+
+    if (-not (Test-IsItemGroupAccessVoucherType -VchType $vchType)) {
+        return @{ success = $true; allowed = $true; deniedItems = @() }
+    }
+
+    $access = Get-ItemGroupAccessForAuthUser `
+        -AuthResult $AuthResult `
+        -VchType $vchType `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode `
+        -RequireAuth $RequireAuth
+
+    return Test-ItemsAllowedByGroupCodes `
+        -Items @($Data.items) `
+        -AllowedGroupCodes @($access.groupCodes) `
+        -AllowAllItems ([bool]$access.allItems) `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+}
+
+
+function Filter-VoucherItemSearchResultByAccess {
+    param(
+        $SearchResult,
+        [int[]]$AllowedGroupCodes,
+        [bool]$AllowAllItems = $false,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if ($null -eq $SearchResult) {
+        return @{ success = $true; total = 0; data = @() }
+    }
+
+    if ($AllowAllItems) {
+        return $SearchResult
+    }
+
+    if (@($AllowedGroupCodes).Count -eq 0) {
+        return @{ success = $true; total = 0; data = @() }
+    }
+
+    if ($SearchResult.success -eq $false) {
+        return $SearchResult
+    }
+
+    $snapshot = Get-ItemPermissionSnapshot `
+        -AllowedGroupCodes @($AllowedGroupCodes) `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $snapshot.success) {
+        return @{
+            success = $false
+            error   = $snapshot.error
+            total   = 0
+            data    = @()
+        }
+    }
+
+    $sourceData = @()
+    try {
+        if ($null -ne $SearchResult.data) {
+            $sourceData = @($SearchResult.data)
+        }
+    }
+    catch {}
+
+    $filtered = @()
+
+    foreach ($item in $sourceData) {
+        $code = 0
+        try {
+            $raw = $item.code
+            if ($null -ne $raw) {
+                [void][int]::TryParse([string]$raw, [ref]$code)
+            }
+        }
+        catch {}
+
+        if ($code -gt 0 -and $snapshot.allowedItemCodeMap.ContainsKey($code)) {
+            $filtered += $item
+        }
+    }
+
+    return @{
+        success = $true
+        total   = $filtered.Count
+        data    = @($filtered)
+    }
+}
+
+
 function Start-BUSYServer {
     param(
         [int]$Port = 8081
@@ -202,7 +1350,87 @@ function Start-BUSYServer {
             } elseif ($path -eq "/busy/voucher" -and $method -eq "POST") {
                 $bodyObj = Read-RequestBody $request | ConvertFrom-Json
 
-                if ($authResult.user.name) {
+                $partyAccessCheck = Test-VoucherPartyAccountAccess `
+                    -AuthResult $authResult `
+                    -Data $bodyObj `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode `
+                    -RequireAuth $requireAuth
+
+                if (-not $partyAccessCheck.success) {
+                    Send-Response $response @{
+                        success   = $false
+                        errorCode = "PARTY_ACCOUNT_VALIDATION_FAILED"
+                        error     = if ($partyAccessCheck.error) { $partyAccessCheck.error } else { "Could not validate Party Account Access." }
+                    } 500
+                    continue
+                }
+
+                if (-not $partyAccessCheck.allowed) {
+                    Send-Response $response @{
+                        success        = $false
+                        errorCode      = "PARTY_ACCOUNT_ACCESS_DENIED"
+                        error          = "The selected Party/account is not allowed for this user and voucher type."
+                        deniedAccounts = @($partyAccessCheck.deniedAccounts)
+                    } 403
+                    continue
+                }
+
+                $dcAccessCheck = Test-VoucherDebitCreditAccountAccess `
+                    -AuthResult $authResult `
+                    -Data $bodyObj `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode `
+                    -RequireAuth $requireAuth
+
+                if (-not $dcAccessCheck.success) {
+                    Send-Response $response @{
+                        success   = $false
+                        errorCode = "ACCOUNT_SIDE_ACCESS_VALIDATION_FAILED"
+                        error     = if ($dcAccessCheck.error) { $dcAccessCheck.error } else { "Could not validate Debit/Credit Account Access." }
+                    } 500
+                    continue
+                }
+
+                if (-not $dcAccessCheck.allowed) {
+                    Send-Response $response @{
+                        success              = $false
+                        errorCode            = "ACCOUNT_SIDE_ACCESS_DENIED"
+                        error                = "One or more Journal/Contra accounts are not allowed for their Debit/Credit side."
+                        deniedAccounts       = @($dcAccessCheck.deniedAccounts)
+                        deniedDebitAccounts  = @($dcAccessCheck.deniedDebitAccounts)
+                        deniedCreditAccounts = @($dcAccessCheck.deniedCreditAccounts)
+                    } 403
+                    continue
+                }
+
+                $itemAccessCheck = Test-VoucherItemGroupAccess `
+                    -AuthResult $authResult `
+                    -Data $bodyObj `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode `
+                    -RequireAuth $requireAuth
+
+                if (-not $itemAccessCheck.success) {
+                    Send-Response $response @{
+                        success   = $false
+                        errorCode = "ITEM_GROUP_ACCESS_VALIDATION_FAILED"
+                        error     = if ($itemAccessCheck.error) { $itemAccessCheck.error } else { "Could not validate Item Group Access." }
+                    } 500
+                    continue
+                }
+
+                if (-not $itemAccessCheck.allowed) {
+                    Send-Response $response @{
+                        success     = $false
+                        errorCode   = "ITEM_GROUP_ACCESS_DENIED"
+                        error       = "One or more Items are outside the Item Group branches allowed for this user and voucher type."
+                        deniedItems = @($itemAccessCheck.deniedItems)
+                    } 403
+                    continue
+                }
+
+                if ($null -ne $authResult -and $null -ne $authResult.user -and $authResult.user.name) {
                     $bodyObj | Add-Member -MemberType NoteProperty -Name "bridgeUserName" -Value $authResult.user.name -Force
                 }
 
@@ -334,7 +1562,87 @@ function Start-BUSYServer {
             } elseif ($path -eq "/busy/voucher/modify" -and $method -eq "POST") {
                 $bodyObj = Read-RequestBody $request | ConvertFrom-Json
 
-                if ($authResult.user.name) {
+                $partyAccessCheck = Test-VoucherPartyAccountAccess `
+                    -AuthResult $authResult `
+                    -Data $bodyObj `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode `
+                    -RequireAuth $requireAuth
+
+                if (-not $partyAccessCheck.success) {
+                    Send-Response $response @{
+                        success   = $false
+                        errorCode = "PARTY_ACCOUNT_VALIDATION_FAILED"
+                        error     = if ($partyAccessCheck.error) { $partyAccessCheck.error } else { "Could not validate Party Account Access." }
+                    } 500
+                    continue
+                }
+
+                if (-not $partyAccessCheck.allowed) {
+                    Send-Response $response @{
+                        success        = $false
+                        errorCode      = "PARTY_ACCOUNT_ACCESS_DENIED"
+                        error          = "The selected Party/account is not allowed for this user and voucher type."
+                        deniedAccounts = @($partyAccessCheck.deniedAccounts)
+                    } 403
+                    continue
+                }
+
+                $dcAccessCheck = Test-VoucherDebitCreditAccountAccess `
+                    -AuthResult $authResult `
+                    -Data $bodyObj `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode `
+                    -RequireAuth $requireAuth
+
+                if (-not $dcAccessCheck.success) {
+                    Send-Response $response @{
+                        success   = $false
+                        errorCode = "ACCOUNT_SIDE_ACCESS_VALIDATION_FAILED"
+                        error     = if ($dcAccessCheck.error) { $dcAccessCheck.error } else { "Could not validate Debit/Credit Account Access." }
+                    } 500
+                    continue
+                }
+
+                if (-not $dcAccessCheck.allowed) {
+                    Send-Response $response @{
+                        success              = $false
+                        errorCode            = "ACCOUNT_SIDE_ACCESS_DENIED"
+                        error                = "One or more Journal/Contra accounts are not allowed for their Debit/Credit side."
+                        deniedAccounts       = @($dcAccessCheck.deniedAccounts)
+                        deniedDebitAccounts  = @($dcAccessCheck.deniedDebitAccounts)
+                        deniedCreditAccounts = @($dcAccessCheck.deniedCreditAccounts)
+                    } 403
+                    continue
+                }
+
+                $itemAccessCheck = Test-VoucherItemGroupAccess `
+                    -AuthResult $authResult `
+                    -Data $bodyObj `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode `
+                    -RequireAuth $requireAuth
+
+                if (-not $itemAccessCheck.success) {
+                    Send-Response $response @{
+                        success   = $false
+                        errorCode = "ITEM_GROUP_ACCESS_VALIDATION_FAILED"
+                        error     = if ($itemAccessCheck.error) { $itemAccessCheck.error } else { "Could not validate Item Group Access." }
+                    } 500
+                    continue
+                }
+
+                if (-not $itemAccessCheck.allowed) {
+                    Send-Response $response @{
+                        success     = $false
+                        errorCode   = "ITEM_GROUP_ACCESS_DENIED"
+                        error       = "One or more Items are outside the Item Group branches allowed for this user and voucher type."
+                        deniedItems = @($itemAccessCheck.deniedItems)
+                    } 403
+                    continue
+                }
+
+                if ($null -ne $authResult -and $null -ne $authResult.user -and $authResult.user.name) {
                     $bodyObj | Add-Member -MemberType NoteProperty -Name "bridgeUserName" -Value $authResult.user.name -Force
                 }
 
@@ -770,6 +2078,10 @@ function Start-BUSYServer {
 
             # --- USER PERMISSIONS (db.bds OLEDB Integration) ---
             } elseif ($path -eq "/busy/permissions" -and $method -eq "GET") {
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    continue
+                }
                 $result = Get-UserPermissions -InstanceId $instanceId -CompanyCode $companyCode
 
             } elseif ($path -eq "/busy/permissions/my" -and $method -eq "GET") {
@@ -780,13 +2092,24 @@ function Start-BUSYServer {
                     if ($myPerm) {
                         $result = @{ success = $true; data = $myPerm }
                     } else {
-                        $result = @{ success = $true; data = @{ name = $activeName; C1=1;C2=1;C3=1;C4=1;C5=1;C6=1;C7=1;C8=1;C9=1;C10=1;I1=1;I2=1;I3=1;I4=1;I5=1;I6=1;I7=1;I8=1;I9=1;I10=1;I11=1;I12=1;I13=1;I14=1;I15=1;I16=1;I17=1;I18=1;I19=1;I20=1;I21=1;I22=1;B33=1;B34=1;M1="{}";M2="{}" } }
+                        $defaultPermissionValue = if (Test-IsPermissionAdminUser -User $authResult.user) { 1 } else { 0 }
+                        $result = @{ success = $true; data = @{
+                            name = $activeName
+                            C1=$defaultPermissionValue;C2=$defaultPermissionValue;C3=$defaultPermissionValue;C4=$defaultPermissionValue;C5=$defaultPermissionValue;C6=$defaultPermissionValue;C7=$defaultPermissionValue;C8=$defaultPermissionValue;C9=$defaultPermissionValue;C10=$defaultPermissionValue
+                            I1=$defaultPermissionValue;I2=$defaultPermissionValue;I3=$defaultPermissionValue;I4=$defaultPermissionValue;I5=$defaultPermissionValue;I6=$defaultPermissionValue;I7=$defaultPermissionValue;I8=$defaultPermissionValue;I9=$defaultPermissionValue;I10=$defaultPermissionValue;I11=$defaultPermissionValue;I12=$defaultPermissionValue;I13=$defaultPermissionValue;I14=$defaultPermissionValue;I15=$defaultPermissionValue;I16=$defaultPermissionValue;I17=$defaultPermissionValue;I18=$defaultPermissionValue;I19=$defaultPermissionValue;I20=$defaultPermissionValue;I21=$defaultPermissionValue;I22=$defaultPermissionValue
+                            B33=$defaultPermissionValue;B34=$defaultPermissionValue;M1="{}";M2="{}"
+                        } }
                     }
                 } else {
                     $result = $userRes
                 }
 
             } elseif ($path -eq "/busy/permissions/save" -and $method -eq "POST") {
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    continue
+                }
+
                 $data = Read-RequestBody $request | ConvertFrom-Json
                 $result = Save-UserPermissions -Data $data -InstanceId $instanceId -CompanyCode $companyCode
 
@@ -796,6 +2119,10 @@ function Start-BUSYServer {
                 }
 
             } elseif ($path -eq "/busy/users" -and $method -eq "GET") {
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    continue
+                }
                 $result = Get-CompanyUsers -InstanceId $instanceId -CompanyCode $companyCode
 
             # --- MASTER DATA ---
@@ -1165,7 +2492,7 @@ function Start-BUSYServer {
                 $showParentGroupVal = Get-QueryStringValue $request.QueryString "showParentGroup" "true"
 
                 $pageVal = Get-QueryStringValue $request.QueryString "page" "1"
-                $pageSizeVal = Get-QueryStringValue $request.QueryString "pageSize" "5000"
+                $pageSizeVal = Get-QueryStringValue $request.QueryString "pageSize" "100"
 
                 $safeLowStockLevel = 5.0
                 [double]::TryParse(
@@ -1179,10 +2506,18 @@ function Start-BUSYServer {
                 [int]::TryParse([string]$pageVal, [ref]$safePage) | Out-Null
                 if ($safePage -lt 1) { $safePage = 1 }
 
-                $safePageSize = 5000
+                # pageSize=0 means All.  Do not apply a hard-coded upper
+                # limit here; Get-StockStatusReport queries the real company
+                # item count and normalizes against that value.
+                $safePageSize = 100
                 [int]::TryParse([string]$pageSizeVal, [ref]$safePageSize) | Out-Null
-                if ($safePageSize -lt 1) { $safePageSize = 250 }
-                if ($safePageSize -gt 5000) { $safePageSize = 5000 }
+                if ($safePageSize -lt 0) { $safePageSize = 100 }
+
+                # Keep this log while validating server-side pagination. It proves
+                # that the browser actually sent the selected page and pageSize.
+                Write-Host (
+                    "  [STOCK-PAGING] requested page=$pageVal pageSize=$pageSizeVal -> page=$safePage pageSize=$safePageSize"
+                ) -ForegroundColor DarkCyan
 
                 $toBool = {
                     param([string]$Value, [bool]$Default)
@@ -1251,10 +2586,110 @@ function Start-BUSYServer {
                 $searchVal = Get-QueryStringValue $request.QueryString "search" ""
                 if ($searchVal -eq "") { $searchVal = Get-QueryStringValue $request.QueryString "params[search]" "" }
 
-                $result = Get-ItemsForVoucher `
-                    -Search      $searchVal `
-                    -InstanceId  $instanceId `
-                    -CompanyCode $companyCode
+                $pageVal = Get-QueryStringValue $request.QueryString "page" "1"
+                if ($pageVal -eq "") { $pageVal = Get-QueryStringValue $request.QueryString "params[page]" "1" }
+
+                $pageSizeVal = Get-QueryStringValue $request.QueryString "pageSize" "30"
+                if ($pageSizeVal -eq "") { $pageSizeVal = Get-QueryStringValue $request.QueryString "params[pageSize]" "30" }
+
+                $itemPage = 1
+                $itemPageSize = 30
+                [void][int]::TryParse([string]$pageVal, [ref]$itemPage)
+                [void][int]::TryParse([string]$pageSizeVal, [ref]$itemPageSize)
+                if ($itemPage -lt 1) { $itemPage = 1 }
+                if ($itemPageSize -lt 1) { $itemPageSize = 30 }
+                if ($itemPageSize -gt 30) { $itemPageSize = 30 }
+
+                $vchTypeVal = Get-QueryStringValue $request.QueryString "vchType" "0"
+                if ($vchTypeVal -eq "") { $vchTypeVal = Get-QueryStringValue $request.QueryString "params[vchType]" "0" }
+
+                $itemVchType = 0
+                [void][int]::TryParse([string]$vchTypeVal, [ref]$itemVchType)
+
+                # /busy/vouchers/items is the voucher picker endpoint. A normal
+                # authenticated user must send the active voucher type so the
+                # server can apply the correct M2.itemGroupCodes permission.
+                # Admins and trusted internal calls retain their existing path.
+                if (
+                    $requireAuth -and
+                    $itemVchType -le 0 -and
+                    -not (Test-IsPermissionAdminUser -User $authResult.user)
+                ) {
+                    Write-Host "  [ITEM ACCESS] user=$($authResult.user.name) vchType=0 -> fail closed" -ForegroundColor Yellow
+                    $result = @{ success=$true; total=0; data=@() }
+                }
+                else {
+                    $itemAccess = Get-ItemGroupAccessForAuthUser `
+                        -AuthResult $authResult `
+                        -VchType $itemVchType `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode `
+                        -RequireAuth $requireAuth
+
+                    $userNameForLog = ""
+                    if ($null -ne $authResult -and $null -ne $authResult.user) {
+                        $userNameForLog = [string]$authResult.user.name
+                    }
+
+                    Write-Host (
+                        "  [ITEM ACCESS] user={0} vchType={1} enforce={2} groups=[{3}] adminAll={4}" -f `
+                        $userNameForLog, `
+                        $itemVchType, `
+                        [bool]$itemAccess.enforce, `
+                        (@($itemAccess.groupCodes) -join ","), `
+                        [bool]$itemAccess.allItems
+                    ) -ForegroundColor DarkCyan
+
+                    if (
+                        $itemAccess.enforce -and
+                        -not [bool]$itemAccess.allItems -and
+                        @($itemAccess.groupCodes).Count -eq 0
+                    ) {
+                        $result = @{ success=$true; total=0; data=@() }
+                    }
+                    else {
+                        if (
+                            $itemAccess.enforce -and
+                            -not [bool]$itemAccess.allItems
+                        ) {
+                            # Item searching belongs in items.ps1. The route only
+                            # supplies the already-resolved permission group codes.
+                            #
+                            # Get-ItemsForVoucher applies the Item Group branch
+                            # restriction INSIDE its existing Master1 search before
+                            # TOP 30 is applied. This keeps the normal-user path as
+                            # close as possible to the already-fast admin path.
+                            $itemSearchStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+                            $result = Get-ItemsForVoucher `
+                                -Search $searchVal `
+                                -AllowedGroupCodes @($itemAccess.groupCodes) `
+                                -EnforceGroupAccess $true `
+                                -MaxResults $itemPageSize `
+                                -InstanceId $instanceId `
+                                -CompanyCode $companyCode
+
+                            $itemSearchStopwatch.Stop()
+
+                            Write-Host (
+                                "  [ITEM ACCESS RESULT] user={0} vchType={1} search='{2}' returned={3} elapsedMs={4} path=ITEMS_MODULE" -f `
+                                $userNameForLog, `
+                                $itemVchType, `
+                                $searchVal, `
+                                @($result.data).Count, `
+                                [int]$itemSearchStopwatch.ElapsedMilliseconds
+                            ) -ForegroundColor DarkGreen
+                        }
+                        else {
+                            # Admin / trusted internal path keeps the existing
+                            # BUSY search behavior, including stock enrichment.
+                            $result = Get-ItemsForVoucher `
+                                -Search      $searchVal `
+                                -InstanceId  $instanceId `
+                                -CompanyCode $companyCode
+                        }
+                    }
+                }
 
             } elseif ($path -eq "/busy/vouchers/item-cost" -and $method -eq "GET") {
                 # ---------------------------------------------------------
@@ -1371,6 +2806,36 @@ function Start-BUSYServer {
                 $data = Read-RequestBody $request | ConvertFrom-Json
                 if (-not $data.name -or -not $data.group) { $result = @{success=$false;error="name and group required"}; $response.StatusCode=400 } else { $result = Update-Item -Data $data -InstanceId $instanceId -CompanyCode $companyCode }
 
+            } elseif ($path -eq "/busy/item-group-access-tree" -and $method -eq "GET") {
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    continue
+                }
+
+                $result = Get-AllItemGroupPermissionNodes `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode
+
+            } elseif ($path -eq "/busy/account-access-tree" -and $method -eq "GET") {
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    continue
+                }
+
+                $result = Get-AllAccountPermissionNodes `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode
+
+            } elseif ($path -eq "/busy/party-account-groups" -and $method -eq "GET") {
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    continue
+                }
+
+                $result = Get-PartyAccountGroups `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode
+
             } elseif ($path -eq "/busy/parties" -and $method -eq "GET") {
                 $searchVal = Get-QueryStringValue $request.QueryString "search" ""
                 if ($searchVal -eq "") { $searchVal = Get-QueryStringValue $request.QueryString "params[search]" "" }
@@ -1385,13 +2850,103 @@ function Start-BUSYServer {
                 if ($cashBankVal -eq "") { $cashBankVal = Get-QueryStringValue $request.QueryString "params[cashBankOnly]" "false" }
                 $isCashBankOnly = ($cashBankVal -eq "true" -or $cashBankVal -eq "1")
 
-                $result = Get-Parties `
-                    -Search       $searchVal `
-                    -CashBankOnly $isCashBankOnly `
-                    -Page         ([int]$pageVal) `
-                    -PageSize     ([int]$pageSizeVal) `
-                    -InstanceId   $instanceId `
-                    -CompanyCode  $companyCode
+                $vchTypeVal = Get-QueryStringValue $request.QueryString "vchType" "0"
+                if ($vchTypeVal -eq "") { $vchTypeVal = Get-QueryStringValue $request.QueryString "params[vchType]" "0" }
+                $partyVchType = 0
+                [void][int]::TryParse([string]$vchTypeVal, [ref]$partyVchType)
+
+                # Normal authenticated users must never get the generic,
+                # unrestricted account list because vchType was accidentally
+                # omitted. Admin screens may still use the generic endpoint.
+                if (
+                    $requireAuth -and
+                    $partyVchType -le 0 -and
+                    $null -ne $authResult -and
+                    $null -ne $authResult.user -and
+                    -not (Test-IsPermissionAdminUser -User $authResult.user)
+                ) {
+                    $result = @{
+                        success    = $true
+                        total      = 0
+                        page       = ([int]$pageVal)
+                        pageSize   = ([int]$pageSizeVal)
+                        totalPages = 1
+                        data       = @()
+                    }
+                    Send-Response $response $result
+                    Write-Host "  [PARTY ACCESS] Blocked generic /busy/parties call for normal user because vchType was missing." -ForegroundColor Yellow
+                    continue
+                }
+
+                $activePartyUser = if ($null -ne $authResult -and $null -ne $authResult.user) { [string]$authResult.user.name } else { "internal" }
+
+                if (Test-IsDebitCreditAccessVoucherType -VchType $partyVchType) {
+                    $dcVal = Get-QueryStringValue $request.QueryString "dc" ""
+                    if ($dcVal -eq "") { $dcVal = Get-QueryStringValue $request.QueryString "params[dc]" "" }
+                    $dcVal = ([string]$dcVal).Trim().ToUpperInvariant()
+
+                    if (
+                        $requireAuth -and
+                        $null -ne $authResult -and
+                        $null -ne $authResult.user -and
+                        -not (Test-IsPermissionAdminUser -User $authResult.user) -and
+                        ($dcVal -ne "D" -and $dcVal -ne "C")
+                    ) {
+                        $result = @{ success=$true; total=0; page=([int]$pageVal); pageSize=([int]$pageSizeVal); totalPages=1; data=@() }
+                        Send-Response $response $result
+                        Write-Host "  [ACCOUNT SIDE ACCESS] Blocked Journal/Contra account request because dc=D/C was missing." -ForegroundColor Yellow
+                        continue
+                    }
+
+                    # Admins can request either side. If no dc is supplied for an
+                    # admin utility screen, default to Debit only because both
+                    # sides are unrestricted for admins anyway.
+                    if ($dcVal -ne "D" -and $dcVal -ne "C") { $dcVal = "D" }
+
+                    $sideAccess = Get-AccountSideAccessForAuthUser `
+                        -AuthResult $authResult `
+                        -VchType $partyVchType `
+                        -Dc $dcVal `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode `
+                        -RequireAuth $requireAuth
+
+                    Write-Host "  [ACCOUNT SIDE ACCESS] user=$activePartyUser vchType=$partyVchType dc=$dcVal groups=[$(@($sideAccess.groupCodes) -join ',')] accounts=[$(@($sideAccess.accountCodes) -join ',')] adminAll=$($sideAccess.allAccounts)" -ForegroundColor DarkCyan
+
+                    $result = Get-Parties `
+                        -Search       $searchVal `
+                        -CashBankOnly $isCashBankOnly `
+                        -Page         ([int]$pageVal) `
+                        -PageSize     ([int]$pageSizeVal) `
+                        -InstanceId   $instanceId `
+                        -CompanyCode  $companyCode `
+                        -AllowedGroupCodes @($sideAccess.groupCodes) `
+                        -AllowedAccountCodes @($sideAccess.accountCodes) `
+                        -EnforceAllAccountAccess ([bool]$sideAccess.enforce) `
+                        -AllowAllAccounts ([bool]$sideAccess.allAccounts)
+                }
+                else {
+                    $partyAccess = Get-PartyGroupAccessForAuthUser `
+                        -AuthResult $authResult `
+                        -VchType $partyVchType `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode `
+                        -RequireAuth $requireAuth
+
+                    $activePartyGroups = (@($partyAccess.groupCodes) -join ",")
+                    Write-Host "  [PARTY ACCESS] user=$activePartyUser vchType=$partyVchType enforce=$($partyAccess.enforce) groups=[$activePartyGroups] adminAll=$($partyAccess.allEligibleRoots)" -ForegroundColor DarkCyan
+
+                    $result = Get-Parties `
+                        -Search       $searchVal `
+                        -CashBankOnly $isCashBankOnly `
+                        -Page         ([int]$pageVal) `
+                        -PageSize     ([int]$pageSizeVal) `
+                        -InstanceId   $instanceId `
+                        -CompanyCode  $companyCode `
+                        -AllowedGroupCodes @($partyAccess.groupCodes) `
+                        -EnforceGroupAccess ([bool]$partyAccess.enforce) `
+                        -AllowAllEligibleRoots ([bool]$partyAccess.allEligibleRoots)
+                }
 
             } elseif ($path -eq "/busy/cash-bank-accounts" -and $method -eq "GET") {
                 $searchVal = Get-QueryStringValue $request.QueryString "search" ""
