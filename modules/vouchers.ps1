@@ -470,13 +470,160 @@ function Update-CheckListCreator {
     } catch {}
 }
 
+
+function Set-WebCreatedVoucherPendingApproval {
+    param(
+        $fi,
+        [int]$VchType,
+        [string]$VchNo,
+        [string]$UserName,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    # BUSY SaveVchFromXML can create a voucher with ApprovalStatus=1.
+    # For BusyWeb-created vouchers the required workflow is different:
+    #
+    #   BusyWeb create
+    #       -> Created By = BusyWeb user
+    #       -> Approval remains pending
+    #       -> Original BUSY approves later
+    #
+    # The live database diagnostic confirmed this relationship on Comp0003:
+    #   Tran1.ApprovalStatus = 1
+    #   CheckList.Action      = 1
+    #   CheckList.UserName    = BusyWeb user
+    #   CheckList.D2          = 1
+    #
+    # Therefore a BusyWeb CREATE keeps the creator/audit row, but resets the
+    # approval state to pending immediately after SaveVchFromXML succeeds.
+    #
+    # IMPORTANT:
+    # This helper is called on CREATE only. It does not interfere with a later
+    # approval performed from original BUSY.
+
+    if ([string]::IsNullOrWhiteSpace($VchNo)) {
+        return @{ success=$false; error="Voucher number is required to set pending approval." }
+    }
+
+    try {
+        $dbType = 0
+
+        if ($InstanceId -and $CompanyCode) {
+            $instance = Get-InstanceConfig -InstanceId $InstanceId
+
+            if ($null -ne $instance -and $null -ne $instance.dbType) {
+                $dbType = [int]$instance.dbType
+            }
+        }
+
+        $wildcard = if ($dbType -eq 1) { "%" } else { "*" }
+
+        $safeNo = $VchNo.Trim().ToLower() -replace "'", "''"
+        $vchCode = 0
+
+        $qry = @"
+SELECT VchCode
+FROM Tran1
+WHERE VchType=$VchType
+  AND VchNo LIKE '$wildcard$safeNo$wildcard'
+ORDER BY VchCode DESC
+"@
+
+        $rst = $fi.GetRecordset($qry)
+
+        if ($rst -and -not $rst.EOF) {
+            $rst.MoveFirst()
+            $vchCode = [int]$rst.Fields.Item("VchCode").Value
+            try { $rst.Close() } catch {}
+        }
+
+        if ($vchCode -le 0) {
+            return @{
+                success = $false
+                error = "Created voucher was saved, but its VchCode could not be resolved for pending approval."
+            }
+        }
+
+        # 1. BUSY approval state -> pending / not approved.
+        $fi.ExecuteQuery(
+            "UPDATE Tran1 SET ApprovalStatus=0 WHERE VchCode=$vchCode"
+        )
+
+        # 2. Preserve the BusyWeb creator in the ADD audit row.
+        #    D2=0 prevents the newly-created audit state from remaining marked
+        #    as approved. We intentionally leave D1 and Action untouched.
+        if (-not [string]::IsNullOrWhiteSpace($UserName)) {
+            $safeUser = $UserName -replace "'", "''"
+
+            $fi.ExecuteQuery(
+                "UPDATE CheckList SET UserName='$safeUser', D2=0 WHERE Code=$vchCode AND Action=1"
+            )
+        } else {
+            $fi.ExecuteQuery(
+                "UPDATE CheckList SET D2=0 WHERE Code=$vchCode AND Action=1"
+            )
+        }
+
+        # 3. Verify the persisted BUSY state before returning success.
+        $verify = $fi.GetRecordset(
+            "SELECT ApprovalStatus FROM Tran1 WHERE VchCode=$vchCode"
+        )
+
+        $approvalStatus = -1
+
+        if ($verify -and -not $verify.EOF) {
+            $verify.MoveFirst()
+            $approvalStatus = [int]$verify.Fields.Item("ApprovalStatus").Value
+            try { $verify.Close() } catch {}
+        }
+
+        if ($approvalStatus -ne 0) {
+            return @{
+                success = $false
+                error = "Voucher was created, but BUSY approval status could not be reset to pending."
+                vchCode = $vchCode
+                approvalStatus = $approvalStatus
+            }
+        }
+
+        Write-Host (
+            "   [WEB VOUCHER APPROVAL] CREATE pending: vchType={0} vchNo='{1}' vchCode={2} creator='{3}'" -f `
+            $VchType,
+            $VchNo,
+            $vchCode,
+            $UserName
+        ) -ForegroundColor Green
+
+        return @{
+            success = $true
+            vchCode = $vchCode
+            approvalStatus = 0
+        }
+    }
+    catch {
+        Write-Host (
+            "   [WEB VOUCHER APPROVAL ERROR] vchType={0} vchNo='{1}' error={2}" -f `
+            $VchType,
+            $VchNo,
+            $_.Exception.Message
+        ) -ForegroundColor Red
+
+        return @{
+            success = $false
+            error = $_.Exception.Message
+        }
+    }
+}
+
 # ═══════════════════════════════════════════════════════════════
 #  XML GENERATOR HELPERS
 # ═══════════════════════════════════════════════════════
 function Build-ItemsXml {
     param(
         $items,
-        [string]$defaultMC = "Main Store"
+        [string]$defaultMC = "Main Store",
+        [string]$salesmanName = ""
     )
 
     $culture = [System.Globalization.CultureInfo]::InvariantCulture
@@ -782,6 +929,15 @@ function Build-ItemsXml {
                 [string]$item.itemName
             )
         )</ItemName>"
+
+        if (-not [string]::IsNullOrWhiteSpace($salesmanName)) {
+            $xml += "<Broker>$(
+                [System.Security.SecurityElement]::Escape(
+                    [string]$salesmanName
+                )
+            )</Broker>"
+            $xml += "<BrokerInvolved>True</BrokerInvolved>"
+        }
 
         if ($item.itemType) {
             $xml += "<ItemType>$($item.itemType)</ItemType>"
@@ -1664,6 +1820,20 @@ function Build-VoucherXml {
     $totalAmt = ($Data.items | ForEach-Object { [double]$_.amount } | Measure-Object -Sum).Sum
     $inputType = if ($Data.inputType) { [int]$Data.inputType } else { 1 }
 
+    $usesSalesman = @(26, 12, 9, 3) -contains $VchType
+    $salesmanName = ""
+    $salesmanCode = 0
+
+    if ($usesSalesman) {
+        try { $salesmanName = ([string]$Data.salesmanName).Trim() } catch {}
+        try {
+            if ($null -ne $Data.salesmanCode) {
+                $salesmanCode = [int]$Data.salesmanCode
+            }
+        }
+        catch { $salesmanCode = 0 }
+    }
+
     # ------------------------------------------------------------
     # Challan types require BUSY TranType = 3.
     #
@@ -1797,6 +1967,11 @@ else {
 
 $xml += "<TranCurName>Rs.</TranCurName>"
 
+    if ($usesSalesman -and -not [string]::IsNullOrWhiteSpace($salesmanName)) {
+        $xml += "<BrokerInvolved>True</BrokerInvolved>"
+        $xml += "<BrokerName>$([System.Security.SecurityElement]::Escape($salesmanName))</BrokerName>"
+    }
+
     $xml += "<InputType>$inputType</InputType>"
     $xml += "<BillingDetails><PartyName>$([System.Security.SecurityElement]::Escape($Data.party))</PartyName></BillingDetails>"
     
@@ -1884,7 +2059,8 @@ else {
     # Existing behaviour for Sales / Purchase / Challan etc.
     $xml += Build-ItemsXml `
         -items $Data.items `
-        -defaultMC $matCentre
+        -defaultMC $matCentre `
+        -salesmanName $salesmanName
 }
     $xml += Build-BillSundriesXml -billSundries $Data.billSundries
 
@@ -1963,6 +2139,10 @@ else {
         $xml += "<CCAccName1>$([System.Security.SecurityElement]::Escape($cc1Acc))</CCAccName1>"
         $xml += "<CCAccName2>$([System.Security.SecurityElement]::Escape($cc2Acc))</CCAccName2>"
         $xml += "</POSVchData>"
+    }
+
+    if ($usesSalesman -and $salesmanCode -gt 0) {
+        $xml += "<tmpBrokerCode>$salesmanCode</tmpBrokerCode>"
     }
 
     $xml += "</$root>"
@@ -3688,8 +3868,32 @@ function Create-Voucher {
                 return @{ success=$false; error=if ($errMsg) { $errMsg } else { 'Unknown BUSY error' } }
             }
 
-            if ($Data.bridgeUserName) {
-                Update-CheckListCreator -fi $fi -VchType $vchType -VchNo $vchNo -VchDate $Data.date -UserName $Data.bridgeUserName -InstanceId $InstanceId -CompanyCode $CompanyCode
+            # BusyWeb must CREATE the voucher, but must NOT approve it.
+            # Original BUSY will perform the approval later.
+            $pendingApprovalResult = Set-WebCreatedVoucherPendingApproval `
+                -fi $fi `
+                -VchType $vchType `
+                -VchNo $vchNo `
+                -UserName ([string]$Data.bridgeUserName) `
+                -InstanceId $InstanceId `
+                -CompanyCode $CompanyCode
+
+            if (-not $pendingApprovalResult.success) {
+                # The voucher already exists in BUSY at this point, so return an
+                # explicit partial-success error instead of silently pretending
+                # that its approval state is correct.
+                return @{
+                    success = $false
+                    created = $true
+                    error = "Voucher was created in BUSY, but BusyWeb could not leave it pending for approval. Do not create it again. Details: $($pendingApprovalResult.error)"
+                    data = @{
+                        vchType = $vchType
+                        vchSeries = $seriesName
+                        vchNo = $vchNo
+                        date = $Data.date
+                        vchCode = $pendingApprovalResult.vchCode
+                    }
+                }
             }
 
             Clear-StockCaches -InstanceId $InstanceId -CompanyCode $CompanyCode
@@ -6270,6 +6474,25 @@ WHERE MasterType = 6
         $stptName = ""
         try { if ($root.STPTName) { $stptName = ([string]$root.STPTName).Trim() } } catch {}
 
+        $salesmanName = ""
+        $salesmanCode = 0
+
+        if (@(26, 12, 9, 3) -contains $VchType) {
+            try {
+                if ($root.BrokerName) {
+                    $salesmanName = ([string]$root.BrokerName).Trim()
+                }
+            }
+            catch {}
+
+            try {
+                if ($root.tmpBrokerCode) {
+                    $salesmanCode = [int]$root.tmpBrokerCode
+                }
+            }
+            catch { $salesmanCode = 0 }
+        }
+
         $matCentre = ""
         $party = ""
         $bomName = ""
@@ -6560,6 +6783,8 @@ WHERE MasterType = 6
 
                 saleType         = $stptName
                 purchaseType     = $stptName
+                salesmanName     = $salesmanName
+                salesmanCode     = $salesmanCode
                 narration        = $narration
                 supplierBillNo   = $supplierBillNo
                 items            = @($items)

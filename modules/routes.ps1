@@ -557,6 +557,149 @@ WHERE [Name] = @userName
     }
 }
 
+
+function Get-NewPermissionProfileDefaultAccess {
+    param(
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    # NEW profiles start with full branch access for:
+    # - Party Account Groups
+    # - Item Groups
+    # - Journal/Contra Debit Account Groups
+    # - Journal/Contra Credit Account Groups
+    #
+    # Voucher Add/Modify permissions remain separate and are not enabled here.
+
+    $partyResult = Get-PartyAccountGroups `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $partyResult.success) {
+        return @{
+            success = $false
+            error = "Could not load Party Account Group roots: $($partyResult.error)"
+        }
+    }
+
+    $itemResult = Get-AllItemGroupPermissionNodes `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $itemResult.success) {
+        return @{
+            success = $false
+            error = "Could not load Item Group roots: $($itemResult.error)"
+        }
+    }
+
+    $accountResult = Get-AllAccountPermissionNodes `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $accountResult.success) {
+        return @{
+            success = $false
+            error = "Could not load Chart of Accounts roots: $($accountResult.error)"
+        }
+    }
+
+    $partyRootCodes = @(
+        @($partyResult.data) |
+        ForEach-Object { [int]$_.rootCode } |
+        Where-Object { $_ -gt 0 } |
+        Sort-Object -Unique
+    )
+
+    $itemRootCodes = @(
+        @($itemResult.data) |
+        ForEach-Object { [int]$_.rootCode } |
+        Where-Object { $_ -gt 0 } |
+        Sort-Object -Unique
+    )
+
+    $accountRootCodes = @(
+        @($accountResult.data) |
+        ForEach-Object { [int]$_.rootCode } |
+        Where-Object { $_ -gt 0 } |
+        Sort-Object -Unique
+    )
+
+    if ($partyRootCodes.Count -eq 0) {
+        return @{ success = $false; error = "No eligible Party Account Group roots were found." }
+    }
+
+    if ($itemRootCodes.Count -eq 0) {
+        return @{ success = $false; error = "No Item Group roots were found." }
+    }
+
+    if ($accountRootCodes.Count -eq 0) {
+        return @{ success = $false; error = "No Chart of Accounts roots were found." }
+    }
+
+    $permissionMap = [ordered]@{}
+
+    $partyVoucherTypes = @(9, 26, 12, 11, 3, 14, 2, 27, 13, 4, 10, 19)
+    $itemVoucherTypes = @(9, 2, 12, 13, 26, 27, 3, 10, 11, 4)
+    $debitCreditVoucherTypes = @(15, 16)
+
+    foreach ($vchType in $partyVoucherTypes) {
+        $key = [string]$vchType
+
+        if (-not $permissionMap.Contains($key)) {
+            $permissionMap[$key] = [ordered]@{}
+        }
+
+        $permissionMap[$key]["partyGroupCodes"] = @($partyRootCodes)
+    }
+
+    foreach ($vchType in $itemVoucherTypes) {
+        $key = [string]$vchType
+
+        if (-not $permissionMap.Contains($key)) {
+            $permissionMap[$key] = [ordered]@{}
+        }
+
+        $permissionMap[$key]["itemGroupCodes"] = @($itemRootCodes)
+    }
+
+    foreach ($vchType in $debitCreditVoucherTypes) {
+        $key = [string]$vchType
+
+        if (-not $permissionMap.Contains($key)) {
+            $permissionMap[$key] = [ordered]@{}
+        }
+
+        $permissionMap[$key]["debitGroupCodes"] = @($accountRootCodes)
+        $permissionMap[$key]["creditGroupCodes"] = @($accountRootCodes)
+
+        # Current Journal/Contra model is GROUP-ONLY.
+        $permissionMap[$key]["debitAccountCodes"] = @()
+        $permissionMap[$key]["creditAccountCodes"] = @()
+    }
+
+    $m2Json = $permissionMap | ConvertTo-Json -Depth 20 -Compress
+
+    Write-Host (
+        "   [PERMISSION DEFAULT ACCESS] company={0} partyRoots={1} itemRoots={2} accountRoots={3}" -f `
+        $CompanyCode,
+        $partyRootCodes.Count,
+        $itemRootCodes.Count,
+        $accountRootCodes.Count
+    ) -ForegroundColor Green
+
+    return @{
+        success = $true
+        data = @{
+            M2 = $m2Json
+            partyRootCodes = @($partyRootCodes)
+            itemRootCodes = @($itemRootCodes)
+            accountRootCodes = @($accountRootCodes)
+        }
+    }
+}
+
 function Get-ItemGroupAccessForAuthUser {
     param(
         $AuthResult,
@@ -1350,6 +1493,33 @@ function Start-BUSYServer {
             } elseif ($path -eq "/busy/voucher" -and $method -eq "POST") {
                 $bodyObj = Read-RequestBody $request | ConvertFrom-Json
 
+                $salesmanCheck = Apply-SalesmanAssignmentToVoucherData `
+                    -AuthResult $authResult `
+                    -Data $bodyObj `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode `
+                    -RequireAuth $requireAuth
+
+                if (-not $salesmanCheck.success) {
+                    Send-Response $response @{
+                        success   = $false
+                        errorCode = "SALESMAN_VALIDATION_FAILED"
+                        error     = if ($salesmanCheck.error) { $salesmanCheck.error } else { "Could not validate Salesman assignment." }
+                    } 500
+                    continue
+                }
+
+                if (-not $salesmanCheck.allowed) {
+                    Send-Response $response @{
+                        success   = $false
+                        errorCode = if ($salesmanCheck.errorCode) { $salesmanCheck.errorCode } else { "SALESMAN_ACCESS_DENIED" }
+                        error     = if ($salesmanCheck.error) { $salesmanCheck.error } else { "Salesman access denied." }
+                    } 403
+                    continue
+                }
+
+                $bodyObj = $salesmanCheck.data
+
                 $partyAccessCheck = Test-VoucherPartyAccountAccess `
                     -AuthResult $authResult `
                     -Data $bodyObj `
@@ -1561,6 +1731,33 @@ function Start-BUSYServer {
 
             } elseif ($path -eq "/busy/voucher/modify" -and $method -eq "POST") {
                 $bodyObj = Read-RequestBody $request | ConvertFrom-Json
+
+                $salesmanCheck = Apply-SalesmanAssignmentToVoucherData `
+                    -AuthResult $authResult `
+                    -Data $bodyObj `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode `
+                    -RequireAuth $requireAuth
+
+                if (-not $salesmanCheck.success) {
+                    Send-Response $response @{
+                        success   = $false
+                        errorCode = "SALESMAN_VALIDATION_FAILED"
+                        error     = if ($salesmanCheck.error) { $salesmanCheck.error } else { "Could not validate Salesman assignment." }
+                    } 500
+                    continue
+                }
+
+                if (-not $salesmanCheck.allowed) {
+                    Send-Response $response @{
+                        success   = $false
+                        errorCode = if ($salesmanCheck.errorCode) { $salesmanCheck.errorCode } else { "SALESMAN_ACCESS_DENIED" }
+                        error     = if ($salesmanCheck.error) { $salesmanCheck.error } else { "Salesman access denied." }
+                    } 403
+                    continue
+                }
+
+                $bodyObj = $salesmanCheck.data
 
                 $partyAccessCheck = Test-VoucherPartyAccountAccess `
                     -AuthResult $authResult `
@@ -2102,6 +2299,21 @@ function Start-BUSYServer {
                     }
                 } else {
                     $result = $userRes
+                }
+
+            } elseif ($path -eq "/busy/permissions/default-access" -and $method -eq "GET") {
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    continue
+                }
+
+                $result = Get-NewPermissionProfileDefaultAccess `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode
+
+                if ($result.success -eq $false) {
+                    Send-Response $response $result 500
+                    continue
                 }
 
             } elseif ($path -eq "/busy/permissions/save" -and $method -eq "POST") {
@@ -2962,6 +3174,8 @@ function Start-BUSYServer {
                 $result = Get-TaxCategories -InstanceId $instanceId -CompanyCode $companyCode
             } elseif ($path -eq "/busy/bill-sundries" -and $method -eq "GET") {
                 $result = Get-BillSundries -InstanceId $instanceId -CompanyCode $companyCode
+            } elseif ($path -eq "/busy/salesmen" -and $method -eq "GET") {
+                $result = Get-Salesmen -InstanceId $instanceId -CompanyCode $companyCode
             } elseif ($path -eq "/busy/material-centers" -and $method -eq "GET") {
                 $result = Get-MaterialCenters -InstanceId $instanceId -CompanyCode $companyCode
 

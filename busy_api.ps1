@@ -14,7 +14,6 @@ param(
 $moduleDir = Join-Path $PSScriptRoot "modules"
 
 function Load-Module {
-
     param(
         [Parameter(Mandatory = $true)]
         [string]$Name
@@ -23,11 +22,9 @@ function Load-Module {
     $modulePath = Join-Path $moduleDir $Name
 
     if (-not (Test-Path $modulePath)) {
-
         Write-Host `
             "  [ERROR] Module not found: $modulePath" `
             -ForegroundColor Red
-
         exit 1
     }
 
@@ -61,6 +58,11 @@ Write-Host "  Loaded: items.ps1" -ForegroundColor Gray
 
 . (Load-Module "accounts.ps1")
 Write-Host "  Loaded: accounts.ps1" -ForegroundColor Gray
+
+# Salesman / Sales Ref master and per-user assignment logic.
+# BUSY stores Salesman records as Master1.MasterType = 19.
+. (Load-Module "salesman.ps1")
+Write-Host "  Loaded: salesman.ps1" -ForegroundColor Gray
 
 
 # ============================================================
@@ -177,7 +179,6 @@ Write-Host "  Loaded: routes.ps1" -ForegroundColor Gray
 # ============================================================
 
 $requiredFunctions = @(
-
     # Reports
     "Get-OutstandingReport",
     "Get-StockStatusReport",
@@ -185,6 +186,12 @@ $requiredFunctions = @(
     # Item / Voucher
     "Get-VoucherItemDetail",
     "Create-Voucher",
+
+    # Salesman / Sales Ref
+    "Get-Salesmen",
+    "Get-SalesmanAssignmentForAuthUser",
+    "Resolve-LiveSalesmanMaster",
+    "Apply-SalesmanAssignmentToVoucherData",
 
     # BOM Master
     "Get-BomList",
@@ -200,13 +207,10 @@ $requiredFunctions = @(
 )
 
 foreach ($functionName in $requiredFunctions) {
-
     if (-not (Get-Command $functionName -ErrorAction SilentlyContinue)) {
-
         Write-Host `
             "  [ERROR] Required function was not loaded: $functionName" `
             -ForegroundColor Red
-
         exit 1
     }
 }

@@ -536,8 +536,18 @@ function Get-CashBankAccounts {
 #   MasterType = 2 -> Account
 #   ParentGrp       -> parent Account Group Code
 #
-# Only the three exact BUSY roots below are eligible. Similar sibling groups
-# (for example "Sundry Debtors-Priyanwadh") are intentionally excluded.
+# Only the three built-in BUSY party roots are eligible:
+#   Code 111 -> Cash-in-hand
+#   Code 116 -> original BUSY group "Sundry Debtors"
+#   Code 117 -> original BUSY group "Sundry Creditors"
+#
+# IMPORTANT:
+# BUSY allows these built-in group captions to be renamed (for example
+# "Sundry Debtors" -> "Account Receivables" and "Sundry Creditors" ->
+# "Accounts Payables"). Therefore Party permissions MUST identify these
+# roots by their stable BUSY system Code, not by the current Name/caption.
+#
+# Similar custom sibling groups are intentionally excluded.
 
 function Get-PartyGroupNormalizedName {
     param([string]$Name)
@@ -608,14 +618,10 @@ ORDER BY Name
 function Get-PartyPermissionTreeInfo {
     param([array]$Groups)
 
-    $acceptedRootNames = @(
-        "sundry debtor",
-        "sundry debtors",
-        "sundry creditor",
-        "sundry creditors",
-        "cash in hand",
-        "cash in hands"
-    )
+    # Stable BUSY system root identities. Do not match these by Name:
+    # users can change the visible captions in BUSY while the system Codes
+    # remain the identity of the original built-in groups.
+    $partyRootCodes = @(111, 116, 117)
 
     $groupByCode = @{}
     $childrenByParent = @{}
@@ -634,7 +640,7 @@ function Get-PartyPermissionTreeInfo {
     $roots = @(
         @($Groups) |
         Where-Object {
-            $acceptedRootNames -contains (Get-PartyGroupNormalizedName ([string]$_.name))
+            $partyRootCodes -contains [int]$_.code
         }
     )
 
@@ -1081,58 +1087,11 @@ function Get-AllAccountPermissionNodes {
             }
         }
 
-        $qry = @"
-SELECT
-    Code,
-    Name,
-    Alias,
-    ParentGrp
-FROM Master1
-WHERE MasterType = 2
-ORDER BY Name
-"@
-
-        $rst = $fi.GetRecordset($qry)
-
-        if ($rst -and -not $rst.EOF) {
-            try { $rst.MoveFirst() } catch {}
-
-            while (-not $rst.EOF) {
-                $codeValue = $rst.Fields.Item("Code").Value
-                $nameValue = $rst.Fields.Item("Name").Value
-                $aliasValue = $rst.Fields.Item("Alias").Value
-                $parentValue = $rst.Fields.Item("ParentGrp").Value
-
-                $code = if ($codeValue -ne [System.DBNull]::Value) { [int][string]$codeValue } else { 0 }
-                $name = if ($nameValue -ne [System.DBNull]::Value) { ([string]$nameValue).Trim() } else { "" }
-                $alias = if ($aliasValue -ne [System.DBNull]::Value) { ([string]$aliasValue).Trim() } else { "" }
-                $parentCode = if ($parentValue -ne [System.DBNull]::Value) { [int][string]$parentValue } else { 0 }
-
-                if ($code -gt 0) {
-                    $groupPath = @(& $resolveGroupPath $parentCode)
-                    $root = if ($groupPath.Count -gt 0) { $groupPath[0] } else { $null }
-                    $pathNames = @($groupPath | ForEach-Object { [string]$_.name }) + @($name)
-
-                    $nodes += @{
-                        rootCode   = if ($null -ne $root) { [int]$root.code } else { $parentCode }
-                        rootName   = if ($null -ne $root) { [string]$root.name } else { "" }
-                        nodeType   = "ACCOUNT"
-                        code       = $code
-                        name       = $name
-                        alias      = $alias
-                        parentCode = $parentCode
-                        level      = $groupPath.Count
-                        pathText   = ($pathNames -join " > ")
-                    }
-                }
-
-                $rst.MoveNext()
-            }
-
-            try { $rst.Close() } catch {}
-        }
-
-        $nodes = @($nodes | Sort-Object pathText, nodeType, name)
+        # Journal / Contra permissions are GROUP-ONLY.
+        # Do not enumerate every MasterType=2 ledger account here. The old
+        # implementation loaded every ledger through BUSY COM even though the
+        # frontend immediately discarded ACCOUNT nodes.
+        $nodes = @($nodes | Sort-Object pathText, name)
 
         return @{
             success = $true
