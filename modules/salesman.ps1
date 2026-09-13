@@ -25,35 +25,139 @@ function Get-Salesmen {
     )
 
     $cacheKey = "$InstanceId|$CompanyCode|salesmen"
-    $cached = Get-Cache $cacheKey
-    if ($cached) { return $cached }
 
-    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
-    if (-not $fi) {
-        return @{ success = $false; error = "BUSY connection failed" }
+    # Reuse the application's existing cache first.
+    $cached = Get-Cache $cacheKey
+    if ($cached) {
+        Write-Host (
+            "  [SALESMEN-FAST] cache HIT {0}/{1} rows={2}" -f
+            $InstanceId,
+            $CompanyCode,
+            @($cached.data).Count
+        ) -ForegroundColor DarkCyan
+
+        return $cached
     }
 
+    $startedAt = Get-Date
+    $ctx = $null
+    $reader = $null
+
     try {
-        $qry = "SELECT Name, Code, Alias FROM Master1 WHERE MasterType = 19 ORDER BY Name"
-        $rst = $fi.GetRecordset($qry)
+        # IMPORTANT:
+        # Do not call Connect-BUSY here.
+        #
+        # This endpoint is read-only master-data loading. BUSY COM/OpenCSDB
+        # can take tens of seconds to initialize and blocks the PowerShell API
+        # loop while it is connecting.
+        #
+        # Use the shared direct fiscal database resolver that is already used
+        # by the optimized voucher settings / approvals code.
+        $resolver = Get-Command `
+            Get-BusyCloudFastConfigDbContext `
+            -ErrorAction SilentlyContinue
 
-        $salesmen = Read-Recordset $rst {
-            param($r)
+        if ($null -eq $resolver) {
+            throw (
+                "Fast fiscal database resolver is unavailable. " +
+                "Make sure the optimized vch_setting.ps1 is installed."
+            )
+        }
 
+        $ctx = Get-BusyCloudFastConfigDbContext `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        if (
+            $null -eq $ctx -or
+            $null -eq $ctx.connection
+        ) {
+            throw "Direct fiscal database connection is unavailable."
+        }
+
+        $conn = $ctx.connection
+
+        $cmd = $conn.CreateCommand()
+
+        try {
+            $cmd.CommandTimeout = 5
+        }
+        catch {
+        }
+
+        # BUSY Salesman / Sales Ref is stored as Broker master rows.
+        $cmd.CommandText = @"
+SELECT
+    Code,
+    Name,
+    Alias
+FROM Master1
+WHERE MasterType = 19
+ORDER BY Name
+"@
+
+        $reader = $cmd.ExecuteReader()
+
+        $salesmen = @()
+
+        while ($reader.Read()) {
+            $code = 0
+            $name = ""
             $alias = ""
+
             try {
-                $rawAlias = $r.Fields.Item("Alias").Value
-                if ($null -ne $rawAlias -and $rawAlias -ne [System.DBNull]::Value) {
-                    $alias = ([string]$rawAlias).Trim()
+                if (-not $reader.IsDBNull(0)) {
+                    $code = [int]$reader.GetValue(0)
                 }
             }
-            catch {}
-
-            @{
-                code  = [int][string]$r.Fields.Item("Code").Value
-                name  = ([string]$r.Fields.Item("Name").Value).Trim()
-                alias = $alias
+            catch {
+                $code = 0
             }
+
+            try {
+                if (-not $reader.IsDBNull(1)) {
+                    $name = ([string]$reader.GetValue(1)).Trim()
+                }
+            }
+            catch {
+                $name = ""
+            }
+
+            try {
+                if (-not $reader.IsDBNull(2)) {
+                    $alias = ([string]$reader.GetValue(2)).Trim()
+                }
+            }
+            catch {
+                $alias = ""
+            }
+
+            if (
+                $code -gt 0 -and
+                -not [string]::IsNullOrWhiteSpace($name)
+            ) {
+                $salesmen += @{
+                    code  = $code
+                    name  = $name
+                    alias = $alias
+                }
+            }
+        }
+
+        if ($reader) {
+            try {
+                $reader.Close()
+            }
+            catch {
+            }
+
+            try {
+                $reader.Dispose()
+            }
+            catch {
+            }
+
+            $reader = $null
         }
 
         $result = @{
@@ -62,17 +166,77 @@ function Get-Salesmen {
             data    = @($salesmen)
         }
 
+        # Keep the exact existing cache behavior.
         if (@($salesmen).Count -gt 0) {
             Set-Cache $cacheKey $result
         }
 
+        $elapsedMs = [int](
+            ((Get-Date) - $startedAt).TotalMilliseconds
+        )
+
+        Write-Host (
+            "  [SALESMEN-FAST] {0}/{1} db={2} rows={3} elapsedMs={4}" -f
+            $InstanceId,
+            $CompanyCode,
+            [string]$ctx.database,
+            @($salesmen).Count,
+            $elapsedMs
+        ) -ForegroundColor DarkCyan
+
         return $result
     }
     catch {
-        return @{ success = $false; error = $_.Exception.Message }
+        $elapsedMs = [int](
+            ((Get-Date) - $startedAt).TotalMilliseconds
+        )
+
+        Write-Host (
+            "  [SALESMEN-FAST FAIL] {0}/{1} elapsedMs={2} error={3}" -f
+            $InstanceId,
+            $CompanyCode,
+            $elapsedMs,
+            $_.Exception.Message
+        ) -ForegroundColor Red
+
+        # Fail quickly instead of falling back to Connect-BUSY and freezing
+        # the whole API process for tens of seconds.
+        return @{
+            success = $false
+            error   = $_.Exception.Message
+        }
     }
     finally {
-        Disconnect-BUSY $fi
+        if ($reader) {
+            try {
+                $reader.Close()
+            }
+            catch {
+            }
+
+            try {
+                $reader.Dispose()
+            }
+            catch {
+            }
+        }
+
+        if (
+            $ctx -and
+            $ctx.connection
+        ) {
+            try {
+                $ctx.connection.Close()
+            }
+            catch {
+            }
+
+            try {
+                $ctx.connection.Dispose()
+            }
+            catch {
+            }
+        }
     }
 }
 
