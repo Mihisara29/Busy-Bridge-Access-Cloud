@@ -492,6 +492,157 @@ function Resolve-VoucherAllowedItemGroupCodes {
 # Returns only the information required by the dropdown:
 # code, name, total stock, and material-centre stock.
 # ═══════════════════════════════════════════════════════
+
+# Direct-DB equivalent of the existing voucher item-group hierarchy loader.
+# It deliberately keeps the SAME 5-minute hierarchy TTL as the original logic.
+function Get-VoucherItemGroupHierarchyDirect {
+    param(
+        $Connection,
+        [string]$InstanceId  = "",
+        [string]$CompanyCode = ""
+    )
+
+    $cacheKey = "$InstanceId|$CompanyCode".ToLowerInvariant()
+    $now = [DateTime]::UtcNow
+
+    if ($script:VoucherItemGroupHierarchyCache.ContainsKey($cacheKey)) {
+        $cached = $script:VoucherItemGroupHierarchyCache[$cacheKey]
+
+        if (
+            $null -ne $cached -and
+            $null -ne $cached.expiresAt -and
+            $cached.expiresAt -gt $now
+        ) {
+            return $cached
+        }
+
+        $script:VoucherItemGroupHierarchyCache.Remove($cacheKey)
+    }
+
+    $validCodes = @{}
+    $childrenByParent = @{}
+    $reader = $null
+    $cmd = $null
+
+    try {
+        $cmd = $Connection.CreateCommand()
+        try { $cmd.CommandTimeout = 5 } catch {}
+
+        $cmd.CommandText = @"
+SELECT
+    Code,
+    ParentGrp
+FROM Master1
+WHERE MasterType = 5
+"@
+
+        $reader = $cmd.ExecuteReader()
+
+        while ($reader.Read()) {
+            $code = 0
+            $parentCode = 0
+
+            try {
+                if (-not $reader.IsDBNull(0)) {
+                    $code = [int][string]$reader.GetValue(0)
+                }
+            }
+            catch {}
+
+            try {
+                if (-not $reader.IsDBNull(1)) {
+                    $parentCode = [int][string]$reader.GetValue(1)
+                }
+            }
+            catch {}
+
+            if ($code -gt 0) {
+                $validCodes[$code] = $true
+
+                if (-not $childrenByParent.ContainsKey($parentCode)) {
+                    $childrenByParent[$parentCode] =
+                        [System.Collections.Generic.List[int]]::new()
+                }
+
+                $childrenByParent[$parentCode].Add($code)
+            }
+        }
+    }
+    finally {
+        if ($reader) {
+            try { $reader.Close() } catch {}
+            try { $reader.Dispose() } catch {}
+        }
+
+        if ($cmd) {
+            try { $cmd.Dispose() } catch {}
+        }
+    }
+
+    $entry = @{
+        validCodes       = $validCodes
+        childrenByParent = $childrenByParent
+        expiresAt        = $now.AddMinutes(5)
+    }
+
+    $script:VoucherItemGroupHierarchyCache[$cacheKey] = $entry
+    return $entry
+}
+
+function Resolve-VoucherAllowedItemGroupCodesDirect {
+    param(
+        $Connection,
+        [int[]]$AllowedGroupCodes,
+        [string]$InstanceId  = "",
+        [string]$CompanyCode = ""
+    )
+
+    $hierarchy = Get-VoucherItemGroupHierarchyDirect `
+        -Connection $Connection `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    $resolved = @{}
+    $queue = [System.Collections.Generic.Queue[int]]::new()
+
+    foreach ($rawCode in @($AllowedGroupCodes)) {
+        $code = 0
+
+        if (
+            [int]::TryParse([string]$rawCode, [ref]$code) -and
+            $code -gt 0 -and
+            $hierarchy.validCodes.ContainsKey($code) -and
+            -not $resolved.ContainsKey($code)
+        ) {
+            $resolved[$code] = $true
+            $queue.Enqueue($code)
+        }
+    }
+
+    while ($queue.Count -gt 0) {
+        $parentCode = $queue.Dequeue()
+
+        if (-not $hierarchy.childrenByParent.ContainsKey($parentCode)) {
+            continue
+        }
+
+        foreach ($childCode in $hierarchy.childrenByParent[$parentCode]) {
+            $child = [int]$childCode
+
+            if (-not $resolved.ContainsKey($child)) {
+                $resolved[$child] = $true
+                $queue.Enqueue($child)
+            }
+        }
+    }
+
+    return @(
+        $resolved.Keys |
+        ForEach-Object { [int]$_ } |
+        Sort-Object
+    )
+}
+
 function Get-ItemsForVoucher {
     param(
         [string]$Search      = "",
@@ -502,8 +653,7 @@ function Get-ItemsForVoucher {
         [int]$MaxResults = 0
     )
 
-    # Preserve the old admin behavior by default (30 blank / 20 while typing).
-    # Permission-controlled voucher searches explicitly pass MaxResults=30.
+    # Preserve the exact original dropdown limits.
     $limit = if ($MaxResults -gt 0) {
         [Math]::Max(1, [Math]::Min(30, $MaxResults))
     }
@@ -514,44 +664,45 @@ function Get-ItemsForVoucher {
         20
     }
 
-    $fi = Connect-BUSY `
-        -InstanceId $InstanceId `
-        -CompanyCode $CompanyCode
-
-    if (-not $fi) {
-        return @{
-            success = $false
-            error   = "BUSY connection failed"
-        }
-    }
+    $startedAt = [System.Diagnostics.Stopwatch]::StartNew()
+    $ctx = $null
+    $reader = $null
+    $cmd = $null
 
     try {
-        # Detect SQL Server or Access wildcard syntax.
-        $dbType = 0
+        # PERFORMANCE CHANGE ONLY:
+        # Replace Connect-BUSY/GetRecordset with a direct connection to the
+        # same active fiscal database. The item/stock SQL below is intentionally
+        # kept equivalent to the original function.
+        $resolver = Get-Command `
+            Get-BusyCloudFastConfigDbContext `
+            -ErrorAction SilentlyContinue
 
-        if ($null -ne $script:ActiveConnection) {
-            $instance = Get-InstanceConfig `
-                -InstanceId $script:ActiveInstanceId
-
-            if (
-                $null -ne $instance -and
-                $null -ne $instance.dbType
-            ) {
-                $dbType = [int]$instance.dbType
-            }
+        if ($null -eq $resolver) {
+            throw "Fast fiscal database resolver is unavailable."
         }
 
+        $ctx = Get-BusyCloudFastConfigDbContext `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        if (
+            $null -eq $ctx -or
+            $null -eq $ctx.connection
+        ) {
+            throw "Direct fiscal database connection is unavailable."
+        }
+
+        $conn = $ctx.connection
+        $dbType = [int]$ctx.dbType
         $wildcard = if ($dbType -eq 1) { "%" } else { "*" }
 
         $where = "Master1.MasterType = 6"
 
         if ($EnforceGroupAccess) {
-            # Permission filtering is part of the SAME item query used by the
-            # existing fast dropdown. We expand only the small Item Group tree,
-            # then query Master1 for matching items inside those groups.
             $resolvedGroupCodes = @(
-                Resolve-VoucherAllowedItemGroupCodes `
-                    -Fi $fi `
+                Resolve-VoucherAllowedItemGroupCodesDirect `
+                    -Connection $conn `
                     -AllowedGroupCodes @($AllowedGroupCodes) `
                     -InstanceId $InstanceId `
                     -CompanyCode $CompanyCode
@@ -584,7 +735,7 @@ function Get-ItemsForVoucher {
 "@
         }
 
-        # Only retrieve code and name for the dropdown.
+        # Same item query as the original function.
         $itemQuery = @"
 SELECT TOP $limit
     Master1.Code,
@@ -595,47 +746,42 @@ WHERE $where
 ORDER BY Master1.Name
 "@
 
-        $rst = $fi.GetRecordset($itemQuery)
+        $cmd = $conn.CreateCommand()
+        try { $cmd.CommandTimeout = 5 } catch {}
+        $cmd.CommandText = $itemQuery
+        $reader = $cmd.ExecuteReader()
+
         $items = [System.Collections.Generic.List[object]]::new()
 
-        if ($rst -and $rst.RecordCount -gt 0) {
-            $rst.MoveFirst()
+        while (-not $reader.IsClosed -and $reader.Read() -and $items.Count -lt $limit) {
+            $codeRaw = $reader.GetValue(0)
+            $nameRaw = $reader.GetValue(1)
+            $aliasRaw = $reader.GetValue(2)
 
-            while (-not $rst.EOF -and $items.Count -lt $limit) {
-                $codeRaw = $rst.Fields.Item("Code").Value
-                $nameRaw = $rst.Fields.Item("Name").Value
-                $aliasRaw = $rst.Fields.Item("Alias").Value
-
-                if ($codeRaw -ne [System.DBNull]::Value) {
-                    $items.Add(@{
-                        code = [int][string]$codeRaw
-
-                        name = if (
-                            $nameRaw -ne [System.DBNull]::Value
-                        ) {
-                            $nameRaw.ToString()
-                        } else {
-                            ""
-                        }
-
-                        alias = if (
-                            $aliasRaw -ne [System.DBNull]::Value
-                        ) {
-                            $aliasRaw.ToString()
-                        } else {
-                            ""
-                        }
-
-                        stock   = 0.0
-                        mcStock = @()
-                    })
-                }
-
-                $rst.MoveNext()
+            if ($codeRaw -ne [System.DBNull]::Value) {
+                $items.Add(@{
+                    code = [int][string]$codeRaw
+                    name = if ($nameRaw -ne [System.DBNull]::Value) {
+                        $nameRaw.ToString()
+                    } else {
+                        ""
+                    }
+                    alias = if ($aliasRaw -ne [System.DBNull]::Value) {
+                        $aliasRaw.ToString()
+                    } else {
+                        ""
+                    }
+                    stock   = 0.0
+                    mcStock = @()
+                })
             }
-
-            try { $rst.Close() } catch {}
         }
+
+        try { $reader.Close() } catch {}
+        try { $reader.Dispose() } catch {}
+        $reader = $null
+        try { $cmd.Dispose() } catch {}
+        $cmd = $null
 
         if ($items.Count -eq 0) {
             return @{
@@ -645,44 +791,49 @@ ORDER BY Master1.Name
             }
         }
 
-        $itemCodes = $items |
-            ForEach-Object { [int]$_.code }
-
+        $itemCodes = $items | ForEach-Object { [int]$_.code }
         $inList = $itemCodes -join ","
 
-        # Material-centre code/name lookup.
+        # Same material-centre lookup and same error behavior as the original:
+        # failure here does NOT fail the item dropdown.
         $mcNameMap = @{}
 
         try {
-            $mcRst = $fi.GetRecordset(
+            $cmd = $conn.CreateCommand()
+            try { $cmd.CommandTimeout = 5 } catch {}
+            $cmd.CommandText =
                 "SELECT Code, Name FROM Master1 WHERE MasterType = 11"
-            )
+            $reader = $cmd.ExecuteReader()
 
-            if ($mcRst -and $mcRst.RecordCount -gt 0) {
-                $mcRst.MoveFirst()
+            while ($reader.Read()) {
+                $mcCodeRaw = $reader.GetValue(0)
+                $mcNameRaw = $reader.GetValue(1)
 
-                while (-not $mcRst.EOF) {
-                    $mcCodeRaw = $mcRst.Fields.Item("Code").Value
-                    $mcNameRaw = $mcRst.Fields.Item("Name").Value
-
-                    if ($mcCodeRaw -ne [System.DBNull]::Value) {
-                        $mcCode = $mcCodeRaw.ToString().Trim()
-
-                        $mcNameMap[$mcCode] = if (
-                            $mcNameRaw -ne [System.DBNull]::Value
-                        ) {
-                            $mcNameRaw.ToString().Trim()
-                        } else {
-                            ""
-                        }
+                if ($mcCodeRaw -ne [System.DBNull]::Value) {
+                    $mcCode = $mcCodeRaw.ToString().Trim()
+                    $mcNameMap[$mcCode] = if (
+                        $mcNameRaw -ne [System.DBNull]::Value
+                    ) {
+                        $mcNameRaw.ToString().Trim()
+                    } else {
+                        ""
                     }
-
-                    $mcRst.MoveNext()
                 }
-
-                try { $mcRst.Close() } catch {}
             }
-        } catch {}
+        }
+        catch {
+        }
+        finally {
+            if ($reader) {
+                try { $reader.Close() } catch {}
+                try { $reader.Dispose() } catch {}
+                $reader = $null
+            }
+            if ($cmd) {
+                try { $cmd.Dispose() } catch {}
+                $cmd = $null
+            }
+        }
 
         $stockMap = @{}
 
@@ -693,7 +844,7 @@ ORDER BY Master1.Name
             }
         }
 
-        # Opening stock.
+        # Same opening-stock query and same swallowed-error behavior.
         try {
             $openingQuery = @"
 SELECT
@@ -705,74 +856,74 @@ WHERE RecType = 0
   AND MasterCode1 IN ($inList)
 "@
 
-            $opRst = $fi.GetRecordset($openingQuery)
+            $cmd = $conn.CreateCommand()
+            try { $cmd.CommandTimeout = 5 } catch {}
+            $cmd.CommandText = $openingQuery
+            $reader = $cmd.ExecuteReader()
 
-            if ($opRst -and $opRst.RecordCount -gt 0) {
-                $opRst.MoveFirst()
+            while ($reader.Read()) {
+                $itemCodeRaw = $reader.GetValue(0)
 
-                while (-not $opRst.EOF) {
-                    $itemCodeRaw =
-                        $opRst.Fields.Item("ItemCode").Value
+                if ($itemCodeRaw -ne [System.DBNull]::Value) {
+                    $itemCode = [int][string]$itemCodeRaw
 
-                    if ($itemCodeRaw -ne [System.DBNull]::Value) {
-                        $itemCode = [int][string]$itemCodeRaw
-
-                        $mcCode = ""
-                        $mcCodeRaw =
-                            $opRst.Fields.Item("MCCode").Value
-
-                        if ($mcCodeRaw -ne [System.DBNull]::Value) {
-                            $mcCode = $mcCodeRaw.ToString().Trim()
-                        }
-
-                        $mcName = if (
-                            $mcNameMap.ContainsKey($mcCode)
-                        ) {
-                            $mcNameMap[$mcCode]
-                        } else {
-                            "Default"
-                        }
-
-                        if ([string]::IsNullOrWhiteSpace($mcName)) {
-                            $mcName = "Default"
-                        }
-
-                        $quantity = 0.0
-                        $quantityRaw =
-                            $opRst.Fields.Item("Quantity").Value
-
-                        if ($quantityRaw -ne [System.DBNull]::Value) {
-                            [double]::TryParse(
-                                $quantityRaw.ToString(),
-                                [System.Globalization.NumberStyles]::Any,
-                                [System.Globalization.CultureInfo]::InvariantCulture,
-                                [ref]$quantity
-                            ) | Out-Null
-                        }
-
-                        if ($stockMap.ContainsKey($itemCode)) {
-                            $stockMap[$itemCode].total += $quantity
-
-                            if (
-                                -not $stockMap[$itemCode].byMc.ContainsKey(
-                                    $mcName
-                                )
-                            ) {
-                                $stockMap[$itemCode].byMc[$mcName] = 0.0
-                            }
-
-                            $stockMap[$itemCode].byMc[$mcName] += $quantity
-                        }
+                    $mcCode = ""
+                    $mcCodeRaw = $reader.GetValue(1)
+                    if ($mcCodeRaw -ne [System.DBNull]::Value) {
+                        $mcCode = $mcCodeRaw.ToString().Trim()
                     }
 
-                    $opRst.MoveNext()
+                    $mcName = if ($mcNameMap.ContainsKey($mcCode)) {
+                        $mcNameMap[$mcCode]
+                    } else {
+                        "Default"
+                    }
+
+                    if ([string]::IsNullOrWhiteSpace($mcName)) {
+                        $mcName = "Default"
+                    }
+
+                    $quantity = 0.0
+                    $quantityRaw = $reader.GetValue(2)
+
+                    if ($quantityRaw -ne [System.DBNull]::Value) {
+                        [double]::TryParse(
+                            $quantityRaw.ToString(),
+                            [System.Globalization.NumberStyles]::Any,
+                            [System.Globalization.CultureInfo]::InvariantCulture,
+                            [ref]$quantity
+                        ) | Out-Null
+                    }
+
+                    if ($stockMap.ContainsKey($itemCode)) {
+                        $stockMap[$itemCode].total += $quantity
+
+                        if (
+                            -not $stockMap[$itemCode].byMc.ContainsKey($mcName)
+                        ) {
+                            $stockMap[$itemCode].byMc[$mcName] = 0.0
+                        }
+
+                        $stockMap[$itemCode].byMc[$mcName] += $quantity
+                    }
                 }
-
-                try { $opRst.Close() } catch {}
             }
-        } catch {}
+        }
+        catch {
+        }
+        finally {
+            if ($reader) {
+                try { $reader.Close() } catch {}
+                try { $reader.Dispose() } catch {}
+                $reader = $null
+            }
+            if ($cmd) {
+                try { $cmd.Dispose() } catch {}
+                $cmd = $null
+            }
+        }
 
-        # Transaction stock.
+        # Same transaction-stock query and same swallowed-error behavior.
         try {
             $transactionQuery = @"
 SELECT
@@ -787,74 +938,74 @@ GROUP BY
     MasterCode2
 "@
 
-            $txnRst = $fi.GetRecordset($transactionQuery)
+            $cmd = $conn.CreateCommand()
+            try { $cmd.CommandTimeout = 5 } catch {}
+            $cmd.CommandText = $transactionQuery
+            $reader = $cmd.ExecuteReader()
 
-            if ($txnRst -and $txnRst.RecordCount -gt 0) {
-                $txnRst.MoveFirst()
+            while ($reader.Read()) {
+                $itemCodeRaw = $reader.GetValue(0)
 
-                while (-not $txnRst.EOF) {
-                    $itemCodeRaw =
-                        $txnRst.Fields.Item("ItemCode").Value
+                if ($itemCodeRaw -ne [System.DBNull]::Value) {
+                    $itemCode = [int][string]$itemCodeRaw
 
-                    if ($itemCodeRaw -ne [System.DBNull]::Value) {
-                        $itemCode = [int][string]$itemCodeRaw
-
-                        $mcCode = ""
-                        $mcCodeRaw =
-                            $txnRst.Fields.Item("MCCode").Value
-
-                        if ($mcCodeRaw -ne [System.DBNull]::Value) {
-                            $mcCode = $mcCodeRaw.ToString().Trim()
-                        }
-
-                        $mcName = if (
-                            $mcNameMap.ContainsKey($mcCode)
-                        ) {
-                            $mcNameMap[$mcCode]
-                        } else {
-                            "Unknown"
-                        }
-
-                        if ([string]::IsNullOrWhiteSpace($mcName)) {
-                            $mcName = "Unknown"
-                        }
-
-                        $quantity = 0.0
-                        $quantityRaw =
-                            $txnRst.Fields.Item("Quantity").Value
-
-                        if ($quantityRaw -ne [System.DBNull]::Value) {
-                            [double]::TryParse(
-                                $quantityRaw.ToString(),
-                                [System.Globalization.NumberStyles]::Any,
-                                [System.Globalization.CultureInfo]::InvariantCulture,
-                                [ref]$quantity
-                            ) | Out-Null
-                        }
-
-                        if ($stockMap.ContainsKey($itemCode)) {
-                            $stockMap[$itemCode].total += $quantity
-
-                            if (
-                                -not $stockMap[$itemCode].byMc.ContainsKey(
-                                    $mcName
-                                )
-                            ) {
-                                $stockMap[$itemCode].byMc[$mcName] = 0.0
-                            }
-
-                            $stockMap[$itemCode].byMc[$mcName] += $quantity
-                        }
+                    $mcCode = ""
+                    $mcCodeRaw = $reader.GetValue(1)
+                    if ($mcCodeRaw -ne [System.DBNull]::Value) {
+                        $mcCode = $mcCodeRaw.ToString().Trim()
                     }
 
-                    $txnRst.MoveNext()
+                    $mcName = if ($mcNameMap.ContainsKey($mcCode)) {
+                        $mcNameMap[$mcCode]
+                    } else {
+                        "Unknown"
+                    }
+
+                    if ([string]::IsNullOrWhiteSpace($mcName)) {
+                        $mcName = "Unknown"
+                    }
+
+                    $quantity = 0.0
+                    $quantityRaw = $reader.GetValue(2)
+
+                    if ($quantityRaw -ne [System.DBNull]::Value) {
+                        [double]::TryParse(
+                            $quantityRaw.ToString(),
+                            [System.Globalization.NumberStyles]::Any,
+                            [System.Globalization.CultureInfo]::InvariantCulture,
+                            [ref]$quantity
+                        ) | Out-Null
+                    }
+
+                    if ($stockMap.ContainsKey($itemCode)) {
+                        $stockMap[$itemCode].total += $quantity
+
+                        if (
+                            -not $stockMap[$itemCode].byMc.ContainsKey($mcName)
+                        ) {
+                            $stockMap[$itemCode].byMc[$mcName] = 0.0
+                        }
+
+                        $stockMap[$itemCode].byMc[$mcName] += $quantity
+                    }
                 }
-
-                try { $txnRst.Close() } catch {}
             }
-        } catch {}
+        }
+        catch {
+        }
+        finally {
+            if ($reader) {
+                try { $reader.Close() } catch {}
+                try { $reader.Dispose() } catch {}
+                $reader = $null
+            }
+            if ($cmd) {
+                try { $cmd.Dispose() } catch {}
+                $cmd = $null
+            }
+        }
 
-        # Attach stock to the lightweight dropdown objects.
+        # Exact original response attachment.
         foreach ($item in $items) {
             $itemCode = [int]$item.code
             $mcStock = @()
@@ -879,6 +1030,17 @@ GROUP BY
             }
         }
 
+        $startedAt.Stop()
+
+        Write-Host (
+            "  [ITEMS-DIRECT-SAFE] {0}/{1} search='{2}' rows={3} elapsedMs={4}" -f
+            $InstanceId,
+            $CompanyCode,
+            $Search,
+            $items.Count,
+            [int]$startedAt.ElapsedMilliseconds
+        ) -ForegroundColor DarkCyan
+
         return @{
             success = $true
             total   = $items.Count
@@ -886,13 +1048,38 @@ GROUP BY
         }
     }
     catch {
+        if ($startedAt.IsRunning) {
+            $startedAt.Stop()
+        }
+
+        Write-Host (
+            "  [ITEMS-DIRECT-SAFE FAIL] {0}/{1} search='{2}' elapsedMs={3} error={4}" -f
+            $InstanceId,
+            $CompanyCode,
+            $Search,
+            [int]$startedAt.ElapsedMilliseconds,
+            $_.Exception.Message
+        ) -ForegroundColor Red
+
         return @{
             success = $false
             error   = $_.Exception.Message
         }
     }
     finally {
-        Disconnect-BUSY $fi
+        if ($reader) {
+            try { $reader.Close() } catch {}
+            try { $reader.Dispose() } catch {}
+        }
+
+        if ($cmd) {
+            try { $cmd.Dispose() } catch {}
+        }
+
+        if ($ctx -and $ctx.connection) {
+            try { $ctx.connection.Close() } catch {}
+            try { $ctx.connection.Dispose() } catch {}
+        }
     }
 }
 
