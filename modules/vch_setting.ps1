@@ -9,6 +9,8 @@ if ($null -eq $script:Config) {
 # -----------------------------------------------------------------------------
 # Existing column/POS configuration
 # -----------------------------------------------------------------------------
+Write-Host "  [FAST-NUMBERING-V4] Direct numbering read path loaded." -ForegroundColor DarkCyan
+
 function Get-ColumnConfig {
     param(
         [int]$VchType,
@@ -222,6 +224,513 @@ function Save-ColumnConfig {
     } finally {
         Disconnect-BUSY $fi
     }
+}
+
+# -----------------------------------------------------------------------------
+# BusyCloud voucher approval configuration + custom approval audit storage
+# -----------------------------------------------------------------------------
+# Verified BUSY mappings used by this feature:
+#   Tran1.ApprovalStatus: 0 = Approval Not Required, 1 = Approved, 2 = Pending
+#   CheckList.Action:      1 = Created, 2 = Modified, 3 = Approved
+#
+# BusyCloud custom Config mappings:
+#   RecType = 203 -> one policy row per voucher type
+#       Type = voucher type
+#       I1   = approval processing required for NEW vouchers (0/1)
+#   RecType = 204 -> approver assignments
+#       Type = voucher type
+#       I1   = active assignment (0/1)
+#       C1   = BUSY username
+#
+# Approval policy is intentionally company + voucher-type specific and is not
+# device-specific. Approver assignments are retained even when processing is
+# switched OFF so existing pending vouchers remain manageable and the policy can
+# later be re-enabled without losing the assignment list.
+# -----------------------------------------------------------------------------
+
+$script:BusyCloudApprovalVoucherTypes = @(9,26,12,11,3,2,27,13,4,10,14,19,15,16,5,8,6)
+$script:BusyCloudApprovalAuditTable = "BusyCloudVoucherApprovalAudit"
+
+function Test-IsBusyCloudApprovalVoucherType {
+    param([int]$VchType)
+    return @($script:BusyCloudApprovalVoucherTypes) -contains $VchType
+}
+
+function Get-BusyCloudApprovalSupportedVoucherTypes {
+    return @($script:BusyCloudApprovalVoucherTypes)
+}
+
+function Get-VoucherApprovalConfig-Direct {
+    param(
+        [int]$VchType,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if (-not (Test-IsBusyCloudApprovalVoucherType -VchType $VchType)) {
+        return @{ success=$false; error="Voucher type $VchType is not supported by BusyCloud approval processing." }
+    }
+
+    $ctx = $null
+    try {
+        $ctx = Get-BusyCloudApprovalDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        $conn = $ctx.connection
+        $approvalRequired = $false
+        $approvers = @()
+
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = "SELECT TOP 1 I1 FROM Config WHERE RecType=203 AND [Type]=$VchType"
+        $raw = $cmd.ExecuteScalar()
+        if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) { $approvalRequired = ([int]$raw -eq 1) }
+
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = "SELECT C1 FROM Config WHERE RecType=204 AND [Type]=$VchType AND I1=1"
+        $rdr = $cmd.ExecuteReader()
+        while ($rdr.Read()) {
+            $name = ""
+            if (-not $rdr.IsDBNull(0)) { $name = ([string]$rdr.GetValue(0)).Trim() }
+            if ($name -and $approvers -notcontains $name) { $approvers += $name }
+        }
+        $rdr.Close()
+
+        return @{ success=$true; data=@{ vch_type=$VchType; approval_required=[bool]$approvalRequired; approvers=@($approvers | Sort-Object) } }
+    }
+    catch { return @{ success=$false; error=$_.Exception.Message } }
+    finally {
+        if ($ctx -and $ctx.connection) { try { $ctx.connection.Close() } catch {}; try { $ctx.connection.Dispose() } catch {} }
+    }
+}
+
+function Save-VoucherApprovalConfig-Direct {
+    param(
+        $Data,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $vchType = 0
+    try { $vchType = [int]$Data.vch_type } catch {}
+    if (-not (Test-IsBusyCloudApprovalVoucherType -VchType $vchType)) {
+        return @{ success=$false; error="Unsupported or missing vch_type." }
+    }
+
+    $rawRequired = ([string]$Data.approval_required).Trim().ToLowerInvariant()
+    $approvalRequired = ($Data.approval_required -eq $true -or $rawRequired -eq "1" -or $rawRequired -eq "true")
+    $requestedApprovers = @(@($Data.approvers) | ForEach-Object { ([string]$_).Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+
+    $usersResult = Get-CompanyUsers -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $usersResult.success) {
+        return @{ success=$false; error="Could not validate approvers against BUSY users. $($usersResult.error)" }
+    }
+
+    $canonicalByLower = @{}
+    foreach ($u in @($usersResult.data)) {
+        $n = ([string]$u).Trim()
+        if ($n) { $canonicalByLower[$n.ToLowerInvariant()] = $n }
+    }
+
+    $approvers = @(); $unknown = @()
+    foreach ($requested in $requestedApprovers) {
+        $key = $requested.ToLowerInvariant()
+        if ($canonicalByLower.ContainsKey($key)) {
+            $canonical = [string]$canonicalByLower[$key]
+            if ($approvers -notcontains $canonical) { $approvers += $canonical }
+        } else { $unknown += $requested }
+    }
+    if ($unknown.Count -gt 0) { return @{ success=$false; error=("Unknown BUSY user(s): " + ($unknown -join ", ")) } }
+
+    $ctx = $null
+    try {
+        $ctx = Get-BusyCloudApprovalDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        $conn = $ctx.connection
+        $requiredInt = if ($approvalRequired) { 1 } else { 0 }
+
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = "SELECT COUNT(*) FROM Config WHERE RecType=203 AND [Type]=$vchType"
+        $exists = ([int]$cmd.ExecuteScalar() -gt 0)
+
+        $cmd = $conn.CreateCommand()
+        if ($exists) { $cmd.CommandText = "UPDATE Config SET I1=$requiredInt WHERE RecType=203 AND [Type]=$vchType" }
+        else { $cmd.CommandText = "INSERT INTO Config (RecType,[Type],I1) VALUES (203,$vchType,$requiredInt)" }
+        [void]$cmd.ExecuteNonQuery()
+
+        $cmd = $conn.CreateCommand(); $cmd.CommandText = "DELETE FROM Config WHERE RecType=204 AND [Type]=$vchType"; [void]$cmd.ExecuteNonQuery()
+        foreach ($name in $approvers) {
+            $safe = $name.Replace("'", "''")
+            $cmd = $conn.CreateCommand(); $cmd.CommandText = "INSERT INTO Config (RecType,[Type],I1,C1) VALUES (204,$vchType,1,'$safe')"; [void]$cmd.ExecuteNonQuery()
+        }
+
+        return @{ success=$true; message="Voucher approval configuration updated successfully"; data=@{ vch_type=$vchType; approval_required=[bool]$approvalRequired; approvers=@($approvers) } }
+    }
+    catch { return @{ success=$false; error=$_.Exception.Message } }
+    finally {
+        if ($ctx -and $ctx.connection) { try { $ctx.connection.Close() } catch {}; try { $ctx.connection.Dispose() } catch {} }
+    }
+}
+
+function Get-VoucherApprovalTypesForUser-Direct {
+    param(
+        [string]$UserName,
+        [bool]$IsAdmin = $false,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if ($IsAdmin) { return @{ success=$true; data=@($script:BusyCloudApprovalVoucherTypes) } }
+    if ([string]::IsNullOrWhiteSpace($UserName)) { return @{ success=$true; data=@() } }
+
+    $ctx = $null
+    try {
+        $ctx = Get-BusyCloudApprovalDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        $conn = $ctx.connection
+        $safeUser = $UserName.Trim().Replace("'", "''")
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = "SELECT [Type] FROM Config WHERE RecType=204 AND I1=1 AND C1='$safeUser'"
+        $rdr = $cmd.ExecuteReader()
+        $types = @()
+        while ($rdr.Read()) {
+            $t = [int]$rdr.GetValue(0)
+            if ((Test-IsBusyCloudApprovalVoucherType -VchType $t) -and $types -notcontains $t) { $types += $t }
+        }
+        $rdr.Close()
+        return @{ success=$true; data=@($types | Sort-Object) }
+    }
+    catch { return @{ success=$false; error=$_.Exception.Message } }
+    finally {
+        if ($ctx -and $ctx.connection) { try { $ctx.connection.Close() } catch {}; try { $ctx.connection.Dispose() } catch {} }
+    }
+}
+
+function Test-VoucherApprover {
+    param(
+        [string]$UserName,
+        [int]$VchType,
+        [bool]$IsAdmin = $false,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if (-not (Test-IsBusyCloudApprovalVoucherType -VchType $VchType)) {
+        return @{ success=$true; allowed=$false; allowed_vch_types=@() }
+    }
+
+    if ($IsAdmin) {
+        return @{ success=$true; allowed=$true; allowed_vch_types=@($script:BusyCloudApprovalVoucherTypes) }
+    }
+
+    $types = Get-VoucherApprovalTypesForUser -UserName $UserName -IsAdmin:$false -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $types.success) { return $types }
+
+    return @{
+        success = $true
+        allowed = (@($types.data) -contains $VchType)
+        allowed_vch_types = @($types.data)
+    }
+}
+
+function Test-VoucherModifyPermissionForUser {
+    param(
+        [string]$UserName,
+        [int]$VchType,
+        [bool]$IsAdmin = $false,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if ($IsAdmin) { return @{ success=$true; allowed=$true } }
+    if ([string]::IsNullOrWhiteSpace($UserName)) { return @{ success=$true; allowed=$false } }
+
+    $map = @{
+        12='C2'; 9='C4'; 3='C6'; 11='C8'; 13='C10';
+        2='I2'; 10='I4'; 4='I6'; 14='I8'; 19='I10'; 16='I12'; 15='I14';
+        5='I16'; 8='I18'; 26='I20'; 27='I22'; 6='B34'
+    }
+    if (-not $map.ContainsKey($VchType)) { return @{ success=$true; allowed=$false } }
+
+    # MobileUserPreference belongs to the authentication/permission database,
+    # not necessarily the fiscal transaction database that contains Tran1/Config.
+    # Reuse the already established permission reader instead of querying the
+    # approval transaction DB directly.
+    try {
+        $all = Get-UserPermissions -InstanceId $InstanceId -CompanyCode $CompanyCode
+        if (-not $all.success) {
+            return @{ success=$false; allowed=$false; error=$all.error }
+        }
+
+        $row = @($all.data | Where-Object {
+            ([string]$_.name).Equals($UserName.Trim(), [System.StringComparison]::OrdinalIgnoreCase)
+        } | Select-Object -First 1)
+
+        $key = [string]$map[$VchType]
+        if (-not $row) { return @{ success=$true; allowed=$false; permission_key=$key } }
+
+        $value = 0
+        try { $value = [int]$row[0].$key } catch { $value = 0 }
+        return @{ success=$true; allowed=($value -ne 0); permission_key=$key }
+    }
+    catch { return @{ success=$false; allowed=$false; error=$_.Exception.Message } }
+}
+
+if ($null -eq $script:BusyCloudApprovalSqlDbCache) {
+    $script:BusyCloudApprovalSqlDbCache = @{}
+}
+
+function Test-BusyCloudSqlTableExists {
+    param(
+        $Instance,
+        [string]$Database,
+        [string]$TableName
+    )
+
+    $conn = $null
+    try {
+        $conn = Open-SqlConnection `
+            -SqlServer $Instance.sqlServer `
+            -Database $Database `
+            -SqlUser $Instance.sqlUser `
+            -SqlPassword $Instance.sqlPassword
+
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandTimeout = 5
+        $cmd.CommandText = "SELECT CASE WHEN OBJECT_ID(@ObjectName, N'U') IS NULL THEN 0 ELSE 1 END"
+        [void]$cmd.Parameters.AddWithValue("@ObjectName", "dbo.$TableName")
+        return ([int]$cmd.ExecuteScalar() -eq 1)
+    }
+    catch { return $false }
+    finally {
+        if ($conn) { try { $conn.Close() } catch {}; try { $conn.Dispose() } catch {} }
+    }
+}
+
+function Resolve-BusyCloudFiscalSqlDatabaseName {
+    param(
+        $Instance,
+        [string]$CompanyCode,
+        [string]$InstanceId
+    )
+
+    $cacheKey = "${InstanceId}|${CompanyCode}".ToLowerInvariant()
+    if ($script:BusyCloudApprovalSqlDbCache.ContainsKey($cacheKey)) {
+        return [string]$script:BusyCloudApprovalSqlDbCache[$cacheKey]
+    }
+
+    # BUSY SQL authentication/master data can live in the base database while
+    # transaction/configuration tables live in a fiscal-year database such as
+    # BusyComp0003_db12026. Get-SqlDatabaseName returns the base name, so discover
+    # the active fiscal DB directly from SQL Server without touching BUSY COM.
+    $baseDb = Get-SqlDatabaseName -CompanyCode $CompanyCode -InstanceId $InstanceId
+    if ([string]::IsNullOrWhiteSpace($baseDb)) {
+        throw "Could not resolve the SQL base database for $InstanceId/$CompanyCode."
+    }
+
+    $now = Get-Date
+    $fyStartYear = if ($now.Month -ge 4) { $now.Year } else { $now.Year - 1 }
+    $preferred = "${baseDb}1${fyStartYear}"
+
+    $master = $null
+    try {
+        $master = Open-SqlConnection `
+            -SqlServer $Instance.sqlServer `
+            -Database "master" `
+            -SqlUser $Instance.sqlUser `
+            -SqlPassword $Instance.sqlPassword
+
+        $cmd = $master.CreateCommand()
+        $cmd.CommandTimeout = 5
+        $cmd.CommandText = @"
+SELECT [name]
+FROM sys.databases
+WHERE state = 0
+  AND ([name] = @BaseDb OR [name] LIKE @Prefix)
+ORDER BY [name] DESC
+"@
+        [void]$cmd.Parameters.AddWithValue("@BaseDb", $baseDb)
+        [void]$cmd.Parameters.AddWithValue("@Prefix", ($baseDb + "%"))
+
+        $rdr = $cmd.ExecuteReader()
+        $candidates = New-Object System.Collections.Generic.List[string]
+        while ($rdr.Read()) {
+            if (-not $rdr.IsDBNull(0)) { [void]$candidates.Add(([string]$rdr.GetString(0)).Trim()) }
+        }
+        $rdr.Close()
+
+        # Prefer the current FY naming convention observed in this BUSY setup,
+        # then fall back to any matching DB that actually contains dbo.Config.
+        $ordered = New-Object System.Collections.Generic.List[string]
+        if ($candidates -contains $preferred) { [void]$ordered.Add($preferred) }
+        foreach ($name in $candidates) {
+            if ($name -ne $preferred -and $name -ne $baseDb) { [void]$ordered.Add($name) }
+        }
+        if ($candidates -contains $baseDb) { [void]$ordered.Add($baseDb) }
+
+        foreach ($name in $ordered) {
+            if (Test-BusyCloudSqlTableExists -Instance $Instance -Database $name -TableName "Config") {
+                $script:BusyCloudApprovalSqlDbCache[$cacheKey] = $name
+                Write-Host "  [APPROVAL-DB] $InstanceId/$CompanyCode -> $name" -ForegroundColor DarkCyan
+                return $name
+            }
+        }
+    }
+    finally {
+        if ($master) { try { $master.Close() } catch {}; try { $master.Dispose() } catch {} }
+    }
+
+    throw "Could not find a fiscal BUSY SQL database containing dbo.Config for $InstanceId/$CompanyCode (base '$baseDb')."
+}
+
+function Get-BusyCloudApprovalDbContext {
+    param([string]$InstanceId="", [string]$CompanyCode="")
+
+    $found = Get-InstanceForCompany -CompanyCode $CompanyCode -InstanceId $InstanceId
+    if (-not $found) { throw "Company not found in instances.json" }
+
+    $inst = $found.instance
+    $comp = $found.company
+    $dbType = if ($null -ne $inst.dbType) { [int]$inst.dbType } else { 0 }
+
+    if ($dbType -eq 1) {
+        $dbName = Resolve-BusyCloudFiscalSqlDatabaseName `
+            -Instance $inst `
+            -CompanyCode $CompanyCode `
+            -InstanceId ([string]$inst.id)
+
+        $conn = Open-SqlConnection `
+            -SqlServer $inst.sqlServer `
+            -Database $dbName `
+            -SqlUser $inst.sqlUser `
+            -SqlPassword $inst.sqlPassword
+
+        return @{ dbType=1; connection=$conn; instance=$inst; company=$comp; database=$dbName }
+    }
+
+    $companyFolder = Join-Path ([string]$inst.dataPath) ([string]$comp.code)
+    $dbFile = Join-Path $companyFolder "db.bds"
+    if (-not (Test-Path $dbFile)) { throw "Access/BDS database not found: $dbFile" }
+    $conn = Open-BdsConnection -DbFile $dbFile
+    return @{ dbType=0; connection=$conn; instance=$inst; company=$comp; database=$dbFile }
+}
+
+function Get-BusyCloudApprovalAuditFilePath {
+    param([string]$InstanceId="", [string]$CompanyCode="")
+    $root = Join-Path (Split-Path -Parent $PSScriptRoot) "data\approval_audit"
+    $safeInstance = ([string]$InstanceId) -replace '[^A-Za-z0-9_.-]', '_'
+    $safeCompany = ([string]$CompanyCode) -replace '[^A-Za-z0-9_.-]', '_'
+    if ([string]::IsNullOrWhiteSpace($safeInstance)) { $safeInstance = "default_instance" }
+    if ([string]::IsNullOrWhiteSpace($safeCompany)) { $safeCompany = "default_company" }
+    return @{ root=$root; file=(Join-Path $root ("{0}__{1}.jsonl" -f $safeInstance,$safeCompany)) }
+}
+
+# Historical function name retained so existing approval code does not need to
+# change. Storage is intentionally OUTSIDE the BUSY database. Creating custom
+# tables inside a live BUSY SQL database caused schema-lock timeouts and slowed
+# COM/OpenCSDB. The sidecar JSONL audit is database-agnostic and safe for both
+# SQL Server and Access/BDS companies.
+function Ensure-BusyCloudVoucherApprovalAuditTable {
+    param([string]$InstanceId="", [string]$CompanyCode="")
+    try {
+        $p = Get-BusyCloudApprovalAuditFilePath -InstanceId $InstanceId -CompanyCode $CompanyCode
+        if (-not (Test-Path $p.root)) { [void](New-Item -ItemType Directory -Path $p.root -Force) }
+        if (-not (Test-Path $p.file)) {
+            $fs = [System.IO.File]::Create($p.file); $fs.Close(); $fs.Dispose()
+        }
+        return @{ success=$true; table="BusyCloudVoucherApprovalAudit(sidecar)"; path=$p.file; dbType=-1 }
+    }
+    catch { return @{ success=$false; error=$_.Exception.Message } }
+}
+
+function Initialize-BusyCloudApprovalStorage {
+    param([bool]$VerboseOutput=$true)
+    $instancesPath = Join-Path $PSScriptRoot "..\instances.json"
+    if (-not (Test-Path $instancesPath)) { return @{ success=$false; error="instances.json not found at $instancesPath"; initialized=0; failed=0 } }
+    try { $cfg = Get-Content $instancesPath -Raw | ConvertFrom-Json }
+    catch { return @{ success=$false; error=$_.Exception.Message; initialized=0; failed=0 } }
+
+    $initialized=0; $failed=0; $errors=@()
+    foreach ($inst in @($cfg.instances)) {
+        foreach ($comp in @($inst.companies)) {
+            $instanceId=[string]$inst.id; $companyCode=[string]$comp.code
+            $res=Ensure-BusyCloudVoucherApprovalAuditTable -InstanceId $instanceId -CompanyCode $companyCode
+            if ($res.success) {
+                $initialized++
+                if ($VerboseOutput) { Write-Host "  Approval audit storage ready: $instanceId/$companyCode" -ForegroundColor DarkGreen }
+            } else {
+                $failed++; $errors += "${instanceId}/${companyCode}: $($res.error)"
+                if ($VerboseOutput) { Write-Host "  [WARN] Approval audit storage: $instanceId/$companyCode - $($res.error)" -ForegroundColor DarkYellow }
+            }
+        }
+    }
+    return @{ success=($failed-eq0); initialized=$initialized; failed=$failed; errors=@($errors) }
+}
+
+function Write-BusyCloudVoucherApprovalAudit {
+    param(
+        [int]$VchCode,
+        [int]$VchType,
+        [string]$VchNo="",
+        [string]$VchSeries="",
+        $VchDate=$null,
+        [string]$EventType,
+        [int]$PreviousStatus,
+        [int]$NewStatus,
+        [string]$ActionBy,
+        [string]$Remarks="",
+        [string]$InstanceId="",
+        [string]$CompanyCode=""
+    )
+
+    $ensure=Ensure-BusyCloudVoucherApprovalAuditTable -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $ensure.success) { return $ensure }
+    $event=([string]$EventType).Trim().ToUpperInvariant()
+    if ($event -notin @("APPROVE","UNAPPROVE")) { return @{ success=$false; error="Unsupported approval audit event '$EventType'." } }
+
+    try {
+        $now=Get-Date
+        $dateText=""
+        if ($null-ne$VchDate -and "$VchDate"-ne"") { try { $dateText=([datetime]$VchDate).ToString("yyyy-MM-dd") } catch { $dateText=[string]$VchDate } }
+        $record=[ordered]@{
+            id=[long][DateTime]::UtcNow.Ticks
+            vchCode=$VchCode; vchType=$VchType; vchNo=[string]$VchNo; vchSeries=[string]$VchSeries; date=$dateText
+            eventType=$event; previousStatus=$PreviousStatus; newStatus=$NewStatus
+            actionBy=[string]$ActionBy; actionTime=$now.ToString("yyyy-MM-dd HH:mm:ss"); remarks=[string]$Remarks
+        }
+        $line=($record | ConvertTo-Json -Compress -Depth 5) + [Environment]::NewLine
+        [System.IO.File]::AppendAllText([string]$ensure.path,$line,[System.Text.Encoding]::UTF8)
+        return @{ success=$true; actionTime=$record.actionTime }
+    }
+    catch { return @{ success=$false; error=$_.Exception.Message } }
+}
+
+function Get-BusyCloudVoucherApprovalHistory {
+    param(
+        [int[]]$VchTypes=@(),
+        [int]$VchType=0,
+        [string]$ActionBy="",
+        [int]$Limit=300,
+        [string]$InstanceId="",
+        [string]$CompanyCode=""
+    )
+
+    $ensure=Ensure-BusyCloudVoucherApprovalAuditTable -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $ensure.success) { return $ensure }
+    $effectiveTypes=@($VchTypes | ForEach-Object{[int]$_} | Where-Object{Test-IsBusyCloudApprovalVoucherType -VchType $_} | Sort-Object -Unique)
+    if ($VchType -gt 0) { $effectiveTypes=@($VchType) }
+    if ($effectiveTypes.Count -eq 0) { return @{ success=$true; data=@() } }
+    if ($Limit -lt 1) { $Limit=1 }; if ($Limit -gt 1000) { $Limit=1000 }
+
+    try {
+        $items=@()
+        foreach ($line in @(Get-Content -Path $ensure.path -ErrorAction SilentlyContinue)) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            try { $r=$line | ConvertFrom-Json } catch { continue }
+            $t=0; try{$t=[int]$r.vchType}catch{}
+            if ($effectiveTypes -notcontains $t) { continue }
+            if ($ActionBy -and -not ([string]$r.actionBy).Equals($ActionBy,[System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            $items += $r
+        }
+        $items=@($items | Sort-Object @{Expression={ try{[datetime]$_.actionTime}catch{[datetime]::MinValue} };Descending=$true}, @{Expression={ try{[long]$_.id}catch{0} };Descending=$true} | Select-Object -First $Limit)
+        return @{ success=$true; data=@($items) }
+    }
+    catch { return @{ success=$false; error=$_.Exception.Message } }
 }
 
 # -----------------------------------------------------------------------------
@@ -1118,43 +1627,269 @@ function Get-WebNumberingConfig {
         [string]$InstanceId = "",
         [string]$CompanyCode = ""
     )
+    Write-Host (
+        "  [WEB-NUMBER-FAST START] {0}/{1} type={2} series='{3}'" -f
+        $InstanceId,
+        $CompanyCode,
+        $VchType,
+        $SeriesName
+    ) -ForegroundColor DarkCyan
 
-    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
-    if (-not $fi) { return @{ success=$false; error="BUSY database connection failed" } }
+
+    # -------------------------------------------------------------------------
+    # FAST READ-ONLY WEB NUMBERING CONFIG
+    #
+    # IMPORTANT:
+    # The previous implementation called Connect-BUSY before checking RecType
+    # 202. That meant EVERY /busy/numbering-config request could spend tens of
+    # seconds inside BUSY COM/OpenCSDB even when the voucher actually used
+    # normal BUSY numbering.
+    #
+    # This implementation reads Master1 / Config / Tran1 directly from the
+    # active fiscal database and never initializes BUSY COM.
+    # -------------------------------------------------------------------------
+
+    $startedAt = Get-Date
+    $ctx = $null
+    $reader = $null
 
     try {
-        $seriesCode = Resolve-VoucherSeriesCode -fi $fi -VchType $VchType -SeriesName $SeriesName
-        $rst = $fi.GetRecordset("SELECT * FROM Config WHERE RecType=202 AND [Type]=$VchType AND D15=$seriesCode")
+        if ($VchType -le 0) {
+            return @{
+                success = $false
+                error = "Voucher type is required."
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($SeriesName)) {
+            return @{
+                success = $false
+                error = "Voucher series is required."
+            }
+        }
+
+        $resolver = Get-Command `
+            Get-BusyCloudFastConfigDbContext `
+            -ErrorAction SilentlyContinue
+
+        if ($null -eq $resolver) {
+            throw (
+                "Fast fiscal database resolver is unavailable. " +
+                "Install the optimized vch_setting.ps1."
+            )
+        }
+
+        $ctx = Get-BusyCloudFastConfigDbContext `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        if (
+            $null -eq $ctx -or
+            $null -eq $ctx.connection
+        ) {
+            throw "Direct fiscal database connection is unavailable."
+        }
+
+        $conn = $ctx.connection
+        $isSql = ([int]$ctx.dbType -eq 1)
+
+        # ---------------------------------------------------------------------
+        # Resolve voucher series directly from Master1.
+        # ---------------------------------------------------------------------
+
+        $cleanSeries = $SeriesName.Trim()
+        $typePrefix = "{0:D2}" -f $VchType
+
+        $prefixedSeries = if (
+            $cleanSeries.StartsWith(
+                $typePrefix,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+        ) {
+            $cleanSeries
+        }
+        else {
+            "$typePrefix$cleanSeries"
+        }
+
+        $safeSeries = $cleanSeries.Replace("'", "''")
+        $safePrefixedSeries = $prefixedSeries.Replace("'", "''")
+
+        $cmd = $conn.CreateCommand()
+        try { $cmd.CommandTimeout = 5 } catch {}
+
+        $cmd.CommandText = @"
+SELECT TOP 1 Code
+FROM Master1
+WHERE MasterType = 21
+  AND (
+        Name = '$safeSeries'
+        OR Name = '$safePrefixedSeries'
+      )
+"@
+
+        $seriesValue = $cmd.ExecuteScalar()
+
+        if (
+            $null -eq $seriesValue -or
+            $seriesValue -eq [System.DBNull]::Value
+        ) {
+            return @{
+                success = $false
+                error = "Voucher series '$cleanSeries' was not found for voucher type $VchType."
+            }
+        }
+
+        $seriesCode = [int]$seriesValue
+
+        # ---------------------------------------------------------------------
+        # Defaults mean normal BUSY numbering.
+        # ---------------------------------------------------------------------
 
         $cfg = @{
-            vch_type=$VchType; series_name=$SeriesName; series_code=$seriesCode
-            source="BUSY"; reset_frequency="YEARLY"; padding_length=1
-            year_format="YY"; month_format="MMM"; is_active=$true
-            date_basis="VOUCHER_DATE"
-            starting_number=1L; ending_number=0L
-            organisation_code=""; prefix=""; suffix=""; separator="_"
+            vch_type          = $VchType
+            series_name       = $cleanSeries
+            series_code       = $seriesCode
+            source            = "BUSY"
+            reset_frequency   = "YEARLY"
+            padding_length    = 1
+            year_format       = "YY"
+            month_format      = "MMM"
+            is_active         = $true
+            date_basis        = "VOUCHER_DATE"
+            starting_number   = 1L
+            ending_number     = 0L
+            organisation_code = ""
+            prefix            = ""
+            suffix            = ""
+            separator         = "_"
         }
 
-        if ($rst -and -not $rst.EOF) {
-            $cfg.source = if ([int](Get-ConfigSafeValue $rst "I1" 0) -eq 1) { "WEB" } else { "BUSY" }
-            $cfg.reset_frequency = Convert-ResetIntToName ([int](Get-ConfigSafeValue $rst "I2" 3))
-            $cfg.padding_length = [int](Get-ConfigSafeValue $rst "I3" 1)
-            $cfg.year_format = Convert-YearFormatIntToName ([int](Get-ConfigSafeValue $rst "I4" 1))
-            $cfg.month_format = Convert-MonthFormatIntToName ([int](Get-ConfigSafeValue $rst "I5" 1))
-            $cfg.is_active = ([int](Get-ConfigSafeValue $rst "I6" 1) -eq 1)
-            $cfg.date_basis = Convert-DateBasisIntToName ([int](Get-ConfigSafeValue $rst "I7" 0))
-            $cfg.starting_number = [long](Get-ConfigSafeValue $rst "L2" 1)
-            $cfg.ending_number = [long](Get-ConfigSafeValue $rst "L3" 0)
-            $cfg.organisation_code = ([string](Get-ConfigSafeValue $rst "C1" "")).Trim()
-            $cfg.prefix = ([string](Get-ConfigSafeValue $rst "C2" "")).Trim()
-            $cfg.suffix = ([string](Get-ConfigSafeValue $rst "C3" "")).Trim()
-            $cfg.separator = [string](Get-ConfigSafeValue $rst "C4" "_")
-        }
-        if ($rst) { try { $rst.Close() } catch {} }
+        # ---------------------------------------------------------------------
+        # Read optional BusyCloud WEB numbering override from Config/RecType 202.
+        # ---------------------------------------------------------------------
 
-        $date = if (-not [string]::IsNullOrWhiteSpace($VoucherDate)) {
-            [datetime]::Parse($VoucherDate, [System.Globalization.CultureInfo]::InvariantCulture)
-        } else {
+        $cmd = $conn.CreateCommand()
+        try { $cmd.CommandTimeout = 5 } catch {}
+
+        $cmd.CommandText = @"
+SELECT TOP 1
+    I1,
+    I2,
+    I3,
+    I4,
+    I5,
+    I6,
+    I7,
+    L2,
+    L3,
+    C1,
+    C2,
+    C3,
+    C4
+FROM Config
+WHERE RecType = 202
+  AND [Type] = $VchType
+  AND D15 = $seriesCode
+"@
+
+        $reader = $cmd.ExecuteReader()
+
+        try {
+            if ($reader.Read()) {
+                $getValue = {
+                    param(
+                        [string]$Field,
+                        $Default
+                    )
+
+                    try {
+                        $ordinal = $reader.GetOrdinal($Field)
+
+                        if (
+                            $ordinal -ge 0 -and
+                            -not $reader.IsDBNull($ordinal)
+                        ) {
+                            return $reader.GetValue($ordinal)
+                        }
+                    }
+                    catch {
+                    }
+
+                    return $Default
+                }
+
+                $cfg.source = if (
+                    [int](& $getValue "I1" 0) -eq 1
+                ) {
+                    "WEB"
+                }
+                else {
+                    "BUSY"
+                }
+
+                $cfg.reset_frequency =
+                    Convert-ResetIntToName `
+                        ([int](& $getValue "I2" 3))
+
+                $cfg.padding_length =
+                    [int](& $getValue "I3" 1)
+
+                $cfg.year_format =
+                    Convert-YearFormatIntToName `
+                        ([int](& $getValue "I4" 1))
+
+                $cfg.month_format =
+                    Convert-MonthFormatIntToName `
+                        ([int](& $getValue "I5" 1))
+
+                $cfg.is_active =
+                    ([int](& $getValue "I6" 1) -eq 1)
+
+                $cfg.date_basis =
+                    Convert-DateBasisIntToName `
+                        ([int](& $getValue "I7" 0))
+
+                $cfg.starting_number =
+                    [long](& $getValue "L2" 1)
+
+                $cfg.ending_number =
+                    [long](& $getValue "L3" 0)
+
+                $cfg.organisation_code =
+                    ([string](& $getValue "C1" "")).Trim()
+
+                $cfg.prefix =
+                    ([string](& $getValue "C2" "")).Trim()
+
+                $cfg.suffix =
+                    ([string](& $getValue "C3" "")).Trim()
+
+                $cfg.separator =
+                    [string](& $getValue "C4" "_")
+            }
+        }
+        finally {
+            if ($reader) {
+                try { $reader.Close() } catch {}
+                try { $reader.Dispose() } catch {}
+                $reader = $null
+            }
+        }
+
+        # ---------------------------------------------------------------------
+        # Resolve numbering date.
+        # ---------------------------------------------------------------------
+
+        $date = if (
+            -not [string]::IsNullOrWhiteSpace($VoucherDate)
+        ) {
+            [datetime]::Parse(
+                $VoucherDate,
+                [System.Globalization.CultureInfo]::InvariantCulture
+            )
+        }
+        else {
             Get-Date
         }
 
@@ -1162,34 +1897,225 @@ function Get-WebNumberingConfig {
             -DateBasis ([string]$cfg.date_basis) `
             -VoucherDate $date
 
-        if ($cfg.source -eq "WEB" -and $cfg.is_active) {
-            $targetInstance = Get-InstanceConfig -InstanceId $InstanceId
-            $dbType = 0
-            if ($null -ne $targetInstance -and $null -ne $targetInstance.dbType) {
-                $dbType = [int]$targetInstance.dbType
-            }
-            $isSql = ($dbType -eq 1)
+        # ---------------------------------------------------------------------
+        # WEB numbering preview.
+        #
+        # Only WEB+active needs a Tran1 scan. BUSY numbering skips this entirely
+        # and immediately returns to Get-EffectiveNumberingConfig, which then
+        # calls the optimized Get-NumberingConfig.
+        # ---------------------------------------------------------------------
 
-            $preview = Get-NextWebVoucherNumberInternal `
-                -fi $fi `
+        if (
+            $cfg.source -eq "WEB" -and
+            $cfg.is_active
+        ) {
+            $dateFilter = ""
+
+            if (
+                ([string]$cfg.date_basis).Trim().ToUpperInvariant() -eq
+                "VOUCHER_DATE"
+            ) {
+                $period = Get-NumberingPeriod `
+                    -VoucherDate $effectiveDate `
+                    -ResetFrequency ([string]$cfg.reset_frequency)
+
+                if ($null -ne $period) {
+                    if ($isSql) {
+                        $startText = $period.Start.ToString(
+                            "yyyy-MM-ddTHH:mm:ss",
+                            [System.Globalization.CultureInfo]::InvariantCulture
+                        )
+
+                        $endText = $period.End.ToString(
+                            "yyyy-MM-ddTHH:mm:ss",
+                            [System.Globalization.CultureInfo]::InvariantCulture
+                        )
+
+                        $dateFilter = (
+                            " AND [Date] >= '$startText'" +
+                            " AND [Date] < '$endText'"
+                        )
+                    }
+                    else {
+                        $startText = $period.Start.ToString(
+                            "MM/dd/yyyy",
+                            [System.Globalization.CultureInfo]::InvariantCulture
+                        )
+
+                        $endText = $period.End.ToString(
+                            "MM/dd/yyyy",
+                            [System.Globalization.CultureInfo]::InvariantCulture
+                        )
+
+                        $dateFilter = (
+                            " AND [Date] >= #$startText#" +
+                            " AND [Date] < #$endText#"
+                        )
+                    }
+                }
+            }
+
+            $webNumberRegex = Get-WebNumberRegex `
+                -Config $cfg `
+                -VoucherDate $effectiveDate
+
+            $cmd = $conn.CreateCommand()
+            try { $cmd.CommandTimeout = 5 } catch {}
+
+            $cmd.CommandText = (
+                "SELECT VchNo FROM Tran1 " +
+                "WHERE VchType=$VchType " +
+                "AND VchSeriesCode=$seriesCode " +
+                "AND Cancelled=0 " +
+                "AND VchCancelled=0" +
+                $dateFilter
+            )
+
+            $reader = $cmd.ExecuteReader()
+
+            $highest = 0L
+
+            try {
+                while ($reader.Read()) {
+                    $raw = ""
+
+                    try {
+                        if (-not $reader.IsDBNull(0)) {
+                            $raw = (
+                                [string]$reader.GetValue(0)
+                            ).Trim()
+                        }
+                    }
+                    catch {
+                        $raw = ""
+                    }
+
+                    if ([string]::IsNullOrWhiteSpace($raw)) {
+                        continue
+                    }
+
+                    $match = $webNumberRegex.Match($raw)
+
+                    if ($match.Success) {
+                        $sequence = 0L
+
+                        if (
+                            [long]::TryParse(
+                                $match.Groups[1].Value,
+                                [ref]$sequence
+                            ) -and
+                            $sequence -gt $highest
+                        ) {
+                            $highest = $sequence
+                        }
+                    }
+                }
+            }
+            finally {
+                if ($reader) {
+                    try { $reader.Close() } catch {}
+                    try { $reader.Dispose() } catch {}
+                    $reader = $null
+                }
+            }
+
+            $startingNumber =
+                [Math]::Max(
+                    1L,
+                    [long]$cfg.starting_number
+                )
+
+            $nextSequence = if ($highest -gt 0) {
+                $highest + 1
+            }
+            else {
+                $startingNumber
+            }
+
+            $endingNumber =
+                [Math]::Max(
+                    0L,
+                    [long]$cfg.ending_number
+                )
+
+            if (
+                $endingNumber -gt 0 -and
+                $nextSequence -gt $endingNumber
+            ) {
+                throw (
+                    "Voucher sequence has reached the configured " +
+                    "ending number $endingNumber."
+                )
+            }
+
+            $cfg.last_sequence = $highest
+            $cfg.next_sequence = $nextSequence
+            $cfg.next_vch_no = Build-WebVoucherNumber `
                 -Config $cfg `
                 -VoucherDate $effectiveDate `
-                -IsSql $isSql
-
-            $cfg.last_sequence = $preview.last_sequence
-            $cfg.next_sequence = $preview.next_sequence
-            $cfg.next_vch_no = $preview.next_vch_no
-        } else {
-            $cfg.last_sequence = 0
-            $cfg.next_sequence = 0
+                -Sequence $nextSequence
+        }
+        else {
+            $cfg.last_sequence = 0L
+            $cfg.next_sequence = 0L
             $cfg.next_vch_no = ""
         }
 
-        return @{ success=$true; data=$cfg }
-    } catch {
-        return @{ success=$false; error=$_.Exception.Message }
-    } finally {
-        Disconnect-BUSY $fi
+        $elapsedMs = [int](
+            ((Get-Date) - $startedAt).TotalMilliseconds
+        )
+
+        Write-Host (
+            "  [WEB-NUMBER-FAST] {0}/{1} type={2} series='{3}' source={4} db={5} elapsedMs={6}" -f
+            $InstanceId,
+            $CompanyCode,
+            $VchType,
+            $cleanSeries,
+            [string]$cfg.source,
+            [string]$ctx.database,
+            $elapsedMs
+        ) -ForegroundColor DarkCyan
+
+        return @{
+            success = $true
+            data = $cfg
+        }
+    }
+    catch {
+        $elapsedMs = [int](
+            ((Get-Date) - $startedAt).TotalMilliseconds
+        )
+
+        Write-Host (
+            "  [WEB-NUMBER-FAST FAIL] {0}/{1} type={2} series='{3}' elapsedMs={4} error={5}" -f
+            $InstanceId,
+            $CompanyCode,
+            $VchType,
+            $SeriesName,
+            $elapsedMs,
+            $_.Exception.Message
+        ) -ForegroundColor Red
+
+        # Do not fall back to Connect-BUSY here. This is a read-only page load,
+        # and a slow COM fallback would block the entire API process again.
+        return @{
+            success = $false
+            error = $_.Exception.Message
+        }
+    }
+    finally {
+        if ($reader) {
+            try { $reader.Close() } catch {}
+            try { $reader.Dispose() } catch {}
+        }
+
+        if (
+            $ctx -and
+            $ctx.connection
+        ) {
+            try { $ctx.connection.Close() } catch {}
+            try { $ctx.connection.Dispose() } catch {}
+        }
     }
 }
 
@@ -1661,3 +2587,1966 @@ function Get-EffectiveNumberingConfig {
     # Existing BUSY function from vouchers.ps1.
     return Get-NumberingConfig -VchType $VchType -SeriesName $SeriesName -InstanceId $InstanceId -CompanyCode $CompanyCode
 }
+
+# -----------------------------------------------------------------------------
+# HOTFIX V5: Access/BDS approval configuration must use the BUSY COM recordset.
+#
+# The Access instance's <company>\db.bds file is the authentication/preferences
+# database and does not necessarily contain the fiscal Config table. Existing
+# voucher settings already prove that Config is available through Connect-BUSY.
+#
+# SQL Server keeps the fast direct fiscal-DB path introduced in v3/v4.
+# -----------------------------------------------------------------------------
+
+function Test-BusyCloudApprovalUsesAccessCom {
+    param(
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    try {
+        $found = Get-InstanceForCompany -CompanyCode $CompanyCode -InstanceId $InstanceId
+        if (-not $found) { return $false }
+        $dbType = if ($null -ne $found.instance.dbType) { [int]$found.instance.dbType } else { 0 }
+        return ($dbType -eq 0)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-VoucherApprovalConfig-AccessCom {
+    param(
+        [int]$VchType,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = "",
+        $ExistingFi = $null
+    )
+
+    $fi = $ExistingFi
+    $ownsConnection = $false
+
+    if (-not $fi) {
+        $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
+        $ownsConnection = $true
+    }
+
+    if (-not $fi) {
+        return @{ success=$false; error="BUSY database connection failed" }
+    }
+
+    try {
+        $approvalRequired = $false
+        $approvers = @()
+
+        $rst = $fi.GetRecordset("SELECT I1 FROM Config WHERE RecType=203 AND [Type]=$VchType")
+        if ($rst -and -not $rst.EOF) {
+            try {
+                $raw = $rst.Fields.Item("I1").Value
+                if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                    $approvalRequired = ([int]$raw -eq 1)
+                }
+            } catch {}
+        }
+        if ($rst) { try { $rst.Close() } catch {} }
+
+        $rst = $fi.GetRecordset("SELECT C1 FROM Config WHERE RecType=204 AND [Type]=$VchType AND I1=1")
+        if ($rst) {
+            while (-not $rst.EOF) {
+                $name = ""
+                try {
+                    $rawName = $rst.Fields.Item("C1").Value
+                    if ($null -ne $rawName -and $rawName -ne [System.DBNull]::Value) {
+                        $name = ([string]$rawName).Trim()
+                    }
+                } catch {}
+
+                if ($name -and $approvers -notcontains $name) {
+                    $approvers += $name
+                }
+                $rst.MoveNext()
+            }
+            try { $rst.Close() } catch {}
+        }
+
+        return @{
+            success = $true
+            data = @{
+                vch_type = $VchType
+                approval_required = [bool]$approvalRequired
+                approvers = @($approvers | Sort-Object)
+            }
+        }
+    }
+    catch {
+        return @{ success=$false; error=$_.Exception.Message }
+    }
+    finally {
+        if ($ownsConnection -and $fi) {
+            Disconnect-BUSY $fi
+        }
+    }
+}
+
+function Save-VoucherApprovalConfig-AccessCom {
+    param(
+        $Data,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $vchType = 0
+    try { $vchType = [int]$Data.vch_type } catch {}
+
+    if (-not (Test-IsBusyCloudApprovalVoucherType -VchType $vchType)) {
+        return @{ success=$false; error="Unsupported or missing vch_type." }
+    }
+
+    $rawRequired = ([string]$Data.approval_required).Trim().ToLowerInvariant()
+    $approvalRequired = (
+        $Data.approval_required -eq $true -or
+        $rawRequired -eq "1" -or
+        $rawRequired -eq "true"
+    )
+
+    $requestedApprovers = @(
+        @($Data.approvers) |
+        ForEach-Object { ([string]$_).Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Sort-Object -Unique
+    )
+
+    $usersResult = Get-CompanyUsers -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $usersResult.success) {
+        return @{
+            success=$false
+            error="Could not validate approvers against BUSY users. $($usersResult.error)"
+        }
+    }
+
+    $canonicalByLower = @{}
+    foreach ($u in @($usersResult.data)) {
+        $n = ([string]$u).Trim()
+        if ($n) { $canonicalByLower[$n.ToLowerInvariant()] = $n }
+    }
+
+    $approvers = @()
+    $unknown = @()
+
+    foreach ($requested in $requestedApprovers) {
+        $key = $requested.ToLowerInvariant()
+        if ($canonicalByLower.ContainsKey($key)) {
+            $canonical = [string]$canonicalByLower[$key]
+            if ($approvers -notcontains $canonical) { $approvers += $canonical }
+        }
+        else {
+            $unknown += $requested
+        }
+    }
+
+    if ($unknown.Count -gt 0) {
+        return @{
+            success=$false
+            error=("Unknown BUSY user(s): " + ($unknown -join ", "))
+        }
+    }
+
+    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $fi) {
+        return @{ success=$false; error="BUSY database connection failed" }
+    }
+
+    try {
+        $requiredInt = if ($approvalRequired) { 1 } else { 0 }
+
+        $exists = $false
+        $rst = $fi.GetRecordset("SELECT RecType FROM Config WHERE RecType=203 AND [Type]=$vchType")
+        if ($rst -and -not $rst.EOF) { $exists = $true }
+        if ($rst) { try { $rst.Close() } catch {} }
+
+        if ($exists) {
+            $fi.ExecuteQuery("UPDATE Config SET I1=$requiredInt WHERE RecType=203 AND [Type]=$vchType")
+        }
+        else {
+            $fi.ExecuteQuery("INSERT INTO Config (RecType,[Type],I1) VALUES (203,$vchType,$requiredInt)")
+        }
+
+        $fi.ExecuteQuery("DELETE FROM Config WHERE RecType=204 AND [Type]=$vchType")
+
+        foreach ($name in $approvers) {
+            $safe = $name.Replace("'", "''")
+            $fi.ExecuteQuery("INSERT INTO Config (RecType,[Type],I1,C1) VALUES (204,$vchType,1,'$safe')")
+        }
+
+        return @{
+            success=$true
+            message="Voucher approval configuration updated successfully"
+            data=@{
+                vch_type=$vchType
+                approval_required=[bool]$approvalRequired
+                approvers=@($approvers)
+            }
+        }
+    }
+    catch {
+        return @{ success=$false; error=$_.Exception.Message }
+    }
+    finally {
+        Disconnect-BUSY $fi
+    }
+}
+
+function Get-VoucherApprovalTypesForUser-AccessCom {
+    param(
+        [string]$UserName,
+        [bool]$IsAdmin = $false,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = "",
+        $ExistingFi = $null
+    )
+
+    if ($IsAdmin) {
+        return @{ success=$true; data=@($script:BusyCloudApprovalVoucherTypes) }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($UserName)) {
+        return @{ success=$true; data=@() }
+    }
+
+    $fi = $ExistingFi
+    $ownsConnection = $false
+
+    if (-not $fi) {
+        $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
+        $ownsConnection = $true
+    }
+
+    if (-not $fi) {
+        return @{ success=$false; error="BUSY database connection failed" }
+    }
+
+    try {
+        $safeUser = $UserName.Trim().Replace("'", "''")
+        $rst = $fi.GetRecordset("SELECT [Type] FROM Config WHERE RecType=204 AND I1=1 AND C1='$safeUser'")
+
+        $types = @()
+        if ($rst) {
+            while (-not $rst.EOF) {
+                $t = 0
+                try { $t = [int]$rst.Fields.Item("Type").Value } catch {}
+
+                if (
+                    (Test-IsBusyCloudApprovalVoucherType -VchType $t) -and
+                    $types -notcontains $t
+                ) {
+                    $types += $t
+                }
+                $rst.MoveNext()
+            }
+            try { $rst.Close() } catch {}
+        }
+
+        return @{ success=$true; data=@($types | Sort-Object) }
+    }
+    catch {
+        return @{ success=$false; error=$_.Exception.Message }
+    }
+    finally {
+        if ($ownsConnection -and $fi) {
+            Disconnect-BUSY $fi
+        }
+    }
+}
+
+# Public dispatchers. SQL keeps the direct fiscal DB path; Access/BDS uses COM.
+function Get-VoucherApprovalConfig {
+    param(
+        [int]$VchType,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = "",
+        $ExistingFi = $null
+    )
+
+    if (-not (Test-IsBusyCloudApprovalVoucherType -VchType $VchType)) {
+        return @{
+            success=$false
+            error="Voucher type $VchType is not supported by BusyCloud approval processing."
+        }
+    }
+
+    if (Test-BusyCloudApprovalUsesAccessCom -InstanceId $InstanceId -CompanyCode $CompanyCode) {
+        return Get-VoucherApprovalConfig-AccessCom `
+            -VchType $VchType `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode `
+            -ExistingFi $ExistingFi
+    }
+
+    return Get-VoucherApprovalConfig-Direct `
+        -VchType $VchType `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+}
+
+function Save-VoucherApprovalConfig {
+    param(
+        $Data,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if (Test-BusyCloudApprovalUsesAccessCom -InstanceId $InstanceId -CompanyCode $CompanyCode) {
+        return Save-VoucherApprovalConfig-AccessCom `
+            -Data $Data `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+    }
+
+    return Save-VoucherApprovalConfig-Direct `
+        -Data $Data `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+}
+
+function Get-VoucherApprovalTypesForUser {
+    param(
+        [string]$UserName,
+        [bool]$IsAdmin = $false,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = "",
+        $ExistingFi = $null
+    )
+
+    if ($IsAdmin) {
+        return @{ success=$true; data=@($script:BusyCloudApprovalVoucherTypes) }
+    }
+
+    if (Test-BusyCloudApprovalUsesAccessCom -InstanceId $InstanceId -CompanyCode $CompanyCode) {
+        return Get-VoucherApprovalTypesForUser-AccessCom `
+            -UserName $UserName `
+            -IsAdmin:$IsAdmin `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode `
+            -ExistingFi $ExistingFi
+    }
+
+    return Get-VoucherApprovalTypesForUser-Direct `
+        -UserName $UserName `
+        -IsAdmin:$IsAdmin `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+}
+
+# Override with ExistingFi support so Access approve/unapprove can reuse the
+# active COM session without opening/closing BUSY again.
+function Test-VoucherApprover {
+    param(
+        [string]$UserName,
+        [int]$VchType,
+        [bool]$IsAdmin = $false,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = "",
+        $ExistingFi = $null
+    )
+
+    if (-not (Test-IsBusyCloudApprovalVoucherType -VchType $VchType)) {
+        return @{ success=$true; allowed=$false; allowed_vch_types=@() }
+    }
+
+    if ($IsAdmin) {
+        return @{
+            success=$true
+            allowed=$true
+            allowed_vch_types=@($script:BusyCloudApprovalVoucherTypes)
+        }
+    }
+
+    $types = Get-VoucherApprovalTypesForUser `
+        -UserName $UserName `
+        -IsAdmin:$false `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode `
+        -ExistingFi $ExistingFi
+
+    if (-not $types.success) { return $types }
+
+    return @{
+        success=$true
+        allowed=(@($types.data) -contains $VchType)
+        allowed_vch_types=@($types.data)
+    }
+}
+
+
+# =============================================================================
+# BusyCloud Voucher Approval v6 policy hardening
+# - Approval OFF means NO approver access for that voucher type.
+# - Explicit approver assignments are cleared when approval is disabled.
+# - Admins remain automatic approvers only for voucher types whose approval
+#   processing is currently enabled.
+# =============================================================================
+
+function Get-EnabledVoucherApprovalTypes-Direct {
+    param([string]$InstanceId="", [string]$CompanyCode="")
+    $ctx = $null
+    try {
+        $ctx = Get-BusyCloudApprovalDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        $conn = $ctx.connection
+        $cmd = $conn.CreateCommand()
+        try { $cmd.CommandTimeout = 15 } catch {}
+        $cmd.CommandText = "SELECT DISTINCT [Type] FROM Config WHERE RecType=203 AND I1=1"
+        $rdr = $cmd.ExecuteReader()
+        $types = @()
+        while ($rdr.Read()) {
+            $t = 0
+            try { $t = [int]$rdr.GetValue(0) } catch {}
+            if ((Test-IsBusyCloudApprovalVoucherType -VchType $t) -and $types -notcontains $t) { $types += $t }
+        }
+        $rdr.Close()
+        return @{ success=$true; data=@($types | Sort-Object) }
+    }
+    catch { return @{ success=$false; error=$_.Exception.Message } }
+    finally {
+        if ($ctx -and $ctx.connection) { try { $ctx.connection.Close() } catch {}; try { $ctx.connection.Dispose() } catch {} }
+    }
+}
+
+function Get-EnabledVoucherApprovalTypes-AccessCom {
+    param([string]$InstanceId="", [string]$CompanyCode="", $ExistingFi=$null)
+    $fi = $ExistingFi
+    $ownsConnection = $false
+    if (-not $fi) {
+        $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
+        $ownsConnection = $true
+    }
+    if (-not $fi) { return @{ success=$false; error="BUSY database connection failed" } }
+    try {
+        $rst = $fi.GetRecordset("SELECT [Type] FROM Config WHERE RecType=203 AND I1=1")
+        $types = @()
+        if ($rst) {
+            while (-not $rst.EOF) {
+                $t = 0
+                try { $t = [int]$rst.Fields.Item("Type").Value } catch {}
+                if ((Test-IsBusyCloudApprovalVoucherType -VchType $t) -and $types -notcontains $t) { $types += $t }
+                $rst.MoveNext()
+            }
+            try { $rst.Close() } catch {}
+        }
+        return @{ success=$true; data=@($types | Sort-Object) }
+    }
+    catch { return @{ success=$false; error=$_.Exception.Message } }
+    finally {
+        if ($ownsConnection -and $fi) { Disconnect-BUSY $fi }
+    }
+}
+
+function Get-EnabledVoucherApprovalTypes {
+    param([string]$InstanceId="", [string]$CompanyCode="", $ExistingFi=$null)
+    if (Test-BusyCloudApprovalUsesAccessCom -InstanceId $InstanceId -CompanyCode $CompanyCode) {
+        return Get-EnabledVoucherApprovalTypes-AccessCom -InstanceId $InstanceId -CompanyCode $CompanyCode -ExistingFi $ExistingFi
+    }
+    return Get-EnabledVoucherApprovalTypes-Direct -InstanceId $InstanceId -CompanyCode $CompanyCode
+}
+
+function Get-VoucherApprovalConfig {
+    param(
+        [int]$VchType,
+        [string]$InstanceId="",
+        [string]$CompanyCode="",
+        $ExistingFi=$null
+    )
+    if (-not (Test-IsBusyCloudApprovalVoucherType -VchType $VchType)) {
+        return @{ success=$false; error="Voucher type $VchType is not supported by BusyCloud approval processing." }
+    }
+    $res = if (Test-BusyCloudApprovalUsesAccessCom -InstanceId $InstanceId -CompanyCode $CompanyCode) {
+        Get-VoucherApprovalConfig-AccessCom -VchType $VchType -InstanceId $InstanceId -CompanyCode $CompanyCode -ExistingFi $ExistingFi
+    } else {
+        Get-VoucherApprovalConfig-Direct -VchType $VchType -InstanceId $InstanceId -CompanyCode $CompanyCode
+    }
+    if ($res.success -and -not [bool]$res.data.approval_required) {
+        # Never expose stale assignments while the policy is OFF.
+        $res.data.approvers = @()
+    }
+    return $res
+}
+
+function Save-VoucherApprovalConfig {
+    param($Data, [string]$InstanceId="", [string]$CompanyCode="")
+    $rawRequired = ([string]$Data.approval_required).Trim().ToLowerInvariant()
+    $enabled = ($Data.approval_required -eq $true -or $rawRequired -eq "1" -or $rawRequired -eq "true")
+    if (-not $enabled) {
+        try { $Data.approvers = @() } catch {}
+    }
+    if (Test-BusyCloudApprovalUsesAccessCom -InstanceId $InstanceId -CompanyCode $CompanyCode) {
+        return Save-VoucherApprovalConfig-AccessCom -Data $Data -InstanceId $InstanceId -CompanyCode $CompanyCode
+    }
+    return Save-VoucherApprovalConfig-Direct -Data $Data -InstanceId $InstanceId -CompanyCode $CompanyCode
+}
+
+function Get-VoucherApprovalTypesForUser {
+    param(
+        [string]$UserName,
+        [bool]$IsAdmin=$false,
+        [string]$InstanceId="",
+        [string]$CompanyCode="",
+        $ExistingFi=$null
+    )
+
+    $enabledResult = Get-EnabledVoucherApprovalTypes -InstanceId $InstanceId -CompanyCode $CompanyCode -ExistingFi $ExistingFi
+    if (-not $enabledResult.success) { return $enabledResult }
+    $enabledTypes = @($enabledResult.data | ForEach-Object { [int]$_ } | Sort-Object -Unique)
+
+    if ($IsAdmin) {
+        # Admins are automatic approvers, but ONLY while approval processing is ON.
+        return @{ success=$true; data=@($enabledTypes) }
+    }
+    if ([string]::IsNullOrWhiteSpace($UserName) -or $enabledTypes.Count -eq 0) {
+        return @{ success=$true; data=@() }
+    }
+
+    $assignedResult = if (Test-BusyCloudApprovalUsesAccessCom -InstanceId $InstanceId -CompanyCode $CompanyCode) {
+        Get-VoucherApprovalTypesForUser-AccessCom -UserName $UserName -IsAdmin:$false -InstanceId $InstanceId -CompanyCode $CompanyCode -ExistingFi $ExistingFi
+    } else {
+        Get-VoucherApprovalTypesForUser-Direct -UserName $UserName -IsAdmin:$false -InstanceId $InstanceId -CompanyCode $CompanyCode
+    }
+    if (-not $assignedResult.success) { return $assignedResult }
+
+    $types = @($assignedResult.data | ForEach-Object { [int]$_ } | Where-Object { $enabledTypes -contains $_ } | Sort-Object -Unique)
+    return @{ success=$true; data=@($types) }
+}
+
+function Test-VoucherApprover {
+    param(
+        [string]$UserName,
+        [int]$VchType,
+        [bool]$IsAdmin=$false,
+        [string]$InstanceId="",
+        [string]$CompanyCode="",
+        $ExistingFi=$null
+    )
+    if (-not (Test-IsBusyCloudApprovalVoucherType -VchType $VchType)) {
+        return @{ success=$true; allowed=$false; allowed_vch_types=@() }
+    }
+    $types = Get-VoucherApprovalTypesForUser -UserName $UserName -IsAdmin:$IsAdmin -InstanceId $InstanceId -CompanyCode $CompanyCode -ExistingFi $ExistingFi
+    if (-not $types.success) { return $types }
+    return @{
+        success=$true
+        allowed=(@($types.data) -contains $VchType)
+        allowed_vch_types=@($types.data)
+    }
+}
+# =============================================================================
+# FAST VOUCHER SETTINGS DIRECT-DB OVERRIDES
+# =============================================================================
+# Goal:
+#   - Never start BUSY COM just to read/write RecType 201 voucher UI settings.
+#   - SQL: resolve the fiscal SQL database and use SqlConnection directly.
+#   - Access/BDS: discover the fiscal .bds containing Config and use OleDb
+#     directly, the same style used by the fast permission subsystem.
+#   - Preserve the old COM implementation as a safety fallback.
+#
+# These definitions intentionally appear at the END of this module so they
+# override the older COM-first functions above without changing routes.ps1.
+# =============================================================================
+
+if ($null -eq $script:BusyCloudFastConfigAccessDbCache) {
+    $script:BusyCloudFastConfigAccessDbCache = @{}
+}
+
+if ($null -eq $script:BusyCloudFastColumnConfigCache) {
+    $script:BusyCloudFastColumnConfigCache = @{}
+}
+
+# Capture the currently loaded implementations before overriding them.
+if ($null -eq $script:BusyCloudLegacyGetColumnConfig) {
+    $script:BusyCloudLegacyGetColumnConfig = ${function:Get-ColumnConfig}
+}
+if ($null -eq $script:BusyCloudLegacySaveColumnConfig) {
+    $script:BusyCloudLegacySaveColumnConfig = ${function:Save-ColumnConfig}
+}
+if ($null -eq $script:BusyCloudLegacyGetVoucherApprovalConfigAccessCom) {
+    $script:BusyCloudLegacyGetVoucherApprovalConfigAccessCom = ${function:Get-VoucherApprovalConfig-AccessCom}
+}
+if ($null -eq $script:BusyCloudLegacySaveVoucherApprovalConfigAccessCom) {
+    $script:BusyCloudLegacySaveVoucherApprovalConfigAccessCom = ${function:Save-VoucherApprovalConfig-AccessCom}
+}
+if ($null -eq $script:BusyCloudLegacyGetEnabledVoucherApprovalTypesAccessCom) {
+    $script:BusyCloudLegacyGetEnabledVoucherApprovalTypesAccessCom = ${function:Get-EnabledVoucherApprovalTypes-AccessCom}
+}
+if ($null -eq $script:BusyCloudLegacyGetVoucherApprovalTypesForUserAccessCom) {
+    $script:BusyCloudLegacyGetVoucherApprovalTypesForUserAccessCom = ${function:Get-VoucherApprovalTypesForUser-AccessCom}
+}
+
+function Test-BusyCloudAccessConfigDatabase {
+    param([string]$DbFile)
+
+    if ([string]::IsNullOrWhiteSpace($DbFile) -or -not (Test-Path -LiteralPath $DbFile)) {
+        return $false
+    }
+
+    $conn = $null
+    $rdr = $null
+    try {
+        $conn = Open-BdsConnection -DbFile $DbFile
+        $cmd = $conn.CreateCommand()
+        try { $cmd.CommandTimeout = 3 } catch {}
+        $cmd.CommandText = "SELECT TOP 1 [RecType] FROM [Config]"
+        $rdr = $cmd.ExecuteReader()
+        return $true
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if ($rdr) {
+            try { $rdr.Close() } catch {}
+            try { $rdr.Dispose() } catch {}
+        }
+        if ($conn) {
+            try { $conn.Close() } catch {}
+            try { $conn.Dispose() } catch {}
+        }
+    }
+}
+
+function Resolve-BusyCloudFiscalAccessDatabasePath {
+    param(
+        $Instance,
+        $Company,
+        [string]$InstanceId,
+        [string]$CompanyCode
+    )
+
+    $cacheKey = ("{0}|{1}" -f $InstanceId, $CompanyCode).ToLowerInvariant()
+
+    if ($script:BusyCloudFastConfigAccessDbCache.ContainsKey($cacheKey)) {
+        $cachedPath = [string]$script:BusyCloudFastConfigAccessDbCache[$cacheKey]
+        if (Test-Path -LiteralPath $cachedPath) {
+            return $cachedPath
+        }
+        $script:BusyCloudFastConfigAccessDbCache.Remove($cacheKey)
+    }
+
+    $companyFolder = Join-Path ([string]$Instance.dataPath) ([string]$Company.code)
+
+    if (-not (Test-Path -LiteralPath $companyFolder)) {
+        throw "Access company folder not found: $companyFolder"
+    }
+
+    # BUSY keeps the authentication/preferences database in db.bds. Fiscal
+    # transaction/config data may be in another .bds file. Discover it once,
+    # then cache the exact path for the lifetime of the API process.
+    $files = @(
+        Get-ChildItem -LiteralPath $companyFolder -Filter "*.bds" -File -ErrorAction SilentlyContinue
+    )
+
+    if ($files.Count -eq 0) {
+        $files = @(
+            Get-ChildItem -LiteralPath $companyFolder -Filter "*.bds" -File -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 50
+        )
+    }
+
+    if ($files.Count -eq 0) {
+        throw "No .bds files were found under $companyFolder"
+    }
+
+    $now = Get-Date
+    $fyStartYear = if ($now.Month -ge 4) { $now.Year } else { $now.Year - 1 }
+    $fyText = [string]$fyStartYear
+
+    # Prefer an obvious current-financial-year database, then non-main BDS
+    # files by recent write time, and only then db.bds.
+    $ranked = @(
+        $files |
+        ForEach-Object {
+            $name = ([string]$_.Name).ToLowerInvariant()
+            $score = 20
+
+            if ($name -match [regex]::Escape($fyText)) {
+                $score = 0
+            }
+            elseif ($name -ne "db.bds") {
+                $score = 10
+            }
+            else {
+                $score = 30
+            }
+
+            [pscustomobject]@{
+                File = $_
+                Score = $score
+                LastWriteTime = $_.LastWriteTime
+            }
+        } |
+        Sort-Object Score, @{ Expression = "LastWriteTime"; Descending = $true }
+    )
+
+    foreach ($candidate in $ranked) {
+        $path = [string]$candidate.File.FullName
+
+        if (Test-BusyCloudAccessConfigDatabase -DbFile $path) {
+            $script:BusyCloudFastConfigAccessDbCache[$cacheKey] = $path
+            Write-Host "  [FAST-CONFIG-DB] $InstanceId/$CompanyCode -> $path" -ForegroundColor DarkCyan
+            return $path
+        }
+    }
+
+    $names = @($ranked | ForEach-Object { $_.File.Name }) -join ", "
+    throw "Could not find an Access/BDS fiscal database containing Config for $InstanceId/$CompanyCode. Checked: $names"
+}
+
+function Get-BusyCloudFastConfigDbContext {
+    param(
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $found = Get-InstanceForCompany -CompanyCode $CompanyCode -InstanceId $InstanceId
+    if (-not $found) {
+        throw "Company not found in instances.json"
+    }
+
+    $inst = $found.instance
+    $comp = $found.company
+    $dbType = if ($null -ne $inst.dbType) { [int]$inst.dbType } else { 0 }
+
+    if ($dbType -eq 1) {
+        $dbName = Resolve-BusyCloudFiscalSqlDatabaseName `
+            -Instance $inst `
+            -CompanyCode $CompanyCode `
+            -InstanceId ([string]$inst.id)
+
+        $conn = Open-SqlConnection `
+            -SqlServer $inst.sqlServer `
+            -Database $dbName `
+            -SqlUser $inst.sqlUser `
+            -SqlPassword $inst.sqlPassword
+
+        return @{
+            dbType = 1
+            connection = $conn
+            instance = $inst
+            company = $comp
+            database = $dbName
+        }
+    }
+
+    $dbFile = Resolve-BusyCloudFiscalAccessDatabasePath `
+        -Instance $inst `
+        -Company $comp `
+        -InstanceId ([string]$inst.id) `
+        -CompanyCode ([string]$comp.code)
+
+    $conn = Open-BdsConnection -DbFile $dbFile
+
+    return @{
+        dbType = 0
+        connection = $conn
+        instance = $inst
+        company = $comp
+        database = $dbFile
+    }
+}
+
+function Get-BusyCloudReaderValue {
+    param(
+        $Reader,
+        [string]$Field,
+        $Default = $null
+    )
+
+    try {
+        $ordinal = $Reader.GetOrdinal($Field)
+        if ($ordinal -ge 0 -and -not $Reader.IsDBNull($ordinal)) {
+            return $Reader.GetValue($ordinal)
+        }
+    }
+    catch {}
+
+    return $Default
+}
+
+function Convert-BusyCloudBehaviorIntToName {
+    param([int]$Value)
+
+    if ($Value -eq 2) { return "semi_variable" }
+    if ($Value -eq 3) { return "fixed" }
+    return "variable"
+}
+
+function Convert-BusyCloudBehaviorNameToInt {
+    param([string]$Value)
+
+    if ($Value -eq "semi_variable") { return 2 }
+    if ($Value -eq "fixed") { return 3 }
+    return 1
+}
+
+function Get-BusyCloudColumnConfigDefault {
+    param(
+        [int]$VchType,
+        [int]$DeviceType
+    )
+
+    $isAccountVoucher = @(14, 15, 16, 19) -contains $VchType
+    $supportsQuickMode = @(14, 19) -contains $VchType
+
+    if ($isAccountVoucher) {
+        return @{
+            vch_type = $VchType
+            device_type = $DeviceType
+            account_default_mode = if ($supportsQuickMode) { "single" } else { "double" }
+            account_allow_mode_switch = if ($supportsQuickMode) { $true } else { $false }
+            acc_quick_col_account = "variable"
+            acc_quick_col_amount = "variable"
+            acc_quick_col_short_narration = "variable"
+            acc_double_col_dc = "variable"
+            acc_double_col_account = "variable"
+            acc_double_col_debit = "variable"
+            acc_double_col_credit = "variable"
+            acc_double_col_short_narration = "variable"
+        }
+    }
+
+    return @{
+        vch_type = $VchType
+        device_type = $DeviceType
+        enable_item_discount = $true
+        enable_alt_units = $true
+        col_qty = "variable"
+        col_unit = "variable"
+        col_price = "variable"
+        col_amount = "variable"
+        col_discount = "variable"
+        col_cfact = "variable"
+        col_alt_qty = "variable"
+        col_alt_price = "variable"
+        enable_pos = $false
+        show_stock_balance = $true
+        def_card_acc = ""
+        def_gift_acc = ""
+    }
+}
+
+function Get-ColumnConfig {
+    param(
+        [int]$VchType,
+        [int]$DeviceType,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $cacheKey = ("{0}|{1}|{2}|{3}" -f $InstanceId, $CompanyCode, $VchType, $DeviceType).ToLowerInvariant()
+
+    try {
+        if ($script:BusyCloudFastColumnConfigCache.ContainsKey($cacheKey)) {
+            $cached = $script:BusyCloudFastColumnConfigCache[$cacheKey]
+            if ($cached -and (Get-Date) -lt $cached.expires) {
+                return @{ success = $true; data = $cached.data }
+            }
+            $script:BusyCloudFastColumnConfigCache.Remove($cacheKey)
+        }
+    }
+    catch {}
+
+    $ctx = $null
+    $rdr = $null
+
+    try {
+        $ctx = Get-BusyCloudFastConfigDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        $conn = $ctx.connection
+
+        $cmd = $conn.CreateCommand()
+        try { $cmd.CommandTimeout = 5 } catch {}
+        $cmd.CommandText = "SELECT TOP 1 * FROM Config WHERE RecType=201 AND [Type]=$VchType AND D15=$DeviceType"
+
+        $rdr = $cmd.ExecuteReader()
+
+        $config = $null
+        if ($rdr.Read()) {
+            $isAccountVoucher = @(14, 15, 16, 19) -contains $VchType
+            $supportsQuickMode = @(14, 19) -contains $VchType
+
+            if ($isAccountVoucher) {
+                $storedMode = [int](Get-BusyCloudReaderValue -Reader $rdr -Field "I1" -Default 1)
+
+                $config = @{
+                    vch_type = $VchType
+                    device_type = $DeviceType
+                    account_default_mode = if ($supportsQuickMode -and $storedMode -eq 1) { "single" } else { "double" }
+                    account_allow_mode_switch = if ($supportsQuickMode) {
+                        ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I2" -Default 1) -eq 1)
+                    } else {
+                        $false
+                    }
+                    acc_quick_col_account = Convert-BusyCloudBehaviorIntToName ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I3" -Default 1))
+                    acc_quick_col_amount = Convert-BusyCloudBehaviorIntToName ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I4" -Default 1))
+                    acc_quick_col_short_narration = Convert-BusyCloudBehaviorIntToName ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I5" -Default 1))
+                    acc_double_col_dc = Convert-BusyCloudBehaviorIntToName ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I6" -Default 1))
+                    acc_double_col_account = Convert-BusyCloudBehaviorIntToName ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I7" -Default 1))
+                    acc_double_col_debit = Convert-BusyCloudBehaviorIntToName ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I8" -Default 1))
+                    acc_double_col_credit = Convert-BusyCloudBehaviorIntToName ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I9" -Default 1))
+                    acc_double_col_short_narration = Convert-BusyCloudBehaviorIntToName ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I10" -Default 1))
+                }
+            }
+            else {
+                $config = @{
+                    vch_type = $VchType
+                    device_type = $DeviceType
+                    enable_item_discount = ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I1" -Default 1) -eq 1)
+                    enable_alt_units = ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I2" -Default 1) -eq 1)
+                    col_qty = Convert-BusyCloudBehaviorIntToName ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I3" -Default 1))
+                    col_unit = Convert-BusyCloudBehaviorIntToName ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I4" -Default 1))
+                    col_price = Convert-BusyCloudBehaviorIntToName ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I5" -Default 1))
+                    col_amount = Convert-BusyCloudBehaviorIntToName ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I6" -Default 1))
+                    col_discount = Convert-BusyCloudBehaviorIntToName ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I7" -Default 1))
+                    col_cfact = Convert-BusyCloudBehaviorIntToName ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I8" -Default 1))
+                    col_alt_qty = Convert-BusyCloudBehaviorIntToName ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I9" -Default 1))
+                    col_alt_price = Convert-BusyCloudBehaviorIntToName ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I10" -Default 1))
+                    enable_pos = ([int](Get-BusyCloudReaderValue -Reader $rdr -Field "I11" -Default 0) -eq 1)
+                    show_stock_balance = ([string](Get-BusyCloudReaderValue -Reader $rdr -Field "C3" -Default "1") -ne "0")
+                    def_card_acc = [string](Get-BusyCloudReaderValue -Reader $rdr -Field "C1" -Default "")
+                    def_gift_acc = [string](Get-BusyCloudReaderValue -Reader $rdr -Field "C2" -Default "")
+                }
+            }
+        }
+
+        if ($rdr) {
+            try { $rdr.Close() } catch {}
+            try { $rdr.Dispose() } catch {}
+            $rdr = $null
+        }
+
+        if ($null -eq $config) {
+            $config = Get-BusyCloudColumnConfigDefault -VchType $VchType -DeviceType $DeviceType
+        }
+
+        $script:BusyCloudFastColumnConfigCache[$cacheKey] = @{
+            expires = (Get-Date).AddSeconds(30)
+            data = $config
+        }
+
+        return @{
+            success = $true
+            data = $config
+            storage = if ($ctx.dbType -eq 1) { "SQL-DIRECT" } else { "ACCESS-DIRECT" }
+        }
+    }
+    catch {
+        Write-Host "  [FAST-CONFIG WARN] Direct column-config read failed for $InstanceId/$CompanyCode; using COM fallback. $($_.Exception.Message)" -ForegroundColor DarkYellow
+
+        return & $script:BusyCloudLegacyGetColumnConfig `
+            -VchType $VchType `
+            -DeviceType $DeviceType `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+    }
+    finally {
+        if ($rdr) {
+            try { $rdr.Close() } catch {}
+            try { $rdr.Dispose() } catch {}
+        }
+        if ($ctx -and $ctx.connection) {
+            try { $ctx.connection.Close() } catch {}
+            try { $ctx.connection.Dispose() } catch {}
+        }
+    }
+}
+
+function Save-ColumnConfig {
+    param(
+        $Data,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $vchType = [int]$Data.vch_type
+    $deviceType = if ($null -ne $Data.device_type) { [int]$Data.device_type } else { 0 }
+
+    $ctx = $null
+
+    try {
+        $ctx = Get-BusyCloudFastConfigDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        $conn = $ctx.connection
+
+        $isAccountVoucher = @(14, 15, 16, 19) -contains $vchType
+        $supportsQuickMode = @(14, 19) -contains $vchType
+
+        $cmd = $conn.CreateCommand()
+        try { $cmd.CommandTimeout = 5 } catch {}
+        $cmd.CommandText = "SELECT COUNT(*) FROM Config WHERE RecType=201 AND [Type]=$vchType AND D15=$deviceType"
+        $exists = ([int]$cmd.ExecuteScalar() -gt 0)
+
+        if ($isAccountVoucher) {
+            $requestedMode = ([string]$Data.account_default_mode).ToLowerInvariant()
+            $i1 = if ($supportsQuickMode -and $requestedMode -eq "single") { 1 } else { 2 }
+            $i2 = if ($supportsQuickMode -and ($Data.account_allow_mode_switch -eq $true -or $Data.account_allow_mode_switch -eq "true")) { 1 } else { 0 }
+            $i3 = Convert-BusyCloudBehaviorNameToInt ([string]$Data.acc_quick_col_account)
+            $i4 = Convert-BusyCloudBehaviorNameToInt ([string]$Data.acc_quick_col_amount)
+            $i5 = Convert-BusyCloudBehaviorNameToInt ([string]$Data.acc_quick_col_short_narration)
+            $i6 = Convert-BusyCloudBehaviorNameToInt ([string]$Data.acc_double_col_dc)
+            $i7 = Convert-BusyCloudBehaviorNameToInt ([string]$Data.acc_double_col_account)
+            $i8 = Convert-BusyCloudBehaviorNameToInt ([string]$Data.acc_double_col_debit)
+            $i9 = Convert-BusyCloudBehaviorNameToInt ([string]$Data.acc_double_col_credit)
+            $i10 = Convert-BusyCloudBehaviorNameToInt ([string]$Data.acc_double_col_short_narration)
+
+            if ($exists) {
+                $sql = "UPDATE Config SET I1=$i1,I2=$i2,I3=$i3,I4=$i4,I5=$i5,I6=$i6,I7=$i7,I8=$i8,I9=$i9,I10=$i10 WHERE RecType=201 AND [Type]=$vchType AND D15=$deviceType"
+            }
+            else {
+                $sql = "INSERT INTO Config (RecType,[Type],D15,I1,I2,I3,I4,I5,I6,I7,I8,I9,I10) VALUES (201,$vchType,$deviceType,$i1,$i2,$i3,$i4,$i5,$i6,$i7,$i8,$i9,$i10)"
+            }
+        }
+        else {
+            $i1 = if ($Data.enable_item_discount -eq $true -or $Data.enable_item_discount -eq "true") { 1 } else { 0 }
+            $i2 = if ($Data.enable_alt_units -eq $true -or $Data.enable_alt_units -eq "true") { 1 } else { 0 }
+            $i3 = Convert-BusyCloudBehaviorNameToInt ([string]$Data.col_qty)
+            $i4 = Convert-BusyCloudBehaviorNameToInt ([string]$Data.col_unit)
+            $i5 = Convert-BusyCloudBehaviorNameToInt ([string]$Data.col_price)
+            $i6 = Convert-BusyCloudBehaviorNameToInt ([string]$Data.col_amount)
+            $i7 = Convert-BusyCloudBehaviorNameToInt ([string]$Data.col_discount)
+            $i8 = Convert-BusyCloudBehaviorNameToInt ([string]$Data.col_cfact)
+            $i9 = Convert-BusyCloudBehaviorNameToInt ([string]$Data.col_alt_qty)
+            $i10 = Convert-BusyCloudBehaviorNameToInt ([string]$Data.col_alt_price)
+            $i11 = if ($Data.enable_pos -eq $true -or $Data.enable_pos -eq "true") { 1 } else { 0 }
+
+            $c3 = if ($null -eq $Data.show_stock_balance) {
+                "1"
+            }
+            elseif ($Data.show_stock_balance -eq $true -or $Data.show_stock_balance -eq "true") {
+                "1"
+            }
+            else {
+                "0"
+            }
+
+            $c1 = if ($Data.def_card_acc) { ([string]$Data.def_card_acc).Replace("'", "''") } else { "" }
+            $c2 = if ($Data.def_gift_acc) { ([string]$Data.def_gift_acc).Replace("'", "''") } else { "" }
+
+            if ($exists) {
+                $sql = "UPDATE Config SET I1=$i1,I2=$i2,I3=$i3,I4=$i4,I5=$i5,I6=$i6,I7=$i7,I8=$i8,I9=$i9,I10=$i10,I11=$i11,C1='$c1',C2='$c2',C3='$c3' WHERE RecType=201 AND [Type]=$vchType AND D15=$deviceType"
+            }
+            else {
+                $sql = "INSERT INTO Config (RecType,[Type],D15,I1,I2,I3,I4,I5,I6,I7,I8,I9,I10,I11,C1,C2,C3) VALUES (201,$vchType,$deviceType,$i1,$i2,$i3,$i4,$i5,$i6,$i7,$i8,$i9,$i10,$i11,'$c1','$c2','$c3')"
+            }
+        }
+
+        $cmd = $conn.CreateCommand()
+        try { $cmd.CommandTimeout = 5 } catch {}
+        $cmd.CommandText = $sql
+        [void]$cmd.ExecuteNonQuery()
+
+        $cacheKey = ("{0}|{1}|{2}|{3}" -f $InstanceId, $CompanyCode, $vchType, $deviceType).ToLowerInvariant()
+        if ($script:BusyCloudFastColumnConfigCache.ContainsKey($cacheKey)) {
+            $script:BusyCloudFastColumnConfigCache.Remove($cacheKey)
+        }
+
+        return @{
+            success = $true
+            message = "Voucher configuration updated successfully"
+            storage = if ($ctx.dbType -eq 1) { "SQL-DIRECT" } else { "ACCESS-DIRECT" }
+        }
+    }
+    catch {
+        Write-Host "  [FAST-CONFIG WARN] Direct column-config save failed for $InstanceId/$CompanyCode; using COM fallback. $($_.Exception.Message)" -ForegroundColor DarkYellow
+
+        return & $script:BusyCloudLegacySaveColumnConfig `
+            -Data $Data `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+    }
+    finally {
+        if ($ctx -and $ctx.connection) {
+            try { $ctx.connection.Close() } catch {}
+            try { $ctx.connection.Dispose() } catch {}
+        }
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Access approval-config fast path
+# -----------------------------------------------------------------------------
+# The approval queue/actions may still use BUSY COM on Access when they already
+# have an ExistingFi. Settings/navigation calls do not need COM, so when no
+# ExistingFi is supplied these functions read the fiscal Config BDS directly.
+
+function Get-VoucherApprovalConfig-AccessCom {
+    param(
+        [int]$VchType,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = "",
+        $ExistingFi = $null
+    )
+
+    if ($ExistingFi) {
+        return & $script:BusyCloudLegacyGetVoucherApprovalConfigAccessCom `
+            -VchType $VchType `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode `
+            -ExistingFi $ExistingFi
+    }
+
+    $ctx = $null
+    $rdr = $null
+
+    try {
+        $ctx = Get-BusyCloudFastConfigDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        $conn = $ctx.connection
+
+        $approvalRequired = $false
+        $approvers = @()
+
+        $cmd = $conn.CreateCommand()
+        try { $cmd.CommandTimeout = 5 } catch {}
+        $cmd.CommandText = "SELECT TOP 1 I1 FROM Config WHERE RecType=203 AND [Type]=$VchType"
+        $raw = $cmd.ExecuteScalar()
+        if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+            $approvalRequired = ([int]$raw -eq 1)
+        }
+
+        $cmd = $conn.CreateCommand()
+        try { $cmd.CommandTimeout = 5 } catch {}
+        $cmd.CommandText = "SELECT C1 FROM Config WHERE RecType=204 AND [Type]=$VchType AND I1=1"
+        $rdr = $cmd.ExecuteReader()
+
+        while ($rdr.Read()) {
+            $name = ""
+            if (-not $rdr.IsDBNull(0)) {
+                $name = ([string]$rdr.GetValue(0)).Trim()
+            }
+            if ($name -and $approvers -notcontains $name) {
+                $approvers += $name
+            }
+        }
+
+        return @{
+            success = $true
+            data = @{
+                vch_type = $VchType
+                approval_required = [bool]$approvalRequired
+                approvers = @($approvers | Sort-Object)
+            }
+        }
+    }
+    catch {
+        Write-Host "  [FAST-CONFIG WARN] Direct Access approval-config read failed; using COM fallback. $($_.Exception.Message)" -ForegroundColor DarkYellow
+
+        return & $script:BusyCloudLegacyGetVoucherApprovalConfigAccessCom `
+            -VchType $VchType `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+    }
+    finally {
+        if ($rdr) {
+            try { $rdr.Close() } catch {}
+            try { $rdr.Dispose() } catch {}
+        }
+        if ($ctx -and $ctx.connection) {
+            try { $ctx.connection.Close() } catch {}
+            try { $ctx.connection.Dispose() } catch {}
+        }
+    }
+}
+
+function Save-VoucherApprovalConfig-AccessCom {
+    param(
+        $Data,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $vchType = 0
+    try { $vchType = [int]$Data.vch_type } catch {}
+
+    if (-not (Test-IsBusyCloudApprovalVoucherType -VchType $vchType)) {
+        return @{ success = $false; error = "Unsupported or missing vch_type." }
+    }
+
+    $rawRequired = ([string]$Data.approval_required).Trim().ToLowerInvariant()
+    $approvalRequired = (
+        $Data.approval_required -eq $true -or
+        $rawRequired -eq "1" -or
+        $rawRequired -eq "true"
+    )
+
+    $requestedApprovers = @(
+        @($Data.approvers) |
+        ForEach-Object { ([string]$_).Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Sort-Object -Unique
+    )
+
+    $usersResult = Get-CompanyUsers -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $usersResult.success) {
+        return @{
+            success = $false
+            error = "Could not validate approvers against BUSY users. $($usersResult.error)"
+        }
+    }
+
+    $canonicalByLower = @{}
+    foreach ($u in @($usersResult.data)) {
+        $n = ([string]$u).Trim()
+        if ($n) {
+            $canonicalByLower[$n.ToLowerInvariant()] = $n
+        }
+    }
+
+    $approvers = @()
+    $unknown = @()
+
+    foreach ($requested in $requestedApprovers) {
+        $key = $requested.ToLowerInvariant()
+        if ($canonicalByLower.ContainsKey($key)) {
+            $canonical = [string]$canonicalByLower[$key]
+            if ($approvers -notcontains $canonical) {
+                $approvers += $canonical
+            }
+        }
+        else {
+            $unknown += $requested
+        }
+    }
+
+    if ($unknown.Count -gt 0) {
+        return @{
+            success = $false
+            error = ("Unknown BUSY user(s): " + ($unknown -join ", "))
+        }
+    }
+
+    $ctx = $null
+
+    try {
+        $ctx = Get-BusyCloudFastConfigDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        $conn = $ctx.connection
+        $requiredInt = if ($approvalRequired) { 1 } else { 0 }
+
+        $cmd = $conn.CreateCommand()
+        try { $cmd.CommandTimeout = 5 } catch {}
+        $cmd.CommandText = "SELECT COUNT(*) FROM Config WHERE RecType=203 AND [Type]=$vchType"
+        $exists = ([int]$cmd.ExecuteScalar() -gt 0)
+
+        $cmd = $conn.CreateCommand()
+        try { $cmd.CommandTimeout = 5 } catch {}
+
+        if ($exists) {
+            $cmd.CommandText = "UPDATE Config SET I1=$requiredInt WHERE RecType=203 AND [Type]=$vchType"
+        }
+        else {
+            $cmd.CommandText = "INSERT INTO Config (RecType,[Type],I1) VALUES (203,$vchType,$requiredInt)"
+        }
+        [void]$cmd.ExecuteNonQuery()
+
+        $cmd = $conn.CreateCommand()
+        try { $cmd.CommandTimeout = 5 } catch {}
+        $cmd.CommandText = "DELETE FROM Config WHERE RecType=204 AND [Type]=$vchType"
+        [void]$cmd.ExecuteNonQuery()
+
+        foreach ($name in $approvers) {
+            $safe = $name.Replace("'", "''")
+            $cmd = $conn.CreateCommand()
+            try { $cmd.CommandTimeout = 5 } catch {}
+            $cmd.CommandText = "INSERT INTO Config (RecType,[Type],I1,C1) VALUES (204,$vchType,1,'$safe')"
+            [void]$cmd.ExecuteNonQuery()
+        }
+
+        return @{
+            success = $true
+            message = "Voucher approval configuration updated successfully"
+            data = @{
+                vch_type = $vchType
+                approval_required = [bool]$approvalRequired
+                approvers = @($approvers)
+            }
+        }
+    }
+    catch {
+        Write-Host "  [FAST-CONFIG WARN] Direct Access approval-config save failed; using COM fallback. $($_.Exception.Message)" -ForegroundColor DarkYellow
+
+        return & $script:BusyCloudLegacySaveVoucherApprovalConfigAccessCom `
+            -Data $Data `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+    }
+    finally {
+        if ($ctx -and $ctx.connection) {
+            try { $ctx.connection.Close() } catch {}
+            try { $ctx.connection.Dispose() } catch {}
+        }
+    }
+}
+
+function Get-EnabledVoucherApprovalTypes-AccessCom {
+    param(
+        [string]$InstanceId = "",
+        [string]$CompanyCode = "",
+        $ExistingFi = $null
+    )
+
+    if ($ExistingFi) {
+        return & $script:BusyCloudLegacyGetEnabledVoucherApprovalTypesAccessCom `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode `
+            -ExistingFi $ExistingFi
+    }
+
+    $ctx = $null
+    $rdr = $null
+
+    try {
+        $ctx = Get-BusyCloudFastConfigDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        $cmd = $ctx.connection.CreateCommand()
+        try { $cmd.CommandTimeout = 5 } catch {}
+        $cmd.CommandText = "SELECT DISTINCT [Type] FROM Config WHERE RecType=203 AND I1=1"
+        $rdr = $cmd.ExecuteReader()
+
+        $types = @()
+        while ($rdr.Read()) {
+            $t = 0
+            try { $t = [int]$rdr.GetValue(0) } catch {}
+
+            if ((Test-IsBusyCloudApprovalVoucherType -VchType $t) -and $types -notcontains $t) {
+                $types += $t
+            }
+        }
+
+        return @{ success = $true; data = @($types | Sort-Object) }
+    }
+    catch {
+        Write-Host "  [FAST-CONFIG WARN] Direct Access enabled-approval read failed; using COM fallback. $($_.Exception.Message)" -ForegroundColor DarkYellow
+
+        return & $script:BusyCloudLegacyGetEnabledVoucherApprovalTypesAccessCom `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+    }
+    finally {
+        if ($rdr) {
+            try { $rdr.Close() } catch {}
+            try { $rdr.Dispose() } catch {}
+        }
+        if ($ctx -and $ctx.connection) {
+            try { $ctx.connection.Close() } catch {}
+            try { $ctx.connection.Dispose() } catch {}
+        }
+    }
+}
+
+function Get-VoucherApprovalTypesForUser-AccessCom {
+    param(
+        [string]$UserName,
+        [bool]$IsAdmin = $false,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = "",
+        $ExistingFi = $null
+    )
+
+    if ($IsAdmin) {
+        return @{ success = $true; data = @($script:BusyCloudApprovalVoucherTypes) }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($UserName)) {
+        return @{ success = $true; data = @() }
+    }
+
+    if ($ExistingFi) {
+        return & $script:BusyCloudLegacyGetVoucherApprovalTypesForUserAccessCom `
+            -UserName $UserName `
+            -IsAdmin:$IsAdmin `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode `
+            -ExistingFi $ExistingFi
+    }
+
+    $ctx = $null
+    $rdr = $null
+
+    try {
+        $safeUser = $UserName.Trim().Replace("'", "''")
+        $ctx = Get-BusyCloudFastConfigDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        $cmd = $ctx.connection.CreateCommand()
+        try { $cmd.CommandTimeout = 5 } catch {}
+        $cmd.CommandText = "SELECT [Type] FROM Config WHERE RecType=204 AND I1=1 AND C1='$safeUser'"
+        $rdr = $cmd.ExecuteReader()
+
+        $types = @()
+        while ($rdr.Read()) {
+            $t = 0
+            try { $t = [int]$rdr.GetValue(0) } catch {}
+
+            if ((Test-IsBusyCloudApprovalVoucherType -VchType $t) -and $types -notcontains $t) {
+                $types += $t
+            }
+        }
+
+        return @{ success = $true; data = @($types | Sort-Object) }
+    }
+    catch {
+        Write-Host "  [FAST-CONFIG WARN] Direct Access approver-type read failed; using COM fallback. $($_.Exception.Message)" -ForegroundColor DarkYellow
+
+        return & $script:BusyCloudLegacyGetVoucherApprovalTypesForUserAccessCom `
+            -UserName $UserName `
+            -IsAdmin:$IsAdmin `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+    }
+    finally {
+        if ($rdr) {
+            try { $rdr.Close() } catch {}
+            try { $rdr.Dispose() } catch {}
+        }
+        if ($ctx -and $ctx.connection) {
+            try { $ctx.connection.Close() } catch {}
+            try { $ctx.connection.Dispose() } catch {}
+        }
+    }
+}
+
+# =============================================================================
+# END FAST VOUCHER SETTINGS DIRECT-DB OVERRIDES
+# =============================================================================
+
+# =============================================================================
+# FAST OPTIONAL FIELD READ PATH
+# =============================================================================
+# Overrides the COM-based implementations originally loaded from vouchers.ps1.
+# vch_setting.ps1 is loaded after vouchers.ps1, so these definitions win.
+#
+# Read-only endpoints covered:
+#   GET /busy/voucher/optional-fields-config
+#   GET /busy/voucher/optional-fields-values
+#
+# No Connect-BUSY / OpenCSDB / COM is used here.
+# =============================================================================
+
+Write-Host "  [FAST-OPTIONAL-FIELDS-V1] Direct optional-field read path loaded." -ForegroundColor DarkCyan
+
+if ($null -eq $script:BusyCloudOptionalFieldsConfigCache) {
+    $script:BusyCloudOptionalFieldsConfigCache = @{}
+}
+
+if ($null -eq $script:BusyCloudOptionalFieldValuesCache) {
+    $script:BusyCloudOptionalFieldValuesCache = @{}
+}
+
+function Get-VoucherOptionalFields {
+    param(
+        [int]$VchType,
+        [string]$SeriesName,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $startedAt = [System.Diagnostics.Stopwatch]::StartNew()
+
+    if ($VchType -le 0 -or [string]::IsNullOrWhiteSpace($SeriesName)) {
+        return @{
+            success = $true
+            count = 0
+            data = @()
+        }
+    }
+
+    $cleanSeriesName = $SeriesName.Trim()
+
+    $cacheKey = (
+        "{0}|{1}|{2}|{3}" -f
+        $InstanceId,
+        $CompanyCode,
+        $VchType,
+        $cleanSeriesName
+    ).ToLowerInvariant()
+
+    if ($script:BusyCloudOptionalFieldsConfigCache.ContainsKey($cacheKey)) {
+        $entry = $script:BusyCloudOptionalFieldsConfigCache[$cacheKey]
+
+        if (
+            $entry -and
+            $entry.expiresAt -gt [DateTime]::UtcNow
+        ) {
+            Write-Host (
+                "  [OPTIONAL-FIELDS-FAST] cache HIT {0}/{1} type={2} series='{3}' rows={4}" -f
+                $InstanceId,
+                $CompanyCode,
+                $VchType,
+                $cleanSeriesName,
+                @($entry.result.data).Count
+            ) -ForegroundColor DarkCyan
+
+            return $entry.result
+        }
+
+        try {
+            $script:BusyCloudOptionalFieldsConfigCache.Remove($cacheKey)
+        }
+        catch {
+        }
+    }
+
+    $ctx = $null
+    $reader = $null
+    $cmd = $null
+
+    try {
+        $ctx = Get-BusyCloudFastConfigDbContext `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        if (
+            $null -eq $ctx -or
+            $null -eq $ctx.connection
+        ) {
+            throw "Direct fiscal database connection is unavailable."
+        }
+
+        $conn = $ctx.connection
+
+        # ---------------------------------------------------------------------
+        # 1. Resolve the voucher-series master code.
+        # ---------------------------------------------------------------------
+
+        $prefixStr = "{0:D2}" -f $VchType
+
+        $prefixedSeriesName = if (
+            $cleanSeriesName.StartsWith(
+                $prefixStr,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+        ) {
+            $cleanSeriesName
+        }
+        else {
+            "$prefixStr$cleanSeriesName"
+        }
+
+        $safeSeriesName =
+            $cleanSeriesName.Replace("'", "''")
+
+        $safePrefixedName =
+            $prefixedSeriesName.Replace("'", "''")
+
+        $cmd = $conn.CreateCommand()
+        try { $cmd.CommandTimeout = 5 } catch {}
+
+        $cmd.CommandText = @"
+SELECT TOP 1 Code
+FROM Master1
+WHERE MasterType = 21
+  AND (
+        Name = '$safeSeriesName'
+        OR Name = '$safePrefixedName'
+      )
+"@
+
+        $seriesValue = $cmd.ExecuteScalar()
+
+        try { $cmd.Dispose() } catch {}
+        $cmd = $null
+
+        if (
+            $null -eq $seriesValue -or
+            $seriesValue -eq [System.DBNull]::Value
+        ) {
+            $result = @{
+                success = $true
+                count = 0
+                data = @()
+            }
+
+            $script:BusyCloudOptionalFieldsConfigCache[$cacheKey] = @{
+                expiresAt = [DateTime]::UtcNow.AddMinutes(5)
+                result = $result
+            }
+
+            return $result
+        }
+
+        $seriesCode = [int]$seriesValue
+
+        # ---------------------------------------------------------------------
+        # 2. Read the single RecType=1 configuration row.
+        #
+        # The original logic only uses C1..C20 to build the returned field
+        # definitions. I* values are read there but do not affect the result.
+        # ---------------------------------------------------------------------
+
+        $columns = @(
+            1..20 |
+            ForEach-Object { "C$_" }
+        ) -join ", "
+
+        $cmd = $conn.CreateCommand()
+        try { $cmd.CommandTimeout = 5 } catch {}
+
+        $cmd.CommandText = @"
+SELECT TOP 1
+    $columns
+FROM Config
+WHERE RecType = 1
+  AND L1 = $seriesCode
+"@
+
+        $reader = $cmd.ExecuteReader()
+
+        $fieldNames = @{}
+
+        if ($reader.Read()) {
+            for ($i = 1; $i -le 20; $i++) {
+                $fieldName = ""
+
+                try {
+                    $ordinal =
+                        $reader.GetOrdinal("C$i")
+
+                    if (-not $reader.IsDBNull($ordinal)) {
+                        $fieldName = (
+                            [string]$reader.GetValue($ordinal)
+                        ).Trim()
+                    }
+                }
+                catch {
+                    $fieldName = ""
+                }
+
+                if (-not [string]::IsNullOrWhiteSpace($fieldName)) {
+                    $fieldNames[$i] = $fieldName
+                }
+            }
+        }
+
+        try { $reader.Close() } catch {}
+        try { $reader.Dispose() } catch {}
+        $reader = $null
+
+        try { $cmd.Dispose() } catch {}
+        $cmd = $null
+
+        if ($fieldNames.Count -eq 0) {
+            $result = @{
+                success = $true
+                count = 0
+                data = @()
+            }
+
+            $script:BusyCloudOptionalFieldsConfigCache[$cacheKey] = @{
+                expiresAt = [DateTime]::UtcNow.AddMinutes(5)
+                result = $result
+            }
+
+            return $result
+        }
+
+        # ---------------------------------------------------------------------
+        # 3. Resolve dropdown/master-backed optional fields in ONE query.
+        #
+        # Original code could execute a separate COUNT(*) query for every text
+        # field. We preserve the same 1000 + field number rule but collapse all
+        # checks into a single DISTINCT query.
+        # ---------------------------------------------------------------------
+
+        $masterTypesPresent = @{}
+
+        $cmd = $conn.CreateCommand()
+        try { $cmd.CommandTimeout = 5 } catch {}
+
+        $cmd.CommandText = @"
+SELECT DISTINCT MasterType
+FROM Master1
+WHERE MasterType >= 1001
+  AND MasterType <= 1020
+"@
+
+        $reader = $cmd.ExecuteReader()
+
+        while ($reader.Read()) {
+            try {
+                if (-not $reader.IsDBNull(0)) {
+                    $masterTypesPresent[[int]$reader.GetValue(0)] = $true
+                }
+            }
+            catch {
+            }
+        }
+
+        try { $reader.Close() } catch {}
+        try { $reader.Dispose() } catch {}
+        $reader = $null
+
+        try { $cmd.Dispose() } catch {}
+        $cmd = $null
+
+        # ---------------------------------------------------------------------
+        # 4. Build the EXACT existing response shape and vocabulary mapping.
+        # ---------------------------------------------------------------------
+
+        $fields = @()
+
+        foreach ($i in ($fieldNames.Keys | Sort-Object)) {
+            $fName = [string]$fieldNames[$i]
+
+            $fieldType = "text"
+            $decimalPlaces = 0
+            $maintainMaster = $false
+
+            if (
+                $fName -match
+                "Date|Dated|Expiry|Due|Period|Mfg|Format|Year|Month|Day"
+            ) {
+                $fieldType = "date"
+            }
+            elseif (
+                $fName -match
+                "Bool|Booleom|Booleon|YesNo|Status|Active|Enabled|Hold|Block|Approved"
+            ) {
+                $fieldType = "boolean"
+            }
+            elseif (
+                $fName -match
+                "Number|Qty|Amt|Rate|Val|Numeric|Discount|Price|Tax|Gst|Balance|Percent|Charge|Cost|Comm|Commission|Duty|Freight"
+            ) {
+                $fieldType = "numeric"
+                $decimalPlaces = 3
+            }
+            else {
+                $targetMasterType = 1000 + [int]$i
+
+                if ($masterTypesPresent.ContainsKey($targetMasterType)) {
+                    $maintainMaster = $true
+                }
+            }
+
+            $fields += @{
+                fieldKey       = "OptionField$i"
+                fieldName      = $fName
+                fieldType      = $fieldType
+                decimalPlaces  = $decimalPlaces
+                maintainMaster = $maintainMaster
+            }
+        }
+
+        $result = @{
+            success = $true
+            count = $fields.Count
+            data = @($fields)
+        }
+
+        $script:BusyCloudOptionalFieldsConfigCache[$cacheKey] = @{
+            expiresAt = [DateTime]::UtcNow.AddMinutes(5)
+            result = $result
+        }
+
+        $startedAt.Stop()
+
+        Write-Host (
+            "  [OPTIONAL-FIELDS-FAST] {0}/{1} type={2} series='{3}' db={4} rows={5} elapsedMs={6}" -f
+            $InstanceId,
+            $CompanyCode,
+            $VchType,
+            $cleanSeriesName,
+            [string]$ctx.database,
+            $fields.Count,
+            [int]$startedAt.ElapsedMilliseconds
+        ) -ForegroundColor DarkCyan
+
+        return $result
+    }
+    catch {
+        if ($startedAt.IsRunning) {
+            $startedAt.Stop()
+        }
+
+        Write-Host (
+            "  [OPTIONAL-FIELDS-FAST FAIL] {0}/{1} type={2} series='{3}' elapsedMs={4} error={5}" -f
+            $InstanceId,
+            $CompanyCode,
+            $VchType,
+            $cleanSeriesName,
+            [int]$startedAt.ElapsedMilliseconds,
+            $_.Exception.Message
+        ) -ForegroundColor Red
+
+        # Deliberately fail fast. A read-only page-load endpoint should not
+        # freeze the entire API process by falling back to BUSY COM.
+        return @{
+            success = $false
+            error = $_.Exception.Message
+            data = @()
+        }
+    }
+    finally {
+        if ($reader) {
+            try { $reader.Close() } catch {}
+            try { $reader.Dispose() } catch {}
+        }
+
+        if ($cmd) {
+            try { $cmd.Dispose() } catch {}
+        }
+
+        if (
+            $ctx -and
+            $ctx.connection
+        ) {
+            try { $ctx.connection.Close() } catch {}
+            try { $ctx.connection.Dispose() } catch {}
+        }
+    }
+}
+
+function Get-OptionalFieldMasterValues {
+    param(
+        [int]$VchType,
+        [string]$SeriesName,
+        [int]$FieldNo,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if ($FieldNo -le 0) {
+        return @{
+            success = $true
+            data = @()
+        }
+    }
+
+    $cacheKey = (
+        "{0}|{1}|{2}" -f
+        $InstanceId,
+        $CompanyCode,
+        $FieldNo
+    ).ToLowerInvariant()
+
+    if ($script:BusyCloudOptionalFieldValuesCache.ContainsKey($cacheKey)) {
+        $entry = $script:BusyCloudOptionalFieldValuesCache[$cacheKey]
+
+        if (
+            $entry -and
+            $entry.expiresAt -gt [DateTime]::UtcNow
+        ) {
+            return $entry.result
+        }
+
+        try {
+            $script:BusyCloudOptionalFieldValuesCache.Remove($cacheKey)
+        }
+        catch {
+        }
+    }
+
+    $startedAt = [System.Diagnostics.Stopwatch]::StartNew()
+    $ctx = $null
+    $reader = $null
+    $cmd = $null
+
+    try {
+        $ctx = Get-BusyCloudFastConfigDbContext `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        if (
+            $null -eq $ctx -or
+            $null -eq $ctx.connection
+        ) {
+            throw "Direct fiscal database connection is unavailable."
+        }
+
+        $targetMasterType = 1000 + $FieldNo
+
+        $cmd = $ctx.connection.CreateCommand()
+        try { $cmd.CommandTimeout = 5 } catch {}
+
+        $cmd.CommandText = @"
+SELECT Name
+FROM Master1
+WHERE MasterType = $targetMasterType
+ORDER BY Name
+"@
+
+        $reader = $cmd.ExecuteReader()
+
+        $values = @()
+
+        while ($reader.Read()) {
+            try {
+                if (-not $reader.IsDBNull(0)) {
+                    $value = (
+                        [string]$reader.GetValue(0)
+                    ).Trim()
+
+                    if (-not [string]::IsNullOrWhiteSpace($value)) {
+                        $values += $value
+                    }
+                }
+            }
+            catch {
+            }
+        }
+
+        $result = @{
+            success = $true
+            data = @($values)
+        }
+
+        $script:BusyCloudOptionalFieldValuesCache[$cacheKey] = @{
+            expiresAt = [DateTime]::UtcNow.AddMinutes(5)
+            result = $result
+        }
+
+        $startedAt.Stop()
+
+        Write-Host (
+            "  [OPTIONAL-VALUES-FAST] {0}/{1} field={2} db={3} rows={4} elapsedMs={5}" -f
+            $InstanceId,
+            $CompanyCode,
+            $FieldNo,
+            [string]$ctx.database,
+            $values.Count,
+            [int]$startedAt.ElapsedMilliseconds
+        ) -ForegroundColor DarkCyan
+
+        return $result
+    }
+    catch {
+        if ($startedAt.IsRunning) {
+            $startedAt.Stop()
+        }
+
+        Write-Host (
+            "  [OPTIONAL-VALUES-FAST FAIL] {0}/{1} field={2} elapsedMs={3} error={4}" -f
+            $InstanceId,
+            $CompanyCode,
+            $FieldNo,
+            [int]$startedAt.ElapsedMilliseconds,
+            $_.Exception.Message
+        ) -ForegroundColor Red
+
+        return @{
+            success = $false
+            error = $_.Exception.Message
+            data = @()
+        }
+    }
+    finally {
+        if ($reader) {
+            try { $reader.Close() } catch {}
+            try { $reader.Dispose() } catch {}
+        }
+
+        if ($cmd) {
+            try { $cmd.Dispose() } catch {}
+        }
+
+        if (
+            $ctx -and
+            $ctx.connection
+        ) {
+            try { $ctx.connection.Close() } catch {}
+            try { $ctx.connection.Dispose() } catch {}
+        }
+    }
+}
+
+# =============================================================================
+# END FAST OPTIONAL FIELD READ PATH
+# =============================================================================
