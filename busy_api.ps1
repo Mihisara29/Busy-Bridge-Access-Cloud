@@ -187,6 +187,14 @@ $requiredFunctions = @(
     "Get-VoucherItemDetail",
     "Create-Voucher",
 
+    # BusyCloud Voucher Approval
+    "Get-VoucherApprovalConfig",
+    "Save-VoucherApprovalConfig",
+    "Ensure-BusyCloudVoucherApprovalAuditTable",
+    "Initialize-BusyCloudApprovalStorage",
+    "Approve-Voucher",
+    "Unapprove-Voucher",
+
     # Salesman / Sales Ref
     "Get-Salesmen",
     "Get-SalesmanAssignmentForAuthUser",
@@ -218,6 +226,25 @@ foreach ($functionName in $requiredFunctions) {
 Write-Host `
     "  Required functions verified successfully." `
     -ForegroundColor Green
+
+
+# ============================================================
+# BUSYCLOUD APPROVAL STORAGE INITIALIZATION
+#
+# Idempotent: creates BusyCloudVoucherApprovalAudit only when it
+# does not already exist in each configured SQL / Access company.
+# A failure in one offline company is logged but does not prevent
+# the API from starting; each approval write also performs a lazy
+# ensure check for safety.
+# ============================================================
+
+Write-Host "  Checking BusyCloud voucher approval storage..." -ForegroundColor Cyan
+$approvalStorage = Initialize-BusyCloudApprovalStorage -VerboseOutput $true
+if ($approvalStorage.failed -gt 0) {
+    Write-Host "  [WARN] Approval storage initialization completed with $($approvalStorage.failed) company warning(s)." -ForegroundColor DarkYellow
+} else {
+    Write-Host "  Approval storage verified for $($approvalStorage.initialized) company database(s)." -ForegroundColor Green
+}
 
 
 # ============================================================
