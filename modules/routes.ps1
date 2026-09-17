@@ -802,16 +802,78 @@ function Get-AllItemGroupPermissionNodes {
         [string]$CompanyCode = ""
     )
 
-    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
-    if (-not $fi) {
-        return @{ success = $false; error = "BUSY connection failed"; data = @() }
+    # Read-only permission master. Never initialize BUSY COM here.
+    if ($null -eq $script:BusyCloudItemGroupTreeCache) {
+        $script:BusyCloudItemGroupTreeCache = @{}
     }
 
+    $cacheKey = (
+        "{0}|{1}|item-group-tree" -f
+        $InstanceId,
+        $CompanyCode
+    ).ToLowerInvariant()
+
+    if ($script:BusyCloudItemGroupTreeCache.ContainsKey($cacheKey)) {
+        $entry = $script:BusyCloudItemGroupTreeCache[$cacheKey]
+
+        if (
+            $entry -and
+            $entry.expires -and
+            (Get-Date) -lt $entry.expires
+        ) {
+            Write-Host (
+                "  [ITEM-GROUP-TREE-FAST] cache HIT {0}/{1} rows={2}" -f
+                $InstanceId,
+                $CompanyCode,
+                @($entry.data).Count
+            ) -ForegroundColor DarkCyan
+
+            return @{
+                success = $true
+                count = @($entry.data).Count
+                data = @($entry.data)
+            }
+        }
+
+        try {
+            $script:BusyCloudItemGroupTreeCache.Remove($cacheKey)
+        }
+        catch {
+        }
+    }
+
+    $startedAt = Get-Date
+    $ctx = $null
+    $reader = $null
+
     try {
-        # BUSY Item Groups are MasterType=5. Return ALL Item Groups, including
-        # currently empty groups, so permissions remain valid when new items are
-        # created later under an already-granted branch.
-        $rst = $fi.GetRecordset(@"
+        $resolver = Get-Command `
+            Get-BusyCloudFastConfigDbContext `
+            -ErrorAction SilentlyContinue
+
+        if ($null -eq $resolver) {
+            throw "Fast fiscal database resolver is unavailable."
+        }
+
+        $ctx = Get-BusyCloudFastConfigDbContext `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        if (
+            $null -eq $ctx -or
+            $null -eq $ctx.connection
+        ) {
+            throw "Direct fiscal database connection is unavailable."
+        }
+
+        $cmd = $ctx.connection.CreateCommand()
+        try {
+            $cmd.CommandTimeout = 5
+        }
+        catch {
+        }
+
+        $cmd.CommandText = @"
 SELECT
     Code,
     Name,
@@ -820,78 +882,85 @@ SELECT
 FROM Master1
 WHERE MasterType = 5
 ORDER BY Name
-"@)
+"@
+
+        $reader = $cmd.ExecuteReader()
 
         $rows = @()
         $byCode = @{}
 
-        if ($rst -and -not $rst.EOF) {
-            try { $rst.MoveFirst() } catch {}
+        while ($reader.Read()) {
+            $code = 0
+            $parentCode = 0
+            $name = ""
+            $alias = ""
 
-            while (-not $rst.EOF) {
-                $code = 0
-                $parentCode = 0
-                $name = ""
-                $alias = ""
-
-                try {
-                    $raw = $rst.Fields.Item("Code").Value
-                    if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
-                        $code = [int]$raw
-                    }
-                } catch {}
-
-                try {
-                    $raw = $rst.Fields.Item("ParentGrp").Value
-                    if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
-                        $parentCode = [int]$raw
-                    }
-                } catch {}
-
-                try {
-                    $raw = $rst.Fields.Item("Name").Value
-                    if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
-                        $name = $raw.ToString().Trim()
-                    }
-                } catch {}
-
-                try {
-                    $raw = $rst.Fields.Item("Alias").Value
-                    if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
-                        $alias = $raw.ToString().Trim()
-                    }
-                } catch {}
-
-                if ($code -gt 0) {
-                    $row = [pscustomobject]@{
-                        code       = $code
-                        name       = $name
-                        alias      = $alias
-                        parentCode = $parentCode
-                    }
-                    $rows += $row
-                    $byCode[$code] = $row
+            try {
+                if (-not $reader.IsDBNull(0)) {
+                    $code = [int]$reader.GetValue(0)
                 }
-
-                $rst.MoveNext()
+            }
+            catch {
+                $code = 0
             }
 
-            try { $rst.Close() } catch {}
+            try {
+                if (-not $reader.IsDBNull(1)) {
+                    $name = ([string]$reader.GetValue(1)).Trim()
+                }
+            }
+            catch {
+                $name = ""
+            }
+
+            try {
+                if (-not $reader.IsDBNull(2)) {
+                    $alias = ([string]$reader.GetValue(2)).Trim()
+                }
+            }
+            catch {
+                $alias = ""
+            }
+
+            try {
+                if (-not $reader.IsDBNull(3)) {
+                    $parentCode = [int]$reader.GetValue(3)
+                }
+            }
+            catch {
+                $parentCode = 0
+            }
+
+            if ($code -gt 0) {
+                $row = [pscustomobject]@{
+                    code = $code
+                    name = $name
+                    alias = $alias
+                    parentCode = $parentCode
+                }
+
+                $rows += $row
+                $byCode[$code] = $row
+            }
         }
+
+        try { $reader.Close() } catch {}
+        try { $reader.Dispose() } catch {}
+        $reader = $null
 
         $nodes = @()
 
-        foreach ($row in $rows) {
+        foreach ($row in @($rows)) {
             $chain = @()
             $current = [int]$row.code
             $visited = @{}
 
             for ($guard = 0; $guard -lt 100; $guard++) {
-                if ($current -le 0 -or -not $byCode.ContainsKey($current)) {
-                    break
-                }
-
-                if ($visited.ContainsKey($current)) {
+                if (
+                    $current -le 0 -or
+                    -not $byCode.ContainsKey($current) -or
+                    $visited.ContainsKey($current)
+                ) {
                     break
                 }
 
@@ -901,40 +970,104 @@ ORDER BY Name
             }
 
             $ordered = @()
+
             for ($i = $chain.Count - 1; $i -ge 0; $i--) {
                 $ordered += $chain[$i]
             }
 
-            $pathNames = @($ordered | ForEach-Object { [string]$_.name })
-            $rootCode = if ($ordered.Count -gt 0) { [int]$ordered[0].code } else { [int]$row.code }
-            $rootName = if ($ordered.Count -gt 0) { [string]$ordered[0].name } else { [string]$row.name }
+            $pathNames = @(
+                $ordered |
+                ForEach-Object { [string]$_.name }
+            )
+
+            $rootCode = if ($ordered.Count -gt 0) {
+                [int]$ordered[0].code
+            }
+            else {
+                [int]$row.code
+            }
+
+            $rootName = if ($ordered.Count -gt 0) {
+                [string]$ordered[0].name
+            }
+            else {
+                [string]$row.name
+            }
 
             $nodes += [pscustomobject]@{
-                rootCode  = $rootCode
-                rootName  = $rootName
-                nodeType  = "GROUP"
-                code      = [int]$row.code
-                name      = [string]$row.name
-                alias     = [string]$row.alias
+                rootCode = $rootCode
+                rootName = $rootName
+                nodeType = "GROUP"
+                code = [int]$row.code
+                name = [string]$row.name
+                alias = [string]$row.alias
                 parentCode = [int]$row.parentCode
-                level     = [Math]::Max(0, $ordered.Count - 1)
-                pathText  = ($pathNames -join " > ")
+                level = [Math]::Max(0, $ordered.Count - 1)
+                pathText = ($pathNames -join " > ")
             }
         }
 
-        $sorted = @($nodes | Sort-Object pathText, name)
+        $sorted = @(
+            $nodes |
+            Sort-Object pathText, name
+        )
+
+        $script:BusyCloudItemGroupTreeCache[$cacheKey] = @{
+            expires = (Get-Date).AddMinutes(30)
+            data = @($sorted)
+        }
+
+        $elapsedMs = [int](
+            ((Get-Date) - $startedAt).TotalMilliseconds
+        )
+
+        Write-Host (
+            "  [ITEM-GROUP-TREE-FAST] {0}/{1} db={2} rows={3} elapsedMs={4}" -f
+            $InstanceId,
+            $CompanyCode,
+            [string]$ctx.database,
+            $sorted.Count,
+            $elapsedMs
+        ) -ForegroundColor DarkCyan
 
         return @{
             success = $true
-            count   = $sorted.Count
-            data    = $sorted
+            count = $sorted.Count
+            data = @($sorted)
         }
     }
     catch {
-        return @{ success = $false; error = $_.Exception.Message; data = @() }
+        $elapsedMs = [int](
+            ((Get-Date) - $startedAt).TotalMilliseconds
+        )
+
+        Write-Host (
+            "  [ITEM-GROUP-TREE-FAST FAIL] {0}/{1} elapsedMs={2} error={3}" -f
+            $InstanceId,
+            $CompanyCode,
+            $elapsedMs,
+            $_.Exception.Message
+        ) -ForegroundColor Red
+
+        return @{
+            success = $false
+            error = $_.Exception.Message
+            data = @()
+        }
     }
     finally {
-        Disconnect-BUSY $fi
+        if ($reader) {
+            try { $reader.Close() } catch {}
+            try { $reader.Dispose() } catch {}
+        }
+
+        if (
+            $ctx -and
+            $ctx.connection
+        ) {
+            try { $ctx.connection.Close() } catch {}
+            try { $ctx.connection.Dispose() } catch {}
+        }
     }
 }
 
@@ -1320,6 +1453,109 @@ function Filter-VoucherItemSearchResultByAccess {
 }
 
 
+# ===============================================================
+# BUSYCLOUD APPROVED-VOUCHER MODIFY GUARD
+# ===============================================================
+# Approved vouchers are more restrictive than normal vouchers:
+#   normal user -> normal Modify permission AND approval permission
+#   companyadmin/superadmin -> allowed
+# Non-approved vouchers continue through the existing permission checks.
+function Test-ApprovedVoucherModifyAccess {
+    param(
+        $AuthResult,
+        $Data,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = "",
+        [bool]$RequireAuth = $true
+    )
+
+    $vchType = 0
+    try { $vchType = [int]$Data.vchType } catch {}
+    $vchNo = ([string]$Data.vchNo).Trim()
+    $vchDate = ([string]$Data.date).Trim()
+    $vchSeries = ([string]$Data.vchSeries).Trim()
+
+    if ($vchType -le 0 -or [string]::IsNullOrWhiteSpace($vchNo)) {
+        return @{ success=$true; allowed=$true; preserveApprovedState=$false; preserveApprovalStatus=$null }
+    }
+
+    $state = Get-VoucherApprovalStateByIdentity `
+        -VchType $vchType `
+        -VchNo $vchNo `
+        -VchDate $vchDate `
+        -VchSeries $vchSeries `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $state.success) {
+        return @{ success=$false; allowed=$false; error=$state.error }
+    }
+
+    if (-not $state.found) {
+        return @{ success=$true; allowed=$true; preserveApprovedState=$false; preserveApprovalStatus=$null; state=$state }
+    }
+
+    # Every existing voucher keeps its current BUSY approval state after a
+    # modification. This prevents SaveVchFromXML from auto-approving a pending
+    # voucher or turning an Approval-Not-Required voucher into another state.
+    if ([int]$state.approvalStatus -ne 1) {
+        return @{
+            success=$true
+            allowed=$true
+            preserveApprovedState=$false
+            preserveApprovalStatus=[int]$state.approvalStatus
+            state=$state
+        }
+    }
+
+    # Trusted bridge-secret/internal calls keep existing behavior, but preserve
+    # the Approved status after the save.
+    if (-not $RequireAuth) {
+        return @{ success=$true; allowed=$true; preserveApprovedState=$true; preserveApprovalStatus=1; state=$state }
+    }
+
+    if ($null -eq $AuthResult -or $null -eq $AuthResult.user) {
+        return @{ success=$true; allowed=$false; preserveApprovedState=$true; error="Authenticated user is required to modify an approved voucher." }
+    }
+
+    $isAdmin = Test-IsPermissionAdminUser -User $AuthResult.user
+    if ($isAdmin) {
+        return @{ success=$true; allowed=$true; preserveApprovedState=$true; preserveApprovalStatus=1; state=$state; isAdmin=$true }
+    }
+
+    $userName = ([string]$AuthResult.user.name).Trim()
+    $modify = Test-VoucherModifyPermissionForUser `
+        -UserName $userName `
+        -VchType $vchType `
+        -IsAdmin:$false `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $modify.success) { return @{ success=$false; allowed=$false; error=$modify.error } }
+
+    $approver = Test-VoucherApprover `
+        -UserName $userName `
+        -VchType $vchType `
+        -IsAdmin:$false `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $approver.success) { return @{ success=$false; allowed=$false; error=$approver.error } }
+
+    $allowed = ([bool]$modify.allowed -and [bool]$approver.allowed)
+    return @{
+        success = $true
+        allowed = $allowed
+        preserveApprovedState = $true
+        preserveApprovalStatus = 1
+        hasModifyPermission = [bool]$modify.allowed
+        hasApprovalPermission = [bool]$approver.allowed
+        state = $state
+        error = if ($allowed) { "" } else { "Approved vouchers require both normal Modify permission and approval permission for this voucher type." }
+    }
+}
+
+
 function Start-BUSYServer {
     param(
         [int]$Port = 8081
@@ -1606,13 +1842,13 @@ function Start-BUSYServer {
 
                 $result = Create-Voucher -Data $bodyObj -InstanceId $instanceId -CompanyCode $companyCode
 
-            # --- OFFLINE VOUCHER SYNCHRONIZATION ---
+            # --- LOCAL VOUCHER SYNCHRONIZATION (NEW IMPLEMENTATION) ---
             } elseif ($path -eq "/busy/offline-vouchers/sync" -and $method -eq "POST") {
-                if (-not (Get-Command Sync-OfflineVoucher -ErrorAction SilentlyContinue)) {
+                if (-not (Get-Command Invoke-OfflineVoucherSync -ErrorAction SilentlyContinue)) {
                     $result = @{
                         success   = $false
                         errorCode = "OFFLINE_SYNC_NOT_LOADED"
-                        error     = "Offline synchronization functions are not loaded."
+                        error     = "The new local voucher synchronization module is not loaded."
                     }
                     $response.StatusCode = 503
                 }
@@ -1620,7 +1856,7 @@ function Start-BUSYServer {
                     $result = @{
                         success   = $false
                         errorCode = "AUTH_REQUIRED"
-                        error     = "An authenticated user is required to synchronize offline vouchers."
+                        error     = "An authenticated BUSY user is required to synchronize local vouchers."
                     }
                     $response.StatusCode = 401
                 }
@@ -1631,7 +1867,7 @@ function Start-BUSYServer {
                         $result = @{
                             success   = $false
                             errorCode = "EMPTY_REQUEST"
-                            error     = "Offline voucher payload is required."
+                            error     = "Local voucher payload is required."
                         }
                         $response.StatusCode = 400
                     }
@@ -1645,22 +1881,22 @@ function Start-BUSYServer {
                             $result = @{
                                 success   = $false
                                 errorCode = "INVALID_JSON"
-                                error     = "The offline voucher request body is not valid JSON."
+                                error     = "The local voucher request body is not valid JSON."
                             }
                             $response.StatusCode = 400
                         }
 
                         if ($null -ne $bodyObj) {
-                            $bodyObj | Add-Member -MemberType NoteProperty -Name "instanceId" -Value ([string]$instanceId) -Force
-                            $bodyObj | Add-Member -MemberType NoteProperty -Name "companyCode" -Value ([string]$companyCode) -Force
-                            $bodyObj | Add-Member -MemberType NoteProperty -Name "userName" -Value ([string]$authResult.user.name) -Force
+                            # localId is the permanent idempotency identity. The browser must
+                            # send the SAME localId on every retry.
+                            $headerKey = ([string]$request.Headers["Idempotency-Key"]).Trim()
+                            $bodyKey = ([string]$bodyObj.localId).Trim()
 
-                            $idempotencyKey = [string]$request.Headers["Idempotency-Key"]
-                            if ([string]::IsNullOrWhiteSpace($idempotencyKey)) {
-                                $idempotencyKey = [string]$bodyObj.localId
+                            if ([string]::IsNullOrWhiteSpace($headerKey)) {
+                                $headerKey = $bodyKey
                             }
 
-                            if ([string]::IsNullOrWhiteSpace($idempotencyKey)) {
+                            if ([string]::IsNullOrWhiteSpace($headerKey)) {
                                 $result = @{
                                     success   = $false
                                     errorCode = "IDEMPOTENCY_KEY_REQUIRED"
@@ -1668,7 +1904,10 @@ function Start-BUSYServer {
                                 }
                                 $response.StatusCode = 400
                             }
-                            elseif (-not [string]::IsNullOrWhiteSpace([string]$bodyObj.localId) -and ([string]$bodyObj.localId).Trim() -ne $idempotencyKey.Trim()) {
+                            elseif (
+                                -not [string]::IsNullOrWhiteSpace($bodyKey) -and
+                                $bodyKey -ne $headerKey
+                            ) {
                                 $result = @{
                                     success   = $false
                                     errorCode = "IDEMPOTENCY_KEY_MISMATCH"
@@ -1677,53 +1916,211 @@ function Start-BUSYServer {
                                 $response.StatusCode = 400
                             }
                             else {
-                                $bodyObj | Add-Member -MemberType NoteProperty -Name "localId" -Value $idempotencyKey.Trim() -Force
+                                $bodyObj | Add-Member `
+                                    -MemberType NoteProperty `
+                                    -Name "localId" `
+                                    -Value $headerKey `
+                                    -Force
 
-                                try {
-                                    $result = Sync-OfflineVoucher -Data $bodyObj -CurrentUser $authResult.user
+                                # IMPORTANT:
+                                # Instance/company/user are NEVER trusted from IndexedDB.
+                                # The endpoint uses the current authenticated request context.
+                                $result = Invoke-OfflineVoucherSync `
+                                    -Data $bodyObj `
+                                    -AuthResult $authResult `
+                                    -InstanceId ([string]$instanceId) `
+                                    -CompanyCode ([string]$companyCode)
 
-                                    if ($null -eq $result) {
-                                        $result = @{
-                                            success   = $false
-                                            localId   = $idempotencyKey.Trim()
-                                            errorCode = "EMPTY_SYNC_RESULT"
-                                            error     = "Offline synchronization returned no result."
-                                        }
-                                        $response.StatusCode = 500
-                                    }
-                                    elseif ($result.success -eq $false) {
-                                        if ($result.conflict -eq $true) { $response.StatusCode = 409 }
-                                        else { $response.StatusCode = 400 }
-                                    }
-                                    else {
-                                        $response.StatusCode = 200
-                                    }
-                                }
-                                catch {
-                                    $message = $_.Exception.Message
-                                    $statusCode = 500
-                                    $errorCode = "OFFLINE_SYNC_FAILED"
-                                    $isConflict = $false
-
-                                    if ($message -match "already being processed") {
-                                        $statusCode = 409
-                                        $errorCode = "OFFLINE_SYNC_IN_PROGRESS"
-                                        $isConflict = $true
-                                    }
-                                    elseif ($message -match "required" -or $message -match "invalid" -or $message -match "not found") {
-                                        $statusCode = 400
-                                        $errorCode = "OFFLINE_SYNC_VALIDATION_FAILED"
-                                    }
-
+                                if ($null -eq $result) {
                                     $result = @{
                                         success   = $false
-                                        localId   = $idempotencyKey.Trim()
-                                        conflict  = $isConflict
-                                        errorCode = $errorCode
-                                        error     = $message
+                                        localId   = $headerKey
+                                        errorCode = "EMPTY_SYNC_RESULT"
+                                        error     = "Local voucher synchronization returned no result."
                                     }
-                                    $response.StatusCode = $statusCode
+                                    $response.StatusCode = 500
                                 }
+                                elseif ($null -ne $result.httpStatus) {
+                                    try {
+                                        $response.StatusCode = [int]$result.httpStatus
+                                    }
+                                    catch {
+                                        $response.StatusCode = if ($result.success -eq $true) { 200 } else { 500 }
+                                    }
+                                }
+                                elseif ($result.success -eq $true) {
+                                    $response.StatusCode = 200
+                                }
+                                elseif ($result.conflict -eq $true) {
+                                    $response.StatusCode = 409
+                                }
+                                else {
+                                    $response.StatusCode = 400
+                                }
+                            }
+                        }
+                    }
+                }
+
+
+            # --- LOCAL VOUCHER REVIEW / RECONCILIATION ---
+            } elseif ($path -eq "/busy/offline-vouchers/reconcile" -and $method -eq "POST") {
+                if (-not (Get-Command Invoke-OfflineVoucherReconciliation -ErrorAction SilentlyContinue)) {
+                    $result = @{
+                        success   = $false
+                        errorCode = "OFFLINE_RECONCILIATION_NOT_LOADED"
+                        error     = "Local voucher reconciliation functions are not loaded."
+                    }
+                    $response.StatusCode = 503
+                }
+                elseif (-not $requireAuth -or $null -eq $authResult -or $null -eq $authResult.user) {
+                    $result = @{
+                        success   = $false
+                        errorCode = "AUTH_REQUIRED"
+                        error     = "An authenticated BUSY user is required to reconcile local vouchers."
+                    }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $bodyText = Read-RequestBody $request
+
+                    if ([string]::IsNullOrWhiteSpace($bodyText)) {
+                        $result = @{
+                            success   = $false
+                            errorCode = "EMPTY_REQUEST"
+                            error     = "localId is required."
+                        }
+                        $response.StatusCode = 400
+                    }
+                    else {
+                        $bodyObj = $null
+
+                        try {
+                            $bodyObj = $bodyText | ConvertFrom-Json
+                        }
+                        catch {
+                            $result = @{
+                                success   = $false
+                                errorCode = "INVALID_JSON"
+                                error     = "The reconciliation request body is not valid JSON."
+                            }
+                            $response.StatusCode = 400
+                        }
+
+                        if ($null -ne $bodyObj) {
+                            $localId = ([string]$bodyObj.localId).Trim()
+
+                            if ([string]::IsNullOrWhiteSpace($localId)) {
+                                $result = @{
+                                    success   = $false
+                                    errorCode = "LOCAL_ID_REQUIRED"
+                                    error     = "localId is required."
+                                }
+                                $response.StatusCode = 400
+                            }
+                            else {
+                                $result = Invoke-OfflineVoucherReconciliation `
+                                    -LocalId $localId `
+                                    -AuthResult $authResult `
+                                    -InstanceId ([string]$instanceId) `
+                                    -CompanyCode ([string]$companyCode)
+
+                                if ($null -eq $result) {
+                                    $result = @{
+                                        success   = $false
+                                        localId   = $localId
+                                        errorCode = "EMPTY_RECONCILIATION_RESULT"
+                                        error     = "Local voucher reconciliation returned no result."
+                                    }
+                                    $response.StatusCode = 500
+                                }
+                                elseif ($null -ne $result.httpStatus) {
+                                    try {
+                                        $response.StatusCode = [int]$result.httpStatus
+                                    }
+                                    catch {
+                                        $response.StatusCode = if ($result.success -eq $true) { 200 } else { 500 }
+                                    }
+                                }
+                                elseif ($result.success -eq $true) {
+                                    $response.StatusCode = 200
+                                }
+                                elseif ($result.reviewRequired -eq $true) {
+                                    $response.StatusCode = 409
+                                }
+                                else {
+                                    $response.StatusCode = 400
+                                }
+                            }
+                        }
+                    }
+                }
+
+
+            # --- LOCAL VOUCHER SAFE REPAIR ---
+            } elseif ($path -eq "/busy/offline-vouchers/repair" -and $method -eq "POST") {
+                if (-not (Get-Command Invoke-OfflineVoucherRepair -ErrorAction SilentlyContinue)) {
+                    $result = @{
+                        success   = $false
+                        errorCode = "OFFLINE_REPAIR_NOT_LOADED"
+                        error     = "Local voucher repair functions are not loaded."
+                    }
+                    $response.StatusCode = 503
+                }
+                elseif (-not $requireAuth -or $null -eq $authResult -or $null -eq $authResult.user) {
+                    $result = @{
+                        success   = $false
+                        errorCode = "AUTH_REQUIRED"
+                        error     = "An authenticated BUSY user is required to repair a local voucher."
+                    }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $bodyText = Read-RequestBody $request
+                    $bodyObj = $null
+
+                    if ([string]::IsNullOrWhiteSpace($bodyText)) {
+                        $result = @{ success=$false; errorCode="EMPTY_REQUEST"; error="localId is required." }
+                        $response.StatusCode = 400
+                    }
+                    else {
+                        try { $bodyObj = $bodyText | ConvertFrom-Json }
+                        catch {
+                            $result = @{ success=$false; errorCode="INVALID_JSON"; error="The repair request body is not valid JSON." }
+                            $response.StatusCode = 400
+                        }
+                    }
+
+                    if ($null -ne $bodyObj) {
+                        $localId = ([string]$bodyObj.localId).Trim()
+
+                        if ([string]::IsNullOrWhiteSpace($localId)) {
+                            $result = @{ success=$false; errorCode="LOCAL_ID_REQUIRED"; error="localId is required." }
+                            $response.StatusCode = 400
+                        }
+                        else {
+                            $result = Invoke-OfflineVoucherRepair `
+                                -LocalId $localId `
+                                -AuthResult $authResult `
+                                -InstanceId ([string]$instanceId) `
+                                -CompanyCode ([string]$companyCode)
+
+                            if ($null -eq $result) {
+                                $result = @{ success=$false; localId=$localId; errorCode="EMPTY_REPAIR_RESULT"; error="Local voucher repair returned no result." }
+                                $response.StatusCode = 500
+                            }
+                            elseif ($null -ne $result.httpStatus) {
+                                try { $response.StatusCode = [int]$result.httpStatus }
+                                catch { $response.StatusCode = if ($result.success -eq $true) { 200 } else { 500 } }
+                            }
+                            elseif ($result.success -eq $true) {
+                                $response.StatusCode = 200
+                            }
+                            elseif ($result.reviewRequired -eq $true) {
+                                $response.StatusCode = 409
+                            }
+                            else {
+                                $response.StatusCode = 400
                             }
                         }
                     }
@@ -1731,6 +2128,38 @@ function Start-BUSYServer {
 
             } elseif ($path -eq "/busy/voucher/modify" -and $method -eq "POST") {
                 $bodyObj = Read-RequestBody $request | ConvertFrom-Json
+
+                # Approved vouchers require BOTH the normal Modify permission
+                # and approval permission for the voucher type (admins bypass).
+                $approvedModifyCheck = Test-ApprovedVoucherModifyAccess `
+                    -AuthResult $authResult `
+                    -Data $bodyObj `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode `
+                    -RequireAuth $requireAuth
+
+                if (-not $approvedModifyCheck.success) {
+                    Send-Response $response @{
+                        success = $false
+                        errorCode = "APPROVED_VOUCHER_MODIFY_VALIDATION_FAILED"
+                        error = if ($approvedModifyCheck.error) { $approvedModifyCheck.error } else { "Could not validate approved voucher modification access." }
+                    } 500
+                    continue
+                }
+
+                if (-not $approvedModifyCheck.allowed) {
+                    Send-Response $response @{
+                        success = $false
+                        errorCode = "APPROVED_VOUCHER_MODIFY_ACCESS_DENIED"
+                        error = if ($approvedModifyCheck.error) { $approvedModifyCheck.error } else { "You cannot modify this approved voucher." }
+                        hasModifyPermission = $approvedModifyCheck.hasModifyPermission
+                        hasApprovalPermission = $approvedModifyCheck.hasApprovalPermission
+                    } 403
+                    continue
+                }
+
+                $bodyObj | Add-Member -MemberType NoteProperty -Name "preserveApprovedState" -Value ([bool]$approvedModifyCheck.preserveApprovedState) -Force
+                $bodyObj | Add-Member -MemberType NoteProperty -Name "preserveApprovalStatus" -Value $approvedModifyCheck.preserveApprovalStatus -Force
 
                 $salesmanCheck = Apply-SalesmanAssignmentToVoucherData `
                     -AuthResult $authResult `
@@ -2104,6 +2533,126 @@ function Start-BUSYServer {
             } elseif ($path -eq "/busy/column-config" -and $method -eq "POST") {
                 $data = Read-RequestBody $request | ConvertFrom-Json
                 $result = Save-ColumnConfig -Data $data -InstanceId $instanceId -CompanyCode $companyCode
+
+            # --- BUSYCLOUD VOUCHER APPROVAL CONFIGURATION (ADMIN) ---
+            } elseif ($path -eq "/busy/voucher-approval-config" -and $method -eq "GET") {
+                if (-not $requireAuth -or $null -eq $authResult -or $null -eq $authResult.user -or -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    $result = @{ success=$false; error="Administrator permission is required." }
+                    $response.StatusCode = 403
+                } else {
+                    $vchTypeStr = Get-QueryStringValue $request.QueryString "vchType" ""
+                    if ([string]::IsNullOrWhiteSpace($vchTypeStr)) { $vchTypeStr = Get-QueryStringValue $request.QueryString "params[vchType]" "" }
+                    $approvalVchType = 0
+                    [void][int]::TryParse([string]$vchTypeStr, [ref]$approvalVchType)
+                    if ($approvalVchType -le 0) {
+                        $result = @{ success=$false; error="vchType is required." }
+                        $response.StatusCode = 400
+                    } else {
+                        $result = Get-VoucherApprovalConfig -VchType $approvalVchType -InstanceId $instanceId -CompanyCode $companyCode
+                        if ($result.success -eq $false) { $response.StatusCode = 400 }
+                    }
+                }
+
+            } elseif ($path -eq "/busy/voucher-approval-config" -and $method -eq "POST") {
+                if (-not $requireAuth -or $null -eq $authResult -or $null -eq $authResult.user -or -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    $result = @{ success=$false; error="Administrator permission is required." }
+                    $response.StatusCode = 403
+                } else {
+                    $data = Read-RequestBody $request | ConvertFrom-Json
+                    $result = Save-VoucherApprovalConfig -Data $data -InstanceId $instanceId -CompanyCode $companyCode
+                    if ($result.success -eq $false) { $response.StatusCode = 400 }
+                }
+
+            # --- APPROVAL INBOX / APPROVED LIST / BUSYCLOUD HISTORY ---
+            } elseif ($path -eq "/busy/voucher-approvals" -and $method -eq "GET") {
+                if (-not $requireAuth -or $null -eq $authResult -or $null -eq $authResult.user) {
+                    $result = @{ success=$false; error="Authenticated BUSY user is required." }
+                    $response.StatusCode = 401
+                } else {
+                    $statusFilter = Get-QueryStringValue $request.QueryString "status" "pending"
+                    $typeStr = Get-QueryStringValue $request.QueryString "vchType" ""
+                    $searchText = Get-QueryStringValue $request.QueryString "search" ""
+                    $fromDate = Get-QueryStringValue $request.QueryString "from" ""
+                    $toDate = Get-QueryStringValue $request.QueryString "to" ""
+                    $pageStr = Get-QueryStringValue $request.QueryString "page" "1"
+                    $pageSizeStr = Get-QueryStringValue $request.QueryString "pageSize" "50"
+
+                    # Backward-compatible support for older axios/query wrappers.
+                    if ([string]::IsNullOrWhiteSpace($statusFilter)) { $statusFilter = Get-QueryStringValue $request.QueryString "params[status]" "pending" }
+                    if ([string]::IsNullOrWhiteSpace($typeStr)) { $typeStr = Get-QueryStringValue $request.QueryString "params[vchType]" "" }
+                    if ([string]::IsNullOrWhiteSpace($searchText)) { $searchText = Get-QueryStringValue $request.QueryString "params[search]" "" }
+                    if ([string]::IsNullOrWhiteSpace($fromDate)) { $fromDate = Get-QueryStringValue $request.QueryString "params[from]" "" }
+                    if ([string]::IsNullOrWhiteSpace($toDate)) { $toDate = Get-QueryStringValue $request.QueryString "params[to]" "" }
+                    if ([string]::IsNullOrWhiteSpace($pageStr)) { $pageStr = Get-QueryStringValue $request.QueryString "params[page]" "1" }
+                    if ([string]::IsNullOrWhiteSpace($pageSizeStr)) { $pageSizeStr = Get-QueryStringValue $request.QueryString "params[pageSize]" "50" }
+
+                    $listType = 0; $page = 1; $pageSize = 50
+                    if ($typeStr) { [void][int]::TryParse([string]$typeStr, [ref]$listType) }
+                    if ($pageStr) { [void][int]::TryParse([string]$pageStr, [ref]$page) }
+                    if ([string]$pageSizeStr -ieq "all") {
+                        $pageSize = 0
+                    } else {
+                        [void][int]::TryParse([string]$pageSizeStr, [ref]$pageSize)
+                    }
+                    if ($page -lt 1) { $page = 1 }
+                    if ($pageSize -notin @(0,50,100,200,300,500)) { $pageSize = 50 }
+
+                    $isApprovalAdmin = Test-IsPermissionAdminUser -User $authResult.user
+
+                    $result = Get-VoucherApprovalQueue `
+                        -UserName ([string]$authResult.user.name) `
+                        -IsAdmin:$isApprovalAdmin `
+                        -Status $statusFilter `
+                        -VchType $listType `
+                        -Search ([string]$searchText) `
+                        -FromDate ([string]$fromDate) `
+                        -ToDate ([string]$toDate) `
+                        -Page $page `
+                        -PageSize $pageSize `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false) { $response.StatusCode = if ($result.httpStatus) { [int]$result.httpStatus } else { 400 } }
+                }
+
+            } elseif ($path -eq "/busy/voucher/approve" -and $method -eq "POST") {
+                if (-not $requireAuth -or $null -eq $authResult -or $null -eq $authResult.user) {
+                    $result = @{ success=$false; error="Authenticated BUSY user is required." }
+                    $response.StatusCode = 401
+                } else {
+                    $data = Read-RequestBody $request | ConvertFrom-Json
+                    $vchCode = 0
+                    [void][int]::TryParse([string]$data.vchCode, [ref]$vchCode)
+                    $isApprovalAdmin = Test-IsPermissionAdminUser -User $authResult.user
+                    $result = Approve-Voucher `
+                        -VchCode $vchCode `
+                        -UserName ([string]$authResult.user.name) `
+                        -IsAdmin:$isApprovalAdmin `
+                        -Remarks ([string]$data.remarks) `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+                    if ($result.success -eq $false) { $response.StatusCode = if ($result.httpStatus) { [int]$result.httpStatus } else { 400 } }
+                }
+
+            } elseif ($path -eq "/busy/voucher/unapprove" -and $method -eq "POST") {
+                if (-not $requireAuth -or $null -eq $authResult -or $null -eq $authResult.user) {
+                    $result = @{ success=$false; error="Authenticated BUSY user is required." }
+                    $response.StatusCode = 401
+                } else {
+                    $data = Read-RequestBody $request | ConvertFrom-Json
+                    $vchCode = 0
+                    [void][int]::TryParse([string]$data.vchCode, [ref]$vchCode)
+                    $isApprovalAdmin = Test-IsPermissionAdminUser -User $authResult.user
+                    $result = Unapprove-Voucher `
+                        -VchCode $vchCode `
+                        -UserName ([string]$authResult.user.name) `
+                        -IsAdmin:$isApprovalAdmin `
+                        -Reason ([string]$data.reason) `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+                    if ($result.success -eq $false) { $response.StatusCode = if ($result.httpStatus) { [int]$result.httpStatus } else { 400 } }
+                }
+
 
             # --- VOUCHER NUMBERING ADMIN CONFIGURATION ---
             } elseif ($path -eq "/busy/voucher-numbering-admin" -and $method -eq "GET") {
@@ -2893,12 +3442,73 @@ function Start-BUSYServer {
                             ) -ForegroundColor DarkGreen
                         }
                         else {
-                            # Admin / trusted internal path keeps the existing
-                            # BUSY search behavior, including stock enrichment.
-                            $result = Get-ItemsForVoucher `
-                                -Search      $searchVal `
-                                -InstanceId  $instanceId `
+                            # Admin / trusted internal users are allowed to see
+                            # every item. The old path called Get-ItemsForVoucher
+                            # without group filtering, which could initialize
+                            # BUSY COM for stock-enriched search and freeze this
+                            # single-threaded PowerShell server for many seconds.
+                            #
+                            # Reuse the existing FAST item-module path instead:
+                            # resolve every Item Group directly from Master1 and
+                            # pass those codes through the same branch already
+                            # used successfully for permission-restricted users.
+                            $allItemGroups = Get-AllItemGroupPermissionNodes `
+                                -InstanceId $instanceId `
                                 -CompanyCode $companyCode
+
+                            if (-not $allItemGroups.success) {
+                                $result = @{
+                                    success = $false
+                                    error = if ($allItemGroups.error) {
+                                        [string]$allItemGroups.error
+                                    }
+                                    else {
+                                        "Could not load BUSY Item Groups."
+                                    }
+                                    data = @()
+                                }
+                            }
+                            else {
+                                $allItemGroupCodes = @(
+                                    @($allItemGroups.data) |
+                                    ForEach-Object {
+                                        $code = 0
+                                        if (
+                                            [int]::TryParse(
+                                                [string]$_.code,
+                                                [ref]$code
+                                            ) -and
+                                            $code -gt 0
+                                        ) {
+                                            $code
+                                        }
+                                    } |
+                                    Select-Object -Unique
+                                )
+
+                                $itemSearchStopwatch =
+                                    [System.Diagnostics.Stopwatch]::StartNew()
+
+                                $result = Get-ItemsForVoucher `
+                                    -Search $searchVal `
+                                    -AllowedGroupCodes $allItemGroupCodes `
+                                    -EnforceGroupAccess $true `
+                                    -MaxResults $itemPageSize `
+                                    -InstanceId $instanceId `
+                                    -CompanyCode $companyCode
+
+                                $itemSearchStopwatch.Stop()
+
+                                Write-Host (
+                                    "  [ITEMS-FAST-ADMIN] user={0} vchType={1} search='{2}' groups={3} returned={4} elapsedMs={5}" -f
+                                    $userNameForLog,
+                                    $itemVchType,
+                                    $searchVal,
+                                    $allItemGroupCodes.Count,
+                                    @($result.data).Count,
+                                    [int]$itemSearchStopwatch.ElapsedMilliseconds
+                                ) -ForegroundColor DarkGreen
+                            }
                         }
                     }
                 }
@@ -3025,6 +3635,33 @@ function Start-BUSYServer {
                 }
 
                 $result = Get-AllItemGroupPermissionNodes `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode
+
+            } elseif ($path -eq "/busy/account-lookup" -and $method -eq "GET") {
+                # Voucher Settings POS account picker. Keep this admin-only because
+                # the endpoint exposes the company ledger master.
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    continue
+                }
+
+                $searchVal = Get-QueryStringValue $request.QueryString "search" ""
+                if ($searchVal -eq "") {
+                    $searchVal = Get-QueryStringValue $request.QueryString "params[search]" ""
+                }
+
+                $limitVal = Get-QueryStringValue $request.QueryString "limit" "50"
+                if ($limitVal -eq "") {
+                    $limitVal = Get-QueryStringValue $request.QueryString "params[limit]" "50"
+                }
+
+                $lookupLimit = 50
+                try { $lookupLimit = [int]$limitVal } catch { $lookupLimit = 50 }
+
+                $result = Get-AccountLookup `
+                    -Search $searchVal `
+                    -Limit $lookupLimit `
                     -InstanceId $instanceId `
                     -CompanyCode $companyCode
 

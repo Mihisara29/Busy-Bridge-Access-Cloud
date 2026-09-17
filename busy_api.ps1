@@ -31,7 +31,6 @@ function Load-Module {
     return $modulePath
 }
 
-
 # ============================================================
 # CORE CONFIG / UTILITIES
 # ============================================================
@@ -121,34 +120,24 @@ Write-Host "  Loaded: scan_login.ps1" -ForegroundColor Gray
 
 
 # ============================================================
-# OFFLINE SYNCHRONIZATION
+# OFFLINE / LOCAL VOUCHER SYNCHRONIZATION
 #
-# These files currently enable StrictMode internally.
-# They are loaded here, then StrictMode is turned off again so
-# older BUSY modules keep their previous behavior with
-# optional/missing properties.
+# This replaces the old split offline_sync_*.ps1 modules.
+#
+# Required file:
+#   modules\offline_voucher_sync.ps1
+#
+# It owns:
+# - Local voucher synchronization
+# - Idempotency / duplicate protection
+# - Durable sync tracking
+# - Retry / recovery state handling
+# - Final numbering at synchronization time
+# - Posting through the existing Create-Voucher pipeline
 # ============================================================
 
-. (Load-Module "offline_sync_db.ps1")
-Write-Host "  Loaded: offline_sync_db.ps1" -ForegroundColor Gray
-
-. (Load-Module "offline_sync_store.ps1")
-Write-Host "  Loaded: offline_sync_store.ps1" -ForegroundColor Gray
-
-. (Load-Module "offline_sync_validation.ps1")
-Write-Host "  Loaded: offline_sync_validation.ps1" -ForegroundColor Gray
-
-. (Load-Module "offline_sync_idempotency.ps1")
-Write-Host "  Loaded: offline_sync_idempotency.ps1" -ForegroundColor Gray
-
-. (Load-Module "offline_sync_numbering.ps1")
-Write-Host "  Loaded: offline_sync_numbering.ps1" -ForegroundColor Gray
-
-. (Load-Module "offline_sync_logging.ps1")
-Write-Host "  Loaded: offline_sync_logging.ps1" -ForegroundColor Gray
-
-. (Load-Module "offline_sync.ps1")
-Write-Host "  Loaded: offline_sync.ps1" -ForegroundColor Gray
+. (Load-Module "offline_voucher_sync.ps1")
+Write-Host "  Loaded: offline_voucher_sync.ps1" -ForegroundColor Gray
 
 
 # ============================================================
@@ -179,6 +168,7 @@ Write-Host "  Loaded: routes.ps1" -ForegroundColor Gray
 # ============================================================
 
 $requiredFunctions = @(
+
     # Reports
     "Get-OutstandingReport",
     "Get-StockStatusReport",
@@ -207,8 +197,8 @@ $requiredFunctions = @(
     "Create-Bom",
     "Update-Bom",
 
-    # Offline Sync
-    "Sync-OfflineVoucher",
+    # Offline / Local Sync
+    "Invoke-OfflineVoucherSync",
 
     # Server
     "Start-BUSYServer"
@@ -233,17 +223,27 @@ Write-Host `
 #
 # Idempotent: creates BusyCloudVoucherApprovalAudit only when it
 # does not already exist in each configured SQL / Access company.
+#
 # A failure in one offline company is logged but does not prevent
 # the API from starting; each approval write also performs a lazy
 # ensure check for safety.
 # ============================================================
 
-Write-Host "  Checking BusyCloud voucher approval storage..." -ForegroundColor Cyan
+Write-Host `
+    "  Checking BusyCloud voucher approval storage..." `
+    -ForegroundColor Cyan
+
 $approvalStorage = Initialize-BusyCloudApprovalStorage -VerboseOutput $true
+
 if ($approvalStorage.failed -gt 0) {
-    Write-Host "  [WARN] Approval storage initialization completed with $($approvalStorage.failed) company warning(s)." -ForegroundColor DarkYellow
-} else {
-    Write-Host "  Approval storage verified for $($approvalStorage.initialized) company database(s)." -ForegroundColor Green
+    Write-Host `
+        "  [WARN] Approval storage initialization completed with $($approvalStorage.failed) company warning(s)." `
+        -ForegroundColor DarkYellow
+}
+else {
+    Write-Host `
+        "  Approval storage verified for $($approvalStorage.initialized) company database(s)." `
+        -ForegroundColor Green
 }
 
 

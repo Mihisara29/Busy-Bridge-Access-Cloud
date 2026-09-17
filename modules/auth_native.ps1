@@ -223,8 +223,12 @@ function Get-CompanyUsers {
             return @{ success = $true; data = $users }
         } catch { return @{ success = $false; error = $_.Exception.Message } } finally { if ($null -ne $conn) { try { $conn.Close() } catch {} } }
     } else {
-        $dbFile = Get-MainCompanyDbPath -CompanyCode $CompanyCode
-        if ([string]::IsNullOrEmpty($dbFile) -or -not (Test-Path $dbFile)) { return @{ success = $false; error = "Main database not found" } }
+        # Resolve Access/BDS against the exact selected instance. Company codes
+        # such as Comp0001 can exist in multiple configured instances, so the
+        # legacy Get-MainCompanyDbPath(companyCode) lookup is ambiguous here.
+        $companyFolder = Join-Path ([string]$inst.dataPath) ([string]$found.company.code)
+        $dbFile = Join-Path $companyFolder "db.bds"
+        if ([string]::IsNullOrEmpty($dbFile) -or -not (Test-Path $dbFile)) { return @{ success = $false; error = "Main database not found for selected instance/company" } }
         $conn = $null
         try {
             $conn = Open-BdsConnection -DbFile $dbFile
@@ -256,7 +260,6 @@ function Get-UserPermissions {
         $conn  = $null
         try {
             $conn = Open-SqlConnection -SqlServer $inst.sqlServer -Database $sqlDb -SqlUser $inst.sqlUser -SqlPassword $inst.sqlPassword
-            Ensure-MobileUserPreferenceTable -Conn $conn
             $cmd = $conn.CreateCommand()
             $cmd.CommandText = "SELECT * FROM MobileUserPreference"
             $rdr = $cmd.ExecuteReader()
@@ -546,9 +549,9 @@ function Invoke-BusyLogin {
 
     Write-Host " [BUSY-LOGIN] Resolved instance '$InstanceId', dbType=$dbType, isAccessDb=$isAccessDb" -ForegroundColor Cyan
 
-    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
-    if (-not $fi) { return @{ success = $false; error = "Could not connect to BUSY Database." } }
-
+    # Login validation below uses direct SQL/OLEDB queries only.
+    # Do NOT open BUSY COM here: on SQL companies OpenCSDB can block for minutes
+    # and can leave the COM session unusable for subsequent master-data calls.
     try {
         $dbCipher    = $null
         $matchedUser = ""
@@ -675,7 +678,6 @@ if ($assignedRole -ne "superadmin") {
                 try {
                     $dbName   = Get-SqlDatabaseName -CompanyCode $CompanyCode -InstanceId $InstanceId
                     $prefConn = Open-SqlConnection -SqlServer $targetInst.sqlServer -Database $dbName -SqlUser $targetInst.sqlUser -SqlPassword $targetInst.sqlPassword
-                    Ensure-MobileUserPreferenceTable -Conn $prefConn
                     $prefCmd  = $prefConn.CreateCommand()
                     $prefCmd.CommandText = "SELECT * FROM MobileUserPreference WHERE [Name]=@u"
                     $prefCmd.Parameters.AddWithValue("@u", $matchedUser) | Out-Null
@@ -698,7 +700,7 @@ if ($assignedRole -ne "superadmin") {
     } catch {
         Write-Host "[BUSY-LOGIN-ERR] General error inside Invoke-BusyLogin: $($_.Exception.Message)" -ForegroundColor Red
         return @{ success = $false; error = "Database error: $($_.Exception.Message)" }
-    } finally { Disconnect-BUSY $fi }
+    }
 }
 
 # ===============================================================

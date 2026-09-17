@@ -700,6 +700,173 @@ ORDER BY Master1.Name
 
 
 # ═══════════════════════════════════════════════════════
+#  LIGHTWEIGHT ACCOUNT LOOKUP (Voucher Settings / POS)
+#  Returns only flat ledger rows. It intentionally does NOT build the full
+#  Chart-of-Accounts permission tree used by PermissionsPage.
+# ═══════════════════════════════════════════════════════
+function Get-AccountLookup {
+    param(
+        [string]$Search      = "",
+        [int]$Limit          = 50,
+        [string]$InstanceId  = "",
+        [string]$CompanyCode = ""
+    )
+
+    $startedAt = [System.Diagnostics.Stopwatch]::StartNew()
+    $ctx = $null
+    $reader = $null
+    $cmd = $null
+
+    try {
+        $resolver = Get-Command `
+            Get-BusyCloudFastConfigDbContext `
+            -ErrorAction SilentlyContinue
+
+        if ($null -eq $resolver) {
+            throw "Fast fiscal database resolver is unavailable."
+        }
+
+        $ctx = Get-BusyCloudFastConfigDbContext `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        if (
+            $null -eq $ctx -or
+            $null -eq $ctx.connection
+        ) {
+            throw "Direct fiscal database connection is unavailable."
+        }
+
+        $safeLimit = [Math]::Max(1, [Math]::Min(100, $Limit))
+        $dbType = [int]$ctx.dbType
+        $wildcard = if ($dbType -eq 1) { "%" } else { "*" }
+        $tableHint = if ($dbType -eq 1) { " WITH (NOLOCK)" } else { "" }
+
+        $where = @"
+Master1.MasterType = 2
+AND Master1.Name IS NOT NULL
+AND Master1.Name <> ''
+"@
+
+        if (-not [string]::IsNullOrWhiteSpace($Search)) {
+            $safeSearch = $Search.Trim().Replace("'", "''")
+            $where += @"
+ AND (
+    Master1.Name LIKE '$wildcard$safeSearch$wildcard'
+    OR Master1.Alias LIKE '$wildcard$safeSearch$wildcard'
+ )
+"@
+        }
+
+        $cmd = $ctx.connection.CreateCommand()
+        try { $cmd.CommandTimeout = 5 } catch {}
+
+        # TOP works for both SQL Server and Access/OLEDB. The result is deliberately
+        # capped because Voucher Settings only needs an autocomplete result set.
+        $cmd.CommandText = @"
+SELECT TOP $safeLimit
+    Master1.Code,
+    Master1.Name,
+    Master1.Alias
+FROM Master1$tableHint
+WHERE $where
+ORDER BY Master1.Name
+"@
+
+        $reader = $cmd.ExecuteReader()
+        $accounts = @()
+
+        while ($reader.Read()) {
+            $code = 0
+            $name = ""
+            $alias = ""
+
+            try {
+                if (-not $reader.IsDBNull(0)) {
+                    $code = [int][string]$reader.GetValue(0)
+                }
+            }
+            catch { $code = 0 }
+
+            try {
+                if (-not $reader.IsDBNull(1)) {
+                    $name = ([string]$reader.GetValue(1)).Trim()
+                }
+            }
+            catch { $name = "" }
+
+            try {
+                if (-not $reader.IsDBNull(2)) {
+                    $alias = ([string]$reader.GetValue(2)).Trim()
+                }
+            }
+            catch { $alias = "" }
+
+            if ($code -le 0 -or [string]::IsNullOrWhiteSpace($name)) {
+                continue
+            }
+
+            $accounts += @{
+                code  = $code
+                name  = $name
+                alias = $alias
+            }
+        }
+
+        $startedAt.Stop()
+        Write-Host (
+            "  [ACCOUNT-LOOKUP-FAST] {0}/{1} db={2} search='{3}' rows={4} elapsedMs={5}" -f
+            $InstanceId,
+            $CompanyCode,
+            [string]$ctx.database,
+            $Search,
+            @($accounts).Count,
+            [int]$startedAt.ElapsedMilliseconds
+        ) -ForegroundColor DarkCyan
+
+        return @{
+            success = $true
+            count   = @($accounts).Count
+            data    = @($accounts)
+        }
+    }
+    catch {
+        if ($startedAt.IsRunning) {
+            $startedAt.Stop()
+        }
+
+        Write-Host (
+            "  [ACCOUNT-LOOKUP-FAST FAIL] {0}/{1} elapsedMs={2} error={3}" -f
+            $InstanceId,
+            $CompanyCode,
+            [int]$startedAt.ElapsedMilliseconds,
+            $_.Exception.Message
+        ) -ForegroundColor Red
+
+        return @{
+            success = $false
+            error   = $_.Exception.Message
+            data    = @()
+        }
+    }
+    finally {
+        if ($reader) {
+            try { $reader.Close() } catch {}
+            try { $reader.Dispose() } catch {}
+        }
+
+        if ($cmd) {
+            try { $cmd.Dispose() } catch {}
+        }
+
+        if ($ctx -and $ctx.connection) {
+            try { $ctx.connection.Close() } catch {}
+            try { $ctx.connection.Dispose() } catch {}
+        }
+    }
+}
+
+# ═══════════════════════════════════════════════════════
 #  GET PARTIES (Paginated, Searchable & Cash/Bank Capable)
 # ═══════════════════════════════════════════════════════
 # ===============================================================
