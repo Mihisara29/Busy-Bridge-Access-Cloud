@@ -714,6 +714,10 @@ function Format-NumberingVoucherNo {
     }
 }
 
+# -----------------------------------------------------------------------------
+# STABILITY RESTORE: exact Get-NumberingConfig behavior from the proven monolith.
+# Uses BUSY CFixedInterface/GetRecordset instead of short-timeout direct SQL.
+# -----------------------------------------------------------------------------
 function Get-NumberingConfig {
     param(
         [int]$VchType,
@@ -722,66 +726,56 @@ function Get-NumberingConfig {
         [string]$CompanyCode = ""
     )
 
-    $startedAt = Get-Date
-    $ctx = $null
-    $reader = $null
+    $fi = $null
 
     try {
-        # ------------------------------------------------------------
-        # Validate request
-        # ------------------------------------------------------------
+        # Detect database type for correct date syntax.
+        $targetInst = Get-InstanceConfig -InstanceId $InstanceId
+        $dbType = 0
 
-        if ($VchType -le 0) {
+        if (
+            $null -ne $targetInst -and
+            $null -ne $targetInst.dbType
+        ) {
+            $dbType = [int]$targetInst.dbType
+        }
+
+        $isSql = ($dbType -eq 1)
+
+        $fi = Connect-BUSY `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        if (-not $fi) {
             return @{
                 success = $false
-                error = "Voucher type is required"
+                error   = "BUSY connection failed"
             }
         }
 
         if ([string]::IsNullOrWhiteSpace($SeriesName)) {
             return @{
                 success = $false
-                error = "Series name is required"
+                error   = "Series name is required"
             }
         }
 
         $SeriesName = $SeriesName.Trim()
 
         # ------------------------------------------------------------
-        # Open DIRECT fiscal database connection
-        #
-        # IMPORTANT:
-        # No Connect-BUSY / OpenCSDB / BUSY COM is used here.
-        # ------------------------------------------------------------
-
-        $ctx = Get-NumberingDirectDbContext `
-            -InstanceId $InstanceId `
-            -CompanyCode $CompanyCode
-
-        if (
-            $null -eq $ctx -or
-            $null -eq $ctx.connection
-        ) {
-            throw "Direct fiscal database connection is unavailable."
-        }
-
-        $conn = $ctx.connection
-        $isSql = ([int]$ctx.dbType -eq 1)
-
-        # ------------------------------------------------------------
         # Resolve voucher-series code
         # ------------------------------------------------------------
 
-        $typePrefix = "{0:D2}" -f $VchType
+        $prefixStr = "{0:D2}" -f $VchType
         $prefixedSeriesName = $SeriesName
 
         if (
             -not $SeriesName.StartsWith(
-                $typePrefix,
+                $prefixStr,
                 [System.StringComparison]::OrdinalIgnoreCase
             )
         ) {
-            $prefixedSeriesName = "$typePrefix$SeriesName"
+            $prefixedSeriesName = "$prefixStr$SeriesName"
         }
 
         $safeSeriesName =
@@ -791,16 +785,11 @@ function Get-NumberingConfig {
             $prefixedSeriesName.Replace("'", "''")
 
         $seriesCode = 0
+        $sRst = $null
 
-        $cmd = $conn.CreateCommand()
         try {
-            $cmd.CommandTimeout = 5
-        }
-        catch {
-        }
-
-        $cmd.CommandText = @"
-SELECT TOP 1 Code
+            $seriesQuery = @"
+SELECT Code
 FROM Master1
 WHERE MasterType = 21
   AND (
@@ -809,37 +798,193 @@ WHERE MasterType = 21
       )
 "@
 
-        $seriesValue = $cmd.ExecuteScalar()
+            $sRst = $fi.GetRecordset($seriesQuery)
 
-        if (
-            $null -ne $seriesValue -and
-            $seriesValue -ne [System.DBNull]::Value
-        ) {
-            $seriesCode = [int]$seriesValue
+            if ($sRst -and -not $sRst.EOF) {
+                $codeValue =
+                    $sRst.Fields.Item("Code").Value
+
+                if (
+                    $null -ne $codeValue -and
+                    $codeValue -ne [System.DBNull]::Value
+                ) {
+                    $seriesCode = [int]$codeValue
+                }
+            }
+        }
+        finally {
+            if ($sRst) {
+                try {
+                    $sRst.Close()
+                }
+                catch {
+                }
+
+                try {
+                    [System.Runtime.InteropServices.Marshal]::ReleaseComObject(
+                        $sRst
+                    ) | Out-Null
+                }
+                catch {
+                }
+            }
         }
 
         if ($seriesCode -le 0) {
             return @{
                 success = $false
-                error = "Series '$SeriesName' not found"
+                error   = "Series '$SeriesName' not found"
             }
         }
 
         # ------------------------------------------------------------
-        # Read numbering configuration
+        # Default numbering configuration
         # ------------------------------------------------------------
 
-        $configValues = $null
+        $c1 = ""
+        $c2 = ""
+        $c3 = ""
+        $c4 = ""
 
-        $cmd = $conn.CreateCommand()
+        $i1 = 0
+        $i6 = 0
+        $i7 = 0
+        $i8 = 0
+
+        $prefix = ""
+        $suffix = ""
+        $paddingLength = 0
+        $isAuto = $false
+        $frequency = 0
+        $endingNo = 0L
+        $startNo = 1L
+        $gotConfig = $false
+
+        # Helper for safely reading one numbering-config row.
+        function Read-NumberingConfigRow {
+            param(
+                $Recordset
+            )
+
+            $result = @{
+                c1            = ""
+                c2            = ""
+                c3            = ""
+                c4            = ""
+                i1            = 0
+                frequency     = 0
+                paddingLength = 0
+                i6            = 0
+                i7            = 0
+                i8            = 0
+                isAuto        = $false
+                startNo       = 1L
+                endingNo      = 0L
+            }
+
+            foreach ($fieldName in @("C1", "C2", "C3", "C4")) {
+                try {
+                    $value =
+                        $Recordset.Fields.Item($fieldName).Value
+
+                    if (
+                        $null -ne $value -and
+                        $value -ne [System.DBNull]::Value
+                    ) {
+                        $result[$fieldName.ToLower()] =
+                            ([string]$value).Trim()
+                    }
+                }
+                catch {
+                }
+            }
+
+            foreach ($fieldName in @("I1", "I2", "I3", "I6", "I7", "I8")) {
+                try {
+                    $value =
+                        $Recordset.Fields.Item($fieldName).Value
+
+                    if (
+                        $null -ne $value -and
+                        $value -ne [System.DBNull]::Value
+                    ) {
+                        switch ($fieldName) {
+                            "I1" {
+                                $result.i1 = [int]$value
+                            }
+
+                            "I2" {
+                                $result.frequency = [int]$value
+                            }
+
+                            "I3" {
+                                $result.paddingLength = [int]$value
+                            }
+
+                            "I6" {
+                                $result.i6 = [int]$value
+                            }
+
+                            "I7" {
+                                $result.i7 = [int]$value
+                            }
+
+                            "I8" {
+                                $result.i8 = [int]$value
+                            }
+                        }
+                    }
+                }
+                catch {
+                }
+            }
+
+            try {
+                $value =
+                    $Recordset.Fields.Item("L2").Value
+
+                if (
+                    $null -ne $value -and
+                    $value -ne [System.DBNull]::Value
+                ) {
+                    $l2Value = [long]$value
+
+                    $result.isAuto = ($l2Value -ge 1)
+
+                    if ($l2Value -gt 1) {
+                        $result.startNo = $l2Value
+                    }
+                }
+            }
+            catch {
+            }
+
+            try {
+                $value =
+                    $Recordset.Fields.Item("L3").Value
+
+                if (
+                    $null -ne $value -and
+                    $value -ne [System.DBNull]::Value
+                ) {
+                    $result.endingNo = [long]$value
+                }
+            }
+            catch {
+            }
+
+            return $result
+        }
+
+        # ------------------------------------------------------------
+        # Read primary numbering configuration
+        # ------------------------------------------------------------
+
+        $cfgRst = $null
+
         try {
-            $cmd.CommandTimeout = 5
-        }
-        catch {
-        }
-
-        $cmd.CommandText = @"
-SELECT TOP 1
+            $configQuery = @"
+SELECT
     C1,
     C2,
     C3,
@@ -857,45 +1002,42 @@ WHERE RecType = 6
   AND L1 = $seriesCode
 "@
 
-        $reader = $cmd.ExecuteReader()
+            $cfgRst = $fi.GetRecordset($configQuery)
 
-        try {
-            if ($reader.Read()) {
+            if ($cfgRst -and -not $cfgRst.EOF) {
+                $gotConfig = $true
                 $configValues =
-                    Read-NumberingConfigDbRow `
-                        -Reader $reader
+                    Read-NumberingConfigRow -Recordset $cfgRst
             }
         }
         finally {
-            if ($reader) {
+            if ($cfgRst) {
                 try {
-                    $reader.Close()
+                    $cfgRst.Close()
                 }
                 catch {
                 }
 
                 try {
-                    $reader.Dispose()
+                    [System.Runtime.InteropServices.Marshal]::ReleaseComObject(
+                        $cfgRst
+                    ) | Out-Null
                 }
                 catch {
                 }
-
-                $reader = $null
             }
         }
 
-        # Preserve the original fallback configuration lookup.
-        if ($null -eq $configValues) {
-            $cmd = $conn.CreateCommand()
+        # ------------------------------------------------------------
+        # Fallback numbering configuration
+        # ------------------------------------------------------------
+
+        if (-not $gotConfig) {
+            $cfgRst2 = $null
 
             try {
-                $cmd.CommandTimeout = 5
-            }
-            catch {
-            }
-
-            $cmd.CommandText = @"
-SELECT TOP 1
+                $fallbackQuery = @"
+SELECT
     C1,
     C2,
     C3,
@@ -914,47 +1056,44 @@ WHERE L1 = $seriesCode
   AND L2 = 1
 "@
 
-            $reader = $cmd.ExecuteReader()
+                $cfgRst2 = $fi.GetRecordset($fallbackQuery)
 
-            try {
-                if ($reader.Read()) {
+                if ($cfgRst2 -and -not $cfgRst2.EOF) {
+                    $gotConfig = $true
                     $configValues =
-                        Read-NumberingConfigDbRow `
-                            -Reader $reader
+                        Read-NumberingConfigRow -Recordset $cfgRst2
                 }
             }
             finally {
-                if ($reader) {
+                if ($cfgRst2) {
                     try {
-                        $reader.Close()
+                        $cfgRst2.Close()
                     }
                     catch {
                     }
 
                     try {
-                        $reader.Dispose()
+                        [System.Runtime.InteropServices.Marshal]::ReleaseComObject(
+                            $cfgRst2
+                        ) | Out-Null
                     }
                     catch {
                     }
-
-                    $reader = $null
                 }
             }
         }
 
-        if ($null -eq $configValues) {
+        if (-not $gotConfig) {
             return @{
                 success = $false
-                error = (
-                    "Numbering configuration not found for " +
-                    "series '$SeriesName'"
-                )
+                error   = "Numbering configuration not found for series '$SeriesName'"
             }
         }
 
-        $prefix = [string]$configValues.c2
-        $suffix = [string]$configValues.c1
-        $separator = [string]$configValues.c4
+        $c1 = [string]$configValues.c1
+        $c2 = [string]$configValues.c2
+        $c3 = [string]$configValues.c3
+        $c4 = [string]$configValues.c4
 
         $i1 = [int]$configValues.i1
         $frequency = [int]$configValues.frequency
@@ -967,22 +1106,20 @@ WHERE L1 = $seriesCode
         $startNo = [long]$configValues.startNo
         $endingNo = [long]$configValues.endingNo
 
-        $padChar = [char]" "
+        # ------------------------------------------------------------
+        # Resolve visible voucher-number format
+        # ------------------------------------------------------------
 
-        if (
-            -not [string]::IsNullOrEmpty(
-                [string]$configValues.c3
-            )
-        ) {
-            $padChar = [char](
-                [string]$configValues.c3
-            )[0]
+        $padChar = if (-not [string]::IsNullOrEmpty($c3)) {
+            [char]$c3[0]
+        }
+        else {
+            [char]" "
         }
 
-        # ------------------------------------------------------------
-        # Resolve date embedding position
-        # ------------------------------------------------------------
-
+        $sep = $c4
+        $prefix = $c2
+        $suffix = $c1
         $embedPos = "none"
 
         if ($i1 -gt 0) {
@@ -1006,10 +1143,10 @@ WHERE L1 = $seriesCode
                     elseif ($i6 -eq 1) {
                         $embedPos = "suffix"
                     }
-                    elseif ($suffix -ne "") {
+                    elseif ($c1 -ne "") {
                         $embedPos = "prefix"
                     }
-                    elseif ($prefix -ne "") {
+                    elseif ($c2 -ne "") {
                         $embedPos = "suffix"
                     }
                     else {
@@ -1020,15 +1157,16 @@ WHERE L1 = $seriesCode
         }
 
         # ------------------------------------------------------------
-        # Build the BUSY date text for the current numbering period
+        # Build date text used inside visible voucher numbers
         # ------------------------------------------------------------
 
         $now = Get-Date
 
-        $monthAbbr = $now.ToString(
-            "MMM",
-            [System.Globalization.CultureInfo]::InvariantCulture
-        ).ToUpperInvariant()
+        $monthAbbr =
+            $now.ToString(
+                "MMM",
+                [System.Globalization.CultureInfo]::InvariantCulture
+            ).ToUpperInvariant()
 
         $financialYear = if ($now.Month -ge 4) {
             $now.Year
@@ -1037,7 +1175,8 @@ WHERE L1 = $seriesCode
             $now.Year - 1
         }
 
-        $financialYearNext = $financialYear + 1
+        $financialYearNext =
+            $financialYear + 1
 
         $fyShort =
             ($financialYear % 100).ToString("D2")
@@ -1045,68 +1184,66 @@ WHERE L1 = $seriesCode
         $fyNextShort =
             ($financialYearNext % 100).ToString("D2")
 
-        $dateText = ""
+        $dateStr = ""
 
         if ($isAuto -and $i1 -gt 0) {
             if ($frequency -eq 3) {
-                if ($i8 -eq 1) {
-                    $dateText =
-                        "$fyShort-$fyNextShort"
+                $dateStr = if ($i8 -eq 1) {
+                    "$fyShort-$fyNextShort"
                 }
                 else {
-                    $dateText =
-                        "$financialYear-$fyNextShort"
+                    "$financialYear-$fyNextShort"
                 }
             }
             elseif ($frequency -eq 2) {
                 switch ($i8) {
                     2 {
-                        $dateText = $now.ToString("MMyy")
+                        $dateStr = $now.ToString("MMyy")
                     }
 
                     3 {
-                        $dateText = $now.ToString("MM-yyyy")
+                        $dateStr = $now.ToString("MM-yyyy")
                     }
 
                     4 {
-                        $dateText = $now.ToString("MMyyyy")
+                        $dateStr = $now.ToString("MMyyyy")
                     }
 
                     11 {
-                        $dateText =
+                        $dateStr =
                             "$monthAbbr-$($now.ToString('yyyy'))"
                     }
 
                     12 {
-                        $dateText =
+                        $dateStr =
                             "$monthAbbr-$($now.ToString('yy'))"
                     }
 
                     13 {
-                        $dateText = $now.ToString("MM-yyyy")
+                        $dateStr = $now.ToString("MM-yyyy")
                     }
 
                     14 {
-                        $dateText = $now.ToString("MM-yy")
+                        $dateStr = $now.ToString("MM-yy")
                     }
 
                     15 {
-                        $dateText = $now.ToString("MMyy")
+                        $dateStr = $now.ToString("MMyy")
                     }
 
                     16 {
-                        $dateText = $now.ToString("yyMM")
+                        $dateStr = $now.ToString("yyMM")
                     }
 
                     default {
-                        $dateText = $now.ToString("MMyy")
+                        $dateStr = $now.ToString("MMyy")
                     }
                 }
             }
         }
 
         # ------------------------------------------------------------
-        # Limit the sequence scan to the current numbering period
+        # Build date filter for current frequency period
         # ------------------------------------------------------------
 
         $dateFilter = ""
@@ -1122,8 +1259,8 @@ WHERE L1 = $seriesCode
             }
             elseif ($frequency -eq 2) {
                 $periodStart = New-Object DateTime `
-                    $now.Year, `
-                    $now.Month, `
+                    $now.Year,
+                    $now.Month,
                     1
 
                 $periodEndExclusive =
@@ -1138,8 +1275,8 @@ WHERE L1 = $seriesCode
                 }
 
                 $periodStart = New-Object DateTime `
-                    $fyStartYear, `
-                    4, `
+                    $fyStartYear,
+                    4,
                     1
 
                 $periodEndExclusive =
@@ -1151,168 +1288,232 @@ WHERE L1 = $seriesCode
                 $null -ne $periodEndExclusive
             ) {
                 if ($isSql) {
-                    $startText =
+                    $sqlStart =
                         $periodStart.ToString(
                             "yyyy-MM-ddTHH:mm:ss",
                             [System.Globalization.CultureInfo]::InvariantCulture
                         )
 
-                    $endText =
+                    $sqlEnd =
                         $periodEndExclusive.ToString(
                             "yyyy-MM-ddTHH:mm:ss",
                             [System.Globalization.CultureInfo]::InvariantCulture
                         )
 
                     $dateFilter = (
-                        " AND [Date] >= '$startText'" +
-                        " AND [Date] < '$endText'"
+                        " AND [Date] >= '$sqlStart'" +
+                        " AND [Date] < '$sqlEnd'"
                     )
                 }
                 else {
-                    $startText =
+                    $accessStart =
                         $periodStart.ToString(
                             "MM/dd/yyyy",
                             [System.Globalization.CultureInfo]::InvariantCulture
                         )
 
-                    $endText =
+                    $accessEnd =
                         $periodEndExclusive.ToString(
                             "MM/dd/yyyy",
                             [System.Globalization.CultureInfo]::InvariantCulture
                         )
 
                     $dateFilter = (
-                        " AND [Date] >= #$startText#" +
-                        " AND [Date] < #$endText#"
+                        " AND [Date] >= #$accessStart#" +
+                        " AND [Date] < #$accessEnd#"
                     )
                 }
             }
         }
 
         # ------------------------------------------------------------
-        # Determine the current sequence directly from Tran1
-        #
-        # We preserve the previous behavior:
-        # visible VchNo sequence is preferred over AutoVchNo because BUSY can
-        # use a different internal auto sequence.
-        #
-        # Only the selected voucher type, series, active rows and current
-        # numbering period are scanned.
+        # Find highest visible voucher sequence
         # ------------------------------------------------------------
 
         $lastVisibleSeq = 0L
         $lastAutoSeq = 0L
-
-        $cmd = $conn.CreateCommand()
-
-        try {
-            $cmd.CommandTimeout = 5
-        }
-        catch {
-        }
-
-        $cmd.CommandText = (
-            "SELECT AutoVchNo, VchNo " +
-            "FROM Tran1 " +
-            "WHERE VchType = $VchType " +
-            "AND VchSeriesCode = $seriesCode " +
-            "AND Cancelled = 0 " +
-            "AND VchCancelled = 0" +
-            $dateFilter
-        )
-
-        $reader = $cmd.ExecuteReader()
+        $tranRst = $null
 
         try {
-            while ($reader.Read()) {
-                $autoNo = 0L
+            $tranQuery = (
+                "SELECT AutoVchNo, VchNo " +
+                "FROM Tran1 " +
+                "WHERE VchType = $VchType " +
+                "AND VchSeriesCode = $seriesCode " +
+                "AND Cancelled = 0 " +
+                "AND VchCancelled = 0" +
+                $dateFilter
+            )
 
-                try {
-                    $autoNo = [long](
-                        Get-NumberingDbValue `
-                            -Reader $reader `
-                            -Field "AutoVchNo" `
-                            -Default 0
-                    )
-                }
-                catch {
-                    $autoNo = 0L
-                }
+            $tranRst = $fi.GetRecordset($tranQuery)
 
-                if ($autoNo -gt $lastAutoSeq) {
-                    $lastAutoSeq = $autoNo
-                }
+            if ($tranRst -and -not $tranRst.EOF) {
+                $tranRst.MoveFirst()
 
-                $dbVoucherNo = [string](
-                    Get-NumberingDbValue `
-                        -Reader $reader `
-                        -Field "VchNo" `
-                        -Default ""
-                )
+                while (-not $tranRst.EOF) {
+                    $dbAutoNo = 0L
+                    $dbVchNo = ""
 
-                if ([string]::IsNullOrWhiteSpace($dbVoucherNo)) {
-                    continue
-                }
+                    try {
+                        $autoValue =
+                            $tranRst.Fields.Item("AutoVchNo").Value
 
-                if ($isAuto) {
-                    $visibleSeq =
-                        Get-NumberingVisibleSequence `
-                            -VoucherNumber $dbVoucherNo `
-                            -Prefix $prefix `
-                            -Suffix $suffix `
-                            -Separator $separator `
-                            -DateText $dateText
-
-                    if ($visibleSeq -gt $lastVisibleSeq) {
-                        $lastVisibleSeq = $visibleSeq
+                        if (
+                            $null -ne $autoValue -and
+                            $autoValue -ne [System.DBNull]::Value
+                        ) {
+                            $dbAutoNo = [long]$autoValue
+                        }
                     }
-                }
-                else {
-                    $manualSeq = 0L
+                    catch {
+                    }
+
+                    try {
+                        $vchNoValue =
+                            $tranRst.Fields.Item("VchNo").Value
+
+                        if (
+                            $null -ne $vchNoValue -and
+                            $vchNoValue -ne [System.DBNull]::Value
+                        ) {
+                            $dbVchNo =
+                                ([string]$vchNoValue).Trim()
+                        }
+                    }
+                    catch {
+                    }
+
+                    if ($dbAutoNo -gt $lastAutoSeq) {
+                        $lastAutoSeq = $dbAutoNo
+                    }
 
                     if (
-                        [long]::TryParse(
-                            $dbVoucherNo.Trim(),
-                            [ref]$manualSeq
-                        ) -and
-                        $manualSeq -gt $lastVisibleSeq
+                        -not [string]::IsNullOrWhiteSpace($dbVchNo) -and
+                        $isAuto
                     ) {
-                        $lastVisibleSeq = $manualSeq
+                        $temp = $dbVchNo.Trim()
+
+                        if (
+                            $prefix -ne "" -and
+                            $temp.StartsWith(
+                                $prefix,
+                                [System.StringComparison]::OrdinalIgnoreCase
+                            )
+                        ) {
+                            $temp =
+                                $temp.Substring($prefix.Length)
+                        }
+
+                        if (
+                            $suffix -ne "" -and
+                            $temp.EndsWith(
+                                $suffix,
+                                [System.StringComparison]::OrdinalIgnoreCase
+                            )
+                        ) {
+                            $temp =
+                                $temp.Substring(
+                                    0,
+                                    $temp.Length - $suffix.Length
+                                )
+                        }
+
+                        if (
+                            $dateStr -ne "" -and
+                            $temp.IndexOf(
+                                $dateStr,
+                                [System.StringComparison]::OrdinalIgnoreCase
+                            ) -ge 0
+                        ) {
+                            $temp =
+                                [regex]::Replace(
+                                    $temp,
+                                    [regex]::Escape($dateStr),
+                                    "",
+                                    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+                                )
+                        }
+
+                        # Remove the configured separator.
+                        if ($sep -ne "") {
+                            $temp =
+                                $temp.Replace($sep, "")
+                        }
+
+                        # Do not remove the padding character.
+                        # Leading zeroes are valid and TryParse handles them.
+                        $temp = $temp.Trim()
+
+                        $parsedVisible = 0L
+
+                        if (
+                            [long]::TryParse(
+                                $temp,
+                                [ref]$parsedVisible
+                            ) -and
+                            $parsedVisible -gt $lastVisibleSeq
+                        ) {
+                            $lastVisibleSeq =
+                                $parsedVisible
+                        }
                     }
+                    elseif (
+                        -not [string]::IsNullOrWhiteSpace($dbVchNo) -and
+                        -not $isAuto
+                    ) {
+                        $parsedManual = 0L
+
+                        if (
+                            [long]::TryParse(
+                                $dbVchNo,
+                                [ref]$parsedManual
+                            ) -and
+                            $parsedManual -gt $lastVisibleSeq
+                        ) {
+                            $lastVisibleSeq =
+                                $parsedManual
+                        }
+                    }
+
+                    $tranRst.MoveNext()
                 }
             }
         }
         finally {
-            if ($reader) {
+            if ($tranRst) {
                 try {
-                    $reader.Close()
+                    $tranRst.Close()
                 }
                 catch {
                 }
 
                 try {
-                    $reader.Dispose()
+                    [System.Runtime.InteropServices.Marshal]::ReleaseComObject(
+                        $tranRst
+                    ) | Out-Null
                 }
                 catch {
                 }
-
-                $reader = $null
             }
         }
 
-        $lastSeq = 0L
-
-        if ($lastVisibleSeq -gt 0) {
-            $lastSeq = $lastVisibleSeq
+        # Prefer visible voucher number because AutoVchNo can use a
+        # different internal sequence.
+        $lastSeq = if ($lastVisibleSeq -gt 0) {
+            $lastVisibleSeq
         }
         elseif ($lastAutoSeq -gt 0) {
-            $lastSeq = $lastAutoSeq
+            $lastAutoSeq
+        }
+        else {
+            0L
         }
 
-        $currentNo = $startNo
-
-        if ($lastSeq -gt 0) {
-            $currentNo = $lastSeq + 1
+        $currentNo = if ($lastSeq -gt 0) {
+            $lastSeq + 1
+        }
+        else {
+            $startNo
         }
 
         if (
@@ -1321,134 +1522,92 @@ WHERE L1 = $seriesCode
         ) {
             return @{
                 success = $false
-                error = (
-                    "Next voucher number $currentNo exceeds " +
-                    "configured ending number $endingNo"
+                error   = (
+                    "Next voucher number $currentNo exceeds configured " +
+                    "ending number $endingNo"
                 )
             }
         }
 
-        $nextVchNo = ""
+        function Build-LocalVchNo {
+            param(
+                [long]$Sequence
+            )
 
-        if ($isAuto) {
-            $nextVchNo =
-                Format-NumberingVoucherNo `
-                    -Sequence $currentNo `
-                    -PaddingLength $paddingLength `
-                    -PaddingCharacter $padChar `
-                    -Prefix $prefix `
-                    -Suffix $suffix `
-                    -Separator $separator `
-                    -DateText $dateText `
-                    -EmbedPosition $embedPos
+            $numberText =
+                [string]$Sequence
+
+            if ($paddingLength -gt 0) {
+                $numberText =
+                    $numberText.PadLeft(
+                        $paddingLength,
+                        $padChar
+                    )
+            }
+
+            switch ($embedPos) {
+                "suffix" {
+                    return (
+                        "$prefix$numberText$sep$dateStr"
+                    ).Trim()
+                }
+
+                "prefix" {
+                    return (
+                        "$dateStr$sep$numberText$suffix"
+                    ).Trim()
+                }
+
+                default {
+                    return (
+                        "$prefix$numberText$suffix"
+                    ).Trim()
+                }
+            }
+        }
+
+        $nextVchNo = if ($isAuto) {
+            Build-LocalVchNo -Sequence $currentNo
         }
         else {
-            $nextVchNo = [string]$currentNo
+            [string]$currentNo
         }
 
-        $lastVchNo = "(none yet)"
-
-        if ($lastSeq -gt 0) {
-            $lastVchNo =
-                Format-NumberingVoucherNo `
-                    -Sequence $lastSeq `
-                    -PaddingLength $paddingLength `
-                    -PaddingCharacter $padChar `
-                    -Prefix $prefix `
-                    -Suffix $suffix `
-                    -Separator $separator `
-                    -DateText $dateText `
-                    -EmbedPosition $embedPos
+        $lastVchNo = if ($lastSeq -gt 0) {
+            Build-LocalVchNo -Sequence $lastSeq
         }
-
-        $elapsedMs = [int](
-            ((Get-Date) - $startedAt).TotalMilliseconds
-        )
-
-        $databaseLabel = [string]$ctx.database
-
-        Write-Host (
-            (
-                "  [NUMBERING-FAST] {0}/{1} type={2} " +
-                "series='{3}' db={4} next='{5}' elapsedMs={6}"
-            ) -f
-                $InstanceId,
-                $CompanyCode,
-                $VchType,
-                $SeriesName,
-                $databaseLabel,
-                $nextVchNo,
-                $elapsedMs
-        ) -ForegroundColor DarkCyan
+        else {
+            "(none yet)"
+        }
 
         return @{
             success = $true
 
             data = @{
-                vch_type = $VchType
-                series_name = $SeriesName
-                prefix = $prefix
-                suffix = $suffix
+                vch_type       = $VchType
+                series_name    = $SeriesName
+                prefix         = $prefix
+                suffix         = $suffix
                 padding_length = $paddingLength
-                current_no = $currentNo
-                is_auto = $isAuto
-                frequency = $frequency
-                ending_no = $endingNo
-                next_vch_no = $nextVchNo
-                last_vch_no = $lastVchNo
+                current_no     = $currentNo
+                is_auto        = $isAuto
+                frequency      = $frequency
+                ending_no      = $endingNo
+                next_vch_no    = $nextVchNo
+                last_vch_no    = $lastVchNo
             }
         }
     }
     catch {
-        $elapsedMs = [int](
-            ((Get-Date) - $startedAt).TotalMilliseconds
-        )
-
-        Write-Host (
-            (
-                "  [NUMBERING-FAST FAIL] {0}/{1} type={2} " +
-                "series='{3}' elapsedMs={4} error={5}"
-            ) -f
-                $InstanceId,
-                $CompanyCode,
-                $VchType,
-                $SeriesName,
-                $elapsedMs,
-                $_.Exception.Message
-        ) -ForegroundColor Red
-
         return @{
             success = $false
-            error = $_.Exception.Message
+            error   = $_.Exception.Message
         }
     }
     finally {
-        if ($reader) {
+        if ($fi) {
             try {
-                $reader.Close()
-            }
-            catch {
-            }
-
-            try {
-                $reader.Dispose()
-            }
-            catch {
-            }
-        }
-
-        if (
-            $ctx -and
-            $ctx.connection
-        ) {
-            try {
-                $ctx.connection.Close()
-            }
-            catch {
-            }
-
-            try {
-                $ctx.connection.Dispose()
+                Disconnect-BUSY $fi
             }
             catch {
             }

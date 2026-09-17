@@ -1,324 +1,114 @@
 # 07-lookups.ps1
 # Extracted from vouchers.ps1. Keep functions behavior-compatible with the monolith.
 
+# STABILITY RESTORE: exact Get-VoucherSeries behavior from the proven monolith.
+# Uses BUSY CFixedInterface/GetRecordset instead of short-timeout direct SQL.
 function Get-VoucherSeries {
-    param(
-        [int]$VchType = 0,
+    param([int]$VchType = 0,
         [string]$InstanceId = "",
         [string]$CompanyCode = ""
     )
 
-    $requestCacheKey = (
-        "{0}|{1}|voucherseries|{2}" -f
-        $InstanceId,
-        $CompanyCode,
-        $VchType
-    ).ToLowerInvariant()
-
-    $cached = Get-Cache $requestCacheKey
-    if ($cached) {
-        Write-Host (
-            "  [SERIES-FAST-V2] cache HIT {0}/{1} type={2}" -f
-            $InstanceId,
-            $CompanyCode,
-            $VchType
-        ) -ForegroundColor DarkCyan
-
-        return $cached
-    }
-
-    # Cache the RAW series master once per company. Every voucher type can then
-    # be filtered in memory, avoiding repeated scans of Master1.
-    if ($null -eq $script:BusyCloudVoucherSeriesMasterCache) {
-        $script:BusyCloudVoucherSeriesMasterCache = @{}
-    }
-
-    $masterCacheKey = (
-        "{0}|{1}|all-series" -f
-        $InstanceId,
-        $CompanyCode
-    ).ToLowerInvariant()
-
-    $allSeries = $null
-
-    if ($script:BusyCloudVoucherSeriesMasterCache.ContainsKey($masterCacheKey)) {
-        $entry = $script:BusyCloudVoucherSeriesMasterCache[$masterCacheKey]
-
-        if (
-            $entry -and
-            $entry.expires -and
-            (Get-Date) -lt $entry.expires
-        ) {
-            $allSeries = @($entry.data)
-        }
-        else {
-            try {
-                $script:BusyCloudVoucherSeriesMasterCache.Remove(
-                    $masterCacheKey
-                )
-            }
-            catch {
-            }
+    $cacheKey = "$InstanceId|$CompanyCode|voucherseries|$VchType"
+    if ($script:_cache -and $script:_cache.ContainsKey($cacheKey)) {
+        $entry = $script:_cache[$cacheKey]
+        if ((Get-Date) -lt $entry.Expires) {
+            return $entry.Data
         }
     }
 
-    $startedAt = [System.Diagnostics.Stopwatch]::StartNew()
-    $ctx = $null
-    $reader = $null
-    $cmd = $null
+    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $fi) {
+        return @{ success = $false; error = "BUSY connection failed" }
+    }
 
     try {
-        if ($null -eq $allSeries) {
-            $ctx = Get-BusyCloudFastConfigDbContext `
-                -InstanceId $InstanceId `
-                -CompanyCode $CompanyCode
+        $rst = $fi.GetRecordset("SELECT * FROM Master1 WHERE MasterType = 21")
+        $allSeries = @()
 
-            if (
-                $null -eq $ctx -or
-                $null -eq $ctx.connection
-            ) {
-                throw "Direct fiscal database connection is unavailable."
-            }
-
-            $conn = $ctx.connection
-            $dbType = [int]$ctx.dbType
-
-            $cmd = $conn.CreateCommand()
-
-            # 10 seconds is only the hard ceiling. SQL NOLOCK below prevents
-            # normal write locks from making the first Sale form fail after 5 s.
-            try { $cmd.CommandTimeout = 10 } catch {}
-
-            if ($dbType -eq 1) {
-                $cmd.CommandText = @"
-SELECT
-    Code,
-    Name,
-    I1,
-    ParentGrp,
-    CM1,
-    CM2
-FROM Master1 WITH (NOLOCK)
-WHERE MasterType = 21
-"@
-            }
-            else {
-                $cmd.CommandText = @"
-SELECT
-    Code,
-    Name,
-    I1,
-    ParentGrp,
-    CM1,
-    CM2
-FROM Master1
-WHERE MasterType = 21
-"@
-            }
-
-            $reader = $cmd.ExecuteReader()
-
-            $loaded = @()
-
-            while ($reader.Read()) {
-                $code = 0
+        if ($null -ne $rst -and -not $rst.EOF) {
+            $rst.MoveFirst()
+            while (-not $rst.EOF) {
+                $code = ""
                 $name = ""
-                $i1 = 0
-                $parentGrp = 0
-                $cm1 = 0
-                $cm2 = 0
 
                 try {
-                    if (-not $reader.IsDBNull(0)) {
-                        $code = [int][string]$reader.GetValue(0)
+                    $v = $rst.Fields.Item("Code").Value
+                    if ($null -ne $v -and $v -ne [System.DBNull]::Value) {
+                        $code = $v.ToString().Trim()
                     }
-                }
-                catch {}
+                } catch {}
 
                 try {
-                    if (-not $reader.IsDBNull(1)) {
-                        $name = ([string]$reader.GetValue(1)).Trim()
+                    $v = $rst.Fields.Item("Name").Value
+                    if ($null -ne $v -and $v -ne [System.DBNull]::Value) {
+                        $name = $v.ToString().Trim()
                     }
-                }
-                catch {}
+                } catch {}
 
-                foreach ($pair in @(
-                    @{ index = 2; target = "i1" },
-                    @{ index = 3; target = "parentGrp" },
-                    @{ index = 4; target = "cm1" },
-                    @{ index = 5; target = "cm2" }
-                )) {
-                    $value = 0
+                $seriesVchType = 0
+
+                foreach ($col in @("I1", "ParentGrp", "CM1", "CM2")) {
                     try {
-                        if (-not $reader.IsDBNull([int]$pair.index)) {
-                            $value = [int][string]$reader.GetValue(
-                                [int]$pair.index
-                            )
+                        $val = $rst.Fields.Item($col).Value
+                        if ($null -ne $val -and $val -ne [System.DBNull]::Value) {
+                            $parsed = [int]($val.ToString().Trim())
+                            if ($parsed -gt 0) {
+                                $seriesVchType = $parsed
+                                break
+                            }
                         }
-                    }
-                    catch {
-                        $value = 0
-                    }
+                    } catch {}
+                }
 
-                    switch ([string]$pair.target) {
-                        "i1"        { $i1 = $value }
-                        "parentGrp" { $parentGrp = $value }
-                        "cm1"       { $cm1 = $value }
-                        "cm2"       { $cm2 = $value }
+                $cleanName = $name
+                if ($seriesVchType -gt 0) {
+                    $prefix = "{0:D2}" -f $seriesVchType
+                    if ($cleanName.StartsWith($prefix)) {
+                        $cleanName = $cleanName.Substring(2)
                     }
                 }
 
-                if ($code -gt 0 -and -not [string]::IsNullOrWhiteSpace($name)) {
-                    $loaded += @{
-                        code      = $code
-                        rawName   = $name
-                        I1        = $i1
-                        ParentGrp = $parentGrp
-                        CM1       = $cm1
-                        CM2       = $cm2
-                    }
-                }
-            }
-
-            try { $reader.Close() } catch {}
-            try { $reader.Dispose() } catch {}
-            $reader = $null
-
-            try { $cmd.Dispose() } catch {}
-            $cmd = $null
-
-            $allSeries = @($loaded)
-
-            $script:BusyCloudVoucherSeriesMasterCache[$masterCacheKey] = @{
-                expires = (Get-Date).AddMinutes(5)
-                data    = @($allSeries)
-            }
-        }
-
-        $filtered = @()
-
-        foreach ($series in @($allSeries)) {
-            $seriesVchType = 0
-
-            foreach ($candidate in @(
-                $series.I1,
-                $series.ParentGrp,
-                $series.CM1,
-                $series.CM2
-            )) {
-                $parsed = 0
-
-                if (
-                    [int]::TryParse([string]$candidate, [ref]$parsed) -and
-                    $parsed -gt 0
-                ) {
-                    $seriesVchType = $parsed
-                    break
-                }
-            }
-
-            $cleanName = ([string]$series.rawName).Trim()
-
-            if (
-                $seriesVchType -gt 0 -and
-                $cleanName.StartsWith(
-                    ("{0:D2}" -f $seriesVchType),
-                    [System.StringComparison]::OrdinalIgnoreCase
-                )
-            ) {
-                $cleanName = $cleanName.Substring(2)
-            }
-
-            if ($VchType -le 0 -or $seriesVchType -eq $VchType) {
-                $filtered += @{
-                    code    = [int]$series.code
+                $allSeries += @{
+                    code    = $code
                     name    = $cleanName
                     vchType = $seriesVchType
                 }
+                $rst.MoveNext()
             }
         }
 
-        # Preserve the previous compatibility fallback.
-        if ($VchType -gt 0 -and $filtered.Count -eq 0 -and $allSeries.Count -gt 0) {
-            foreach ($series in @($allSeries)) {
-                $cleanName = ([string]$series.rawName).Trim()
-
-                if (
-                    $cleanName.Length -ge 2 -and
-                    $cleanName.Substring(0, 2) -match '^\d{2}$'
-                ) {
-                    $cleanName = $cleanName.Substring(2)
-                }
-
-                $filtered += @{
-                    code    = [int]$series.code
-                    name    = $cleanName
-                    vchType = 0
-                }
-            }
+        if ($null -ne $rst) {
+            try { $rst.Close() } catch {}
         }
 
-        $filtered = @(
-            $filtered |
-            Sort-Object name
-        )
-
-        $result = @{
-            success = $true
-            data    = @($filtered)
+        $filtered = if ($VchType -eq 0) {
+            $allSeries
+        } else {
+            @($allSeries | Where-Object { $_.vchType -eq $VchType })
         }
 
-        Set-Cache $requestCacheKey $result
-
-        $startedAt.Stop()
-
-        Write-Host (
-            "  [SERIES-FAST-V2] {0}/{1} type={2} rows={3} elapsedMs={4}" -f
-            $InstanceId,
-            $CompanyCode,
-            $VchType,
-            @($filtered).Count,
-            [int]$startedAt.ElapsedMilliseconds
-        ) -ForegroundColor DarkCyan
-
-        return $result
-    }
-    catch {
-        if ($startedAt.IsRunning) {
-            $startedAt.Stop()
+        if ($VchType -ne 0 -and $filtered.Count -eq 0 -and $allSeries.Count -gt 0) {
+            $filtered = $allSeries
         }
 
-        Write-Host (
-            "  [SERIES-FAST-V2 FAIL] {0}/{1} type={2} elapsedMs={3} error={4}" -f
-            $InstanceId,
-            $CompanyCode,
-            $VchType,
-            [int]$startedAt.ElapsedMilliseconds,
-            $_.Exception.Message
-        ) -ForegroundColor Red
+        $response = @{ success = $true; data = $filtered }
 
-        return @{
-            success = $false
-            error = $_.Exception.Message
+        if (-not $script:_cache) {
+            $script:_cache = @{}
         }
-    }
-    finally {
-        if ($reader) {
-            try { $reader.Close() } catch {}
-            try { $reader.Dispose() } catch {}
+        $cfg = Get-Config
+        $ttl = if ($cfg.CACHE_TTL -gt 0) { $cfg.CACHE_TTL } else { 300 }
+        $script:_cache[$cacheKey] = @{
+            Data    = $response
+            Expires = (Get-Date).AddSeconds($ttl)
         }
 
-        if ($cmd) {
-            try { $cmd.Dispose() } catch {}
-        }
-
-        if (
-            $ctx -and
-            $ctx.connection
-        ) {
-            try { $ctx.connection.Close() } catch {}
-            try { $ctx.connection.Dispose() } catch {}
-        }
+        return $response
+    } catch {
+        return @{ success = $false; error = $_.Exception.Message }
+    } finally {
+        Disconnect-BUSY $fi
     }
 }
 
