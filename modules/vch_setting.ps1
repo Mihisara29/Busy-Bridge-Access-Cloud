@@ -4550,3 +4550,341 @@ ORDER BY Name
 # =============================================================================
 # END FAST OPTIONAL FIELD READ PATH
 # =============================================================================
+
+
+# =============================================================================
+# BusyCloud Web Approval Phase 1 - Three-state approval policy
+# =============================================================================
+# RecType = 203, Type = voucher type
+#   I1 = 0 -> NONE (no approval)
+#   I1 = 1 -> BUSY (existing BUSY-connected approval)
+#   I1 = 2 -> WEB  (new external Web Approval workflow)
+#
+# RecType = 204 continues to store ONLY explicit BUSY approvers.
+# Web Approval managers are NOT stored in RecType 204.
+#
+# Backward compatibility:
+# - Existing frontend sending approval_required=false -> mode 0
+# - Existing frontend sending approval_required=true  -> mode 1
+# - New frontend may send approval_mode / approval_mode_value.
+# =============================================================================
+
+function ConvertTo-VoucherApprovalModeValue {
+    param($Value)
+
+    if ($null -eq $Value) { return -1 }
+
+    $text = ([string]$Value).Trim().ToUpperInvariant()
+
+    switch ($text) {
+        "0"       { return 0 }
+        "NONE"    { return 0 }
+        "OFF"     { return 0 }
+        "1"       { return 1 }
+        "BUSY"    { return 1 }
+        "BUSY_APPROVAL" { return 1 }
+        "2"       { return 2 }
+        "WEB"     { return 2 }
+        "WEB_APPROVAL" { return 2 }
+        default   { return -1 }
+    }
+}
+
+function Get-VoucherApprovalModeName {
+    param([int]$Mode)
+
+    switch ($Mode) {
+        1 { return "BUSY" }
+        2 { return "WEB" }
+        default { return "NONE" }
+    }
+}
+
+function Get-VoucherApprovalConfig {
+    param(
+        [int]$VchType,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = "",
+        $ExistingFi = $null
+    )
+
+    if (-not (Test-IsBusyCloudApprovalVoucherType -VchType $VchType)) {
+        return @{
+            success = $false
+            error = "Voucher type $VchType is not supported by BusyCloud approval processing."
+        }
+    }
+
+    $ctx = $null
+    $rdr = $null
+
+    try {
+        # Settings are stored in the active financial-year Config table.
+        # Use the already-established fiscal DB resolver.
+        $ctx = Get-BusyCloudFastConfigDbContext `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        $conn = $ctx.connection
+        $mode = 0
+        $approvers = @()
+
+        $cmd = $conn.CreateCommand()
+        try { $cmd.CommandTimeout = 10 } catch {}
+        $cmd.CommandText = "SELECT TOP 1 I1 FROM Config WHERE RecType=203 AND [Type]=$VchType"
+        $raw = $cmd.ExecuteScalar()
+
+        if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+            try { $mode = [int]$raw } catch { $mode = 0 }
+        }
+
+        if ($mode -notin @(0,1,2)) {
+            # Safe fallback for unexpected legacy values.
+            $mode = if ($mode -eq 1) { 1 } else { 0 }
+        }
+
+        # Explicit approvers belong only to the existing BUSY approval mode.
+        if ($mode -eq 1) {
+            $cmd = $conn.CreateCommand()
+            try { $cmd.CommandTimeout = 10 } catch {}
+            $cmd.CommandText = "SELECT C1 FROM Config WHERE RecType=204 AND [Type]=$VchType AND I1=1"
+            $rdr = $cmd.ExecuteReader()
+
+            while ($rdr.Read()) {
+                $name = ""
+                if (-not $rdr.IsDBNull(0)) {
+                    $name = ([string]$rdr.GetValue(0)).Trim()
+                }
+
+                if ($name -and $approvers -notcontains $name) {
+                    $approvers += $name
+                }
+            }
+
+            try { $rdr.Close() } catch {}
+            $rdr = $null
+        }
+
+        return @{
+            success = $true
+            data = @{
+                vch_type = $VchType
+
+                # New three-state API.
+                approval_mode_value = $mode
+                approval_mode = Get-VoucherApprovalModeName -Mode $mode
+
+                # Backward-compatible fields used by the existing UI.
+                approval_required = ($mode -eq 1)
+                web_approval_required = ($mode -eq 2)
+
+                # RecType 204 is BUSY-approval-only.
+                approvers = @($approvers | Sort-Object)
+            }
+        }
+    }
+    catch {
+        return @{ success=$false; error=$_.Exception.Message }
+    }
+    finally {
+        if ($rdr) {
+            try { $rdr.Close() } catch {}
+            try { $rdr.Dispose() } catch {}
+        }
+
+        if ($ctx -and $ctx.connection) {
+            try { $ctx.connection.Close() } catch {}
+            try { $ctx.connection.Dispose() } catch {}
+        }
+    }
+}
+
+function Save-VoucherApprovalConfig {
+    param(
+        $Data,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $vchType = 0
+    try { $vchType = [int]$Data.vch_type } catch {}
+
+    if (-not (Test-IsBusyCloudApprovalVoucherType -VchType $vchType)) {
+        return @{ success=$false; error="Unsupported or missing vch_type." }
+    }
+
+    # Prefer the new explicit mode. Fall back to the old boolean contract.
+    $mode = -1
+
+    if ($null -ne $Data.approval_mode_value) {
+        $mode = ConvertTo-VoucherApprovalModeValue -Value $Data.approval_mode_value
+    }
+
+    if ($mode -lt 0 -and $null -ne $Data.approval_mode) {
+        $mode = ConvertTo-VoucherApprovalModeValue -Value $Data.approval_mode
+    }
+
+    if ($mode -lt 0) {
+        $rawRequired = ([string]$Data.approval_required).Trim().ToLowerInvariant()
+        $enabled = (
+            $Data.approval_required -eq $true -or
+            $rawRequired -eq "1" -or
+            $rawRequired -eq "true"
+        )
+        $mode = if ($enabled) { 1 } else { 0 }
+    }
+
+    if ($mode -notin @(0,1,2)) {
+        return @{ success=$false; error="approval_mode must be NONE, BUSY or WEB." }
+    }
+
+    if (
+        $mode -eq 2 -and
+        (Get-Command Test-WebApprovalSupportedVoucherType -ErrorAction SilentlyContinue) -and
+        -not (Test-WebApprovalSupportedVoucherType -VchType $vchType)
+    ) {
+        return @{
+            success = $false
+            error = "Web Approval is supported only for Sales Quotation, Sale Order, Sale, Sale Return, Receipt and Delivery Order."
+        }
+    }
+
+    $approvers = @()
+
+    # Only BUSY approval mode is allowed to carry RecType 204 approvers.
+    if ($mode -eq 1) {
+        $requestedApprovers = @(
+            @($Data.approvers) |
+            ForEach-Object { ([string]$_).Trim() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Sort-Object -Unique
+        )
+
+        $usersResult = Get-CompanyUsers `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        if (-not $usersResult.success) {
+            return @{
+                success = $false
+                error = "Could not validate approvers against BUSY users. $($usersResult.error)"
+            }
+        }
+
+        $canonicalByLower = @{}
+
+        foreach ($u in @($usersResult.data)) {
+            $name = ([string]$u).Trim()
+            if ($name) {
+                $canonicalByLower[$name.ToLowerInvariant()] = $name
+            }
+        }
+
+        $unknown = @()
+
+        foreach ($requested in $requestedApprovers) {
+            $key = $requested.ToLowerInvariant()
+
+            if ($canonicalByLower.ContainsKey($key)) {
+                $canonical = [string]$canonicalByLower[$key]
+                if ($approvers -notcontains $canonical) {
+                    $approvers += $canonical
+                }
+            }
+            else {
+                $unknown += $requested
+            }
+        }
+
+        if ($unknown.Count -gt 0) {
+            return @{
+                success = $false
+                error = ("Unknown BUSY user(s): " + ($unknown -join ", "))
+            }
+        }
+    }
+
+    $ctx = $null
+    $tx = $null
+
+    try {
+        $ctx = Get-BusyCloudFastConfigDbContext `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        $conn = $ctx.connection
+        $tx = $conn.BeginTransaction()
+
+        $cmd = $conn.CreateCommand()
+        $cmd.Transaction = $tx
+        $cmd.CommandText = "SELECT COUNT(*) FROM Config WHERE RecType=203 AND [Type]=$vchType"
+        $exists = ([int]$cmd.ExecuteScalar() -gt 0)
+
+        $cmd = $conn.CreateCommand()
+        $cmd.Transaction = $tx
+
+        if ($exists) {
+            $cmd.CommandText = "UPDATE Config SET I1=$mode WHERE RecType=203 AND [Type]=$vchType"
+        }
+        else {
+            $cmd.CommandText = "INSERT INTO Config (RecType,[Type],I1) VALUES (203,$vchType,$mode)"
+        }
+
+        [void]$cmd.ExecuteNonQuery()
+
+        # Always clear previous BUSY approvers first.
+        $cmd = $conn.CreateCommand()
+        $cmd.Transaction = $tx
+        $cmd.CommandText = "DELETE FROM Config WHERE RecType=204 AND [Type]=$vchType"
+        [void]$cmd.ExecuteNonQuery()
+
+        # Re-create RecType 204 only for BUSY approval.
+        if ($mode -eq 1) {
+            foreach ($name in $approvers) {
+                $safe = $name.Replace("'", "''")
+                $cmd = $conn.CreateCommand()
+                $cmd.Transaction = $tx
+                $cmd.CommandText = "INSERT INTO Config (RecType,[Type],I1,C1) VALUES (204,$vchType,1,'$safe')"
+                [void]$cmd.ExecuteNonQuery()
+            }
+        }
+
+        $tx.Commit()
+        $tx = $null
+
+        $outputApprovers = @()
+        if ($mode -eq 1) {
+            $outputApprovers = @($approvers)
+        }
+
+        return @{
+            success = $true
+            message = "Voucher approval settings saved successfully."
+            data = @{
+                vch_type = $vchType
+                approval_mode_value = $mode
+                approval_mode = Get-VoucherApprovalModeName -Mode $mode
+                approval_required = ($mode -eq 1)
+                web_approval_required = ($mode -eq 2)
+                approvers = @($outputApprovers)
+            }
+        }
+    }
+    catch {
+        if ($tx) {
+            try { $tx.Rollback() } catch {}
+        }
+
+        return @{ success=$false; error=$_.Exception.Message }
+    }
+    finally {
+        if ($ctx -and $ctx.connection) {
+            try { $ctx.connection.Close() } catch {}
+            try { $ctx.connection.Dispose() } catch {}
+        }
+    }
+}
+
+# Existing BUSY approval authorization remains intentionally unchanged:
+# Get-EnabledVoucherApprovalTypes* queries RecType=203 AND I1=1, therefore
+# I1=2 (WEB approval) never grants BUSY approve/unapprove permission.

@@ -1693,6 +1693,70 @@ function Start-BUSYServer {
             }
 
             # ════════════════════════════════════════════════
+            #  INTERNAL WEB PUSH WORKER ENDPOINTS
+            #
+            #  - localhost only
+            #  - protected by X-BusyCloud-Push-Worker secret
+            #  - intentionally handled before normal user authentication
+            # ════════════════════════════════════════════════
+
+            if ($path -eq "/busy/push-worker/jobs" -and $method -eq "GET") {
+                if (-not (Test-WebPushWorkerAuthorized -Request $request)) {
+                    Send-Response $response @{success=$false; error="Push worker authorization failed."} 403
+                    continue
+                }
+
+                $limitRaw = Get-QueryStringValue $request.QueryString "limit" "50"
+                $limit = 50
+                try { $limit = [int]$limitRaw } catch {}
+
+                $result = Get-WebPushPendingJobsAllCompanies -Limit $limit
+
+                if ($result.success -eq $false) {
+                    $response.StatusCode = 500
+                }
+
+                Send-Response $response $result
+                continue
+            }
+
+            if ($path -eq "/busy/push-worker/result" -and $method -eq "POST") {
+                if (-not (Test-WebPushWorkerAuthorized -Request $request)) {
+                    Send-Response $response @{success=$false; error="Push worker authorization failed."} 403
+                    continue
+                }
+
+                try {
+                    $data = Read-RequestBody $request | ConvertFrom-Json
+
+                    $result = Complete-WebPushDelivery `
+                        -InstanceId ([string]$data.instanceId) `
+                        -CompanyCode ([string]$data.companyCode) `
+                        -DeliveryId ([string]$data.deliveryId) `
+                        -SubscriptionId ([string]$data.subscriptionId) `
+                        -Succeeded ([bool]$data.succeeded) `
+                        -Gone ([bool]$data.gone) `
+                        -HttpStatus ([int]$data.httpStatus) `
+                        -ErrorMessage ([string]$data.error)
+
+                    if ($result.success -eq $false) {
+                        $response.StatusCode = if ($result.httpStatus) {
+                            [int]$result.httpStatus
+                        } else {
+                            500
+                        }
+                    }
+                }
+                catch {
+                    $result = @{ success=$false; error=$_.Exception.Message }
+                    $response.StatusCode = 400
+                }
+
+                Send-Response $response $result
+                continue
+            }
+
+            # ════════════════════════════════════════════════
             #  PROTECTED ENDPOINTS (Auth & Headers required)
             # ════════════════════════════════════════════════
 
@@ -1840,7 +1904,35 @@ function Start-BUSYServer {
                     $bodyObj | Add-Member -MemberType NoteProperty -Name "bridgeUserName" -Value $authResult.user.name -Force
                 }
 
-                $result = Create-Voucher -Data $bodyObj -InstanceId $instanceId -CompanyCode $companyCode
+                # PHASE 3 WEB APPROVAL ROUTING:
+                # For RecType=203 / I1=2, the voucher is stored as a PENDING
+                # BusyCloud Web Approval transaction and Create-Voucher is NOT called.
+                # BUSY / NONE modes continue through the existing COM create pipeline.
+                $webApprovalRouting = Invoke-WebApprovalVoucherCreateRouting `
+                    -AuthResult $authResult `
+                    -Data $bodyObj `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode `
+                    -RequireAuth $requireAuth
+
+                if ($webApprovalRouting.handled) {
+                    $result = $webApprovalRouting.result
+
+                    if ($result.success -eq $false) {
+                        if ($result.httpStatus) {
+                            $response.StatusCode = [int]$result.httpStatus
+                        }
+                        else {
+                            $response.StatusCode = 400
+                        }
+                    }
+                }
+                else {
+                    $result = Create-Voucher `
+                        -Data $bodyObj `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+                }
 
             # --- LOCAL VOUCHER SYNCHRONIZATION (NEW IMPLEMENTATION) ---
             } elseif ($path -eq "/busy/offline-vouchers/sync" -and $method -eq "POST") {
@@ -2885,6 +2977,439 @@ function Start-BUSYServer {
                     continue
                 }
                 $result = Get-CompanyUsers -InstanceId $instanceId -CompanyCode $companyCode
+
+            # --- BUSYCLOUD WEB APPROVAL FOUNDATION (PHASE 1) ---
+            } elseif ($path -eq "/busy/web-approval/storage" -and $method -eq "GET") {
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    continue
+                }
+
+                $result = Get-WebApprovalStorageStatus `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode
+
+                if ($result.success -eq $false) {
+                    $response.StatusCode = 500
+                }
+
+            } elseif ($path -eq "/busy/web-approval/users" -and $method -eq "GET") {
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    continue
+                }
+
+                $result = Get-WebApprovalRoleDirectory `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode
+
+                if ($result.success -eq $false) {
+                    $response.StatusCode = 500
+                }
+
+            } elseif ($path -eq "/busy/web-approval/me" -and $method -eq "GET") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user
+                ) {
+                    Send-Response $response @{ success=$false; error="Authenticated BUSY user is required." } 401
+                    continue
+                }
+
+                $result = Get-WebApprovalUserRole `
+                    -UserName ([string]$authResult.user.name) `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode
+
+                if ($result.success -eq $false) {
+                    $response.StatusCode = 500
+                }
+
+            } elseif ($path -eq "/busy/web-approval/mine" -and $method -eq "GET") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user -or
+                    [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $result = @{
+                        success = $false
+                        error = "Authenticated BUSY user is required."
+                    }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $result = Get-WebApprovalMySubmissions `
+                        -UserName ([string]$authResult.user.name) `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false) {
+                        $response.StatusCode = if ($result.httpStatus) {
+                            [int]$result.httpStatus
+                        } else {
+                            500
+                        }
+                    }
+                }
+
+            } elseif ($path -eq "/busy/push/config" -and $method -eq "GET") {
+                $result = Get-WebPushPublicConfig
+
+            } elseif ($path -eq "/busy/push/subscribe" -and $method -eq "POST") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user -or
+                    [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $result = @{ success=$false; error="Authenticated BUSY user is required." }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $data = Read-RequestBody $request | ConvertFrom-Json
+
+                    $result = Save-WebPushSubscription `
+                        -UserName ([string]$authResult.user.name) `
+                        -Data $data `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false) {
+                        $response.StatusCode = if ($result.httpStatus) {
+                            [int]$result.httpStatus
+                        } else {
+                            400
+                        }
+                    }
+                }
+
+            } elseif ($path -eq "/busy/push/unsubscribe" -and $method -eq "POST") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user -or
+                    [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $result = @{ success=$false; error="Authenticated BUSY user is required." }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $data = Read-RequestBody $request | ConvertFrom-Json
+
+                    $result = Disable-WebPushSubscription `
+                        -UserName ([string]$authResult.user.name) `
+                        -Endpoint ([string]$data.endpoint) `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false) {
+                        $response.StatusCode = if ($result.httpStatus) {
+                            [int]$result.httpStatus
+                        } else {
+                            400
+                        }
+                    }
+                }
+
+            } elseif ($path -eq "/busy/web-approval/notifications/read" -and $method -eq "POST") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user -or
+                    [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $result = @{ success=$false; error="Authenticated BUSY user is required." }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $data = Read-RequestBody $request | ConvertFrom-Json
+                    $readAll = $false
+
+                    try {
+                        $readAll = (
+                            $data.readAll -eq $true -or
+                            ([string]$data.readAll).Trim().ToLowerInvariant() -eq "true"
+                        )
+                    }
+                    catch {}
+
+                    $result = Set-WebApprovalNotificationRead `
+                        -UserName ([string]$authResult.user.name) `
+                        -NotificationId ([string]$data.notificationId) `
+                        -ReadAll $readAll `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false) {
+                        $response.StatusCode = if ($result.httpStatus) {
+                            [int]$result.httpStatus
+                        } else {
+                            400
+                        }
+                    }
+                }
+
+            } elseif ($path -eq "/busy/web-approval/notifications" -and $method -eq "GET") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user -or
+                    [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $result = @{
+                        success = $false
+                        error = "Authenticated BUSY user is required."
+                    }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $result = Get-WebApprovalNotifications `
+                        -UserName ([string]$authResult.user.name) `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false) {
+                        $response.StatusCode = if ($result.httpStatus) {
+                            [int]$result.httpStatus
+                        } else {
+                            500
+                        }
+                    }
+                }
+
+            # --- WEB APPROVAL MANAGER INBOX / DECISIONS / SYNC ---
+            } elseif ($path -eq "/busy/web-approval/assigned" -and $method -eq "GET") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user -or
+                    [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $result = @{ success=$false; error="Authenticated Sales Manager is required." }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $status = Get-QueryStringValue $request.QueryString "status" "PENDING"
+
+                    $result = Get-WebApprovalAssignedQueue `
+                        -ManagerUserName ([string]$authResult.user.name) `
+                        -Status $status `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false -or $result.allowed -eq $false) {
+                        $response.StatusCode = if ($result.httpStatus) {
+                            [int]$result.httpStatus
+                        } else {
+                            400
+                        }
+                    }
+                }
+
+            } elseif ($path -eq "/busy/web-approval/detail" -and $method -eq "GET") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user -or
+                    [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $result = @{ success=$false; error="Authenticated Sales Manager is required." }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $id = Get-QueryStringValue $request.QueryString "id" ""
+
+                    if ([string]::IsNullOrWhiteSpace($id)) {
+                        $result = @{ success=$false; error="Web Approval id is required." }
+                        $response.StatusCode = 400
+                    }
+                    else {
+                        $result = Get-WebApprovalDetailForManager `
+                            -Id $id `
+                            -ManagerUserName ([string]$authResult.user.name) `
+                            -InstanceId $instanceId `
+                            -CompanyCode $companyCode
+
+                        if ($result.success -eq $false -or $result.allowed -eq $false) {
+                            $response.StatusCode = if ($result.httpStatus) {
+                                [int]$result.httpStatus
+                            } else {
+                                400
+                            }
+                        }
+                    }
+                }
+
+            } elseif ($path -eq "/busy/web-approval/approve" -and $method -eq "POST") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user -or
+                    [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $result = @{ success=$false; error="Authenticated Sales Manager is required." }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $data = Read-RequestBody $request | ConvertFrom-Json
+
+                    $result = Approve-WebApprovalVoucher `
+                        -Id ([string]$data.id) `
+                        -ManagerUserName ([string]$authResult.user.name) `
+                        -Remarks ([string]$data.remarks) `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false) {
+                        $response.StatusCode = if ($result.httpStatus) {
+                            [int]$result.httpStatus
+                        } else {
+                            400
+                        }
+                    }
+                }
+
+            } elseif ($path -eq "/busy/web-approval/reject" -and $method -eq "POST") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user -or
+                    [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $result = @{ success=$false; error="Authenticated Sales Manager is required." }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $data = Read-RequestBody $request | ConvertFrom-Json
+
+                    $result = Reject-WebApprovalVoucher `
+                        -Id ([string]$data.id) `
+                        -ManagerUserName ([string]$authResult.user.name) `
+                        -Reason ([string]$data.reason) `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false) {
+                        $response.StatusCode = if ($result.httpStatus) {
+                            [int]$result.httpStatus
+                        } else {
+                            400
+                        }
+                    }
+                }
+
+            } elseif ($path -eq "/busy/web-approval/sync" -and $method -eq "POST") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user -or
+                    [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $result = @{ success=$false; error="Authenticated Sales Manager is required." }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $data = Read-RequestBody $request | ConvertFrom-Json
+
+                    $result = Sync-WebApprovalVoucher `
+                        -Id ([string]$data.id) `
+                        -ManagerUserName ([string]$authResult.user.name) `
+                        -ManualVoucherNo ([string]$data.manualVoucherNo) `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false) {
+                        $response.StatusCode = if ($result.httpStatus) {
+                            [int]$result.httpStatus
+                        } else {
+                            400
+                        }
+                    }
+                }
+
+            } elseif ($path -eq "/busy/web-approval/user-role" -and $method -eq "POST") {
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    continue
+                }
+
+                $data = Read-RequestBody $request | ConvertFrom-Json
+
+                $actionBy = ""
+                if ($null -ne $authResult -and $null -ne $authResult.user) {
+                    $actionBy = [string]$authResult.user.name
+                }
+
+                $result = Set-WebApprovalUserRole `
+                    -UserName ([string]$data.userName) `
+                    -Role $data.role `
+                    -ActionBy $actionBy `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode
+
+                if ($result.success -eq $false) {
+                    $response.StatusCode = if ($result.httpStatus) { [int]$result.httpStatus } else { 400 }
+                }
+
+            } elseif ($path -eq "/busy/web-approval/managers" -and $method -eq "GET") {
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    continue
+                }
+
+                $salesmanUserName = Get-QueryStringValue $request.QueryString "salesmanUserName" ""
+                if ([string]::IsNullOrWhiteSpace($salesmanUserName)) {
+                    $salesmanUserName = Get-QueryStringValue $request.QueryString "salesman" ""
+                }
+
+                if ([string]::IsNullOrWhiteSpace($salesmanUserName)) {
+                    $result = @{ success=$false; error="salesmanUserName is required." }
+                    $response.StatusCode = 400
+                }
+                else {
+                    $result = Get-WebApprovalManagersForSalesman `
+                        -SalesmanUserName $salesmanUserName `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false) {
+                        $response.StatusCode = 400
+                    }
+                }
+
+            } elseif ($path -eq "/busy/web-approval/managers" -and $method -eq "POST") {
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    continue
+                }
+
+                $data = Read-RequestBody $request | ConvertFrom-Json
+
+                $actionBy = ""
+                if ($null -ne $authResult -and $null -ne $authResult.user) {
+                    $actionBy = [string]$authResult.user.name
+                }
+
+                $managerNames = @()
+                if ($null -ne $data.managerUserNames) {
+                    $managerNames = @($data.managerUserNames)
+                }
+                elseif ($null -ne $data.managers) {
+                    $managerNames = @($data.managers)
+                }
+
+                $result = Set-WebApprovalManagersForSalesman `
+                    -SalesmanUserName ([string]$data.salesmanUserName) `
+                    -ManagerUserNames $managerNames `
+                    -ActionBy $actionBy `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode
+
+                if ($result.success -eq $false) {
+                    $response.StatusCode = if ($result.httpStatus) { [int]$result.httpStatus } else { 400 }
+                }
 
             # --- MASTER DATA ---
 
