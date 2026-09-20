@@ -1,0 +1,4 @@
+node_modules/
+../data/push/push_config.json
+../data/push/worker.pid
+../data/push/*.log

@@ -1,0 +1,15 @@
+{
+  "name": "busycloud-push-worker",
+  "private": true,
+  "version": "1.0.0",
+  "description": "BUSY Cloud Web Push delivery worker",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js",
+    "generate-config": "node generate_config.js"
+  },
+  "dependencies": {
+    "busycloud-push-worker": "file:",
+    "web-push": "^3.6.7"
+  }
+}
