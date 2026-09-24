@@ -224,6 +224,7 @@ $requiredFunctions = @(
 
     # Persistent / Web Push Notifications
     "Get-WebPushPublicConfig",
+    "Get-WebPushSubscriptionStatus",
     "Save-WebPushSubscription",
     "Disable-WebPushSubscription",
     "Set-WebApprovalNotificationRead",

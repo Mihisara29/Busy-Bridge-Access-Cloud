@@ -31,7 +31,7 @@
 # ============================================================================
 # BUSYCLOUD WEB APPROVAL MODULE VERSION
 # ============================================================================
-$script:BusyCloudWebApprovalModuleVersion = "6.2-auto-push-bootstrap-npm-fix"
+$script:BusyCloudWebApprovalModuleVersion = "6.6-private-requested-numbering"
 Write-Host "  [WEB-APPROVAL] Module version $script:BusyCloudWebApprovalModuleVersion loaded." -ForegroundColor DarkCyan
 
 $script:WebApprovalSchemaVersion = 1
@@ -432,13 +432,39 @@ CREATE TABLE [BusyCloudPushSubscription] (
 
     try {
         if ($dbType -eq 1) {
+            # v6.5 migration:
+            # An endpoint identifies a browser/device, and the SAME device may
+            # be used by multiple BUSY users. Therefore EndpointHash alone must
+            # NOT be unique anymore.
             $sql = @"
-IF NOT EXISTS (
+IF EXISTS (
     SELECT 1 FROM sys.indexes
     WHERE name='UX_BusyCloudPushSubscription_EndpointHash'
       AND object_id=OBJECT_ID('dbo.BusyCloudPushSubscription')
 )
-CREATE UNIQUE INDEX UX_BusyCloudPushSubscription_EndpointHash
+DROP INDEX UX_BusyCloudPushSubscription_EndpointHash
+ON dbo.BusyCloudPushSubscription
+"@
+            [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql $sql)
+
+            $sql = @"
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name='UX_BusyCloudPushSubscription_UserEndpoint'
+      AND object_id=OBJECT_ID('dbo.BusyCloudPushSubscription')
+)
+CREATE UNIQUE INDEX UX_BusyCloudPushSubscription_UserEndpoint
+ON dbo.BusyCloudPushSubscription(UserName, EndpointHash)
+"@
+            [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql $sql)
+
+            $sql = @"
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name='IX_BusyCloudPushSubscription_EndpointHash'
+      AND object_id=OBJECT_ID('dbo.BusyCloudPushSubscription')
+)
+CREATE INDEX IX_BusyCloudPushSubscription_EndpointHash
 ON dbo.BusyCloudPushSubscription(EndpointHash)
 "@
             [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql $sql)
@@ -455,8 +481,19 @@ ON dbo.BusyCloudPushSubscription(UserName, IsActive)
             [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql $sql)
         }
         else {
+            # Access/BDS equivalent. DROP/CREATE is wrapped because providers
+            # throw when an index does not exist/already exists.
             try {
-                [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql "CREATE UNIQUE INDEX [UX_BusyCloudPushSubscription_EndpointHash] ON [BusyCloudPushSubscription] ([EndpointHash])")
+                [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql "DROP INDEX [UX_BusyCloudPushSubscription_EndpointHash] ON [BusyCloudPushSubscription]")
+                Write-Host "  [WEB-APPROVAL MIGRATION] Removed single-user Push endpoint uniqueness in $($Context.database)" -ForegroundColor Yellow
+            } catch {}
+
+            try {
+                [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql "CREATE UNIQUE INDEX [UX_BusyCloudPushSubscription_UserEndpoint] ON [BusyCloudPushSubscription] ([UserName], [EndpointHash])")
+            } catch {}
+
+            try {
+                [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql "CREATE INDEX [IX_BusyCloudPushSubscription_EndpointHash] ON [BusyCloudPushSubscription] ([EndpointHash])")
             } catch {}
 
             try {
@@ -2174,6 +2211,19 @@ function Add-WebApprovalNotificationRow {
         [datetime]$CreatedAt
     )
 
+    $recipient = ([string]$RecipientUserName).Trim()
+    $messageText = ([string]$Message).Trim()
+
+    if (
+        -not [string]::IsNullOrWhiteSpace($recipient) -and
+        -not $messageText.StartsWith(
+            "Dear ",
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    ) {
+        $messageText = "Dear $recipient,`r`n$messageText"
+    }
+
     $cmd = $Context.connection.CreateCommand()
     $cmd.Transaction = $Transaction
     $dbType = [int]$Context.dbType
@@ -2206,11 +2256,11 @@ VALUES
 "@
 
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@id" -Value $id -Kind Text -Size 36)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@recipientUserName" -Value $RecipientUserName -Kind Text -Size 100)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@recipientUserName" -Value $recipient -Kind Text -Size 100)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@webApprovalId" -Value $WebApprovalId -Kind Text -Size 36)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@notificationType" -Value $NotificationType -Kind Text -Size 50)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@title" -Value $Title -Kind Text -Size 250)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@message" -Value $Message -Kind LongText)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@message" -Value $messageText -Kind LongText)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@isRead" -Value 0 -Kind Bool)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@createdAt" -Value $CreatedAt -Kind Date)
     }
@@ -2234,11 +2284,11 @@ VALUES
 "@
 
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p1" -Value $id -Kind Text -Size 36)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p2" -Value $RecipientUserName -Kind Text -Size 100)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p2" -Value $recipient -Kind Text -Size 100)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p3" -Value $WebApprovalId -Kind Text -Size 36)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p4" -Value $NotificationType -Kind Text -Size 50)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p5" -Value $Title -Kind Text -Size 250)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p6" -Value $Message -Kind LongText)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p6" -Value $messageText -Kind LongText)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p7" -Value 0 -Kind Bool)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p8" -Value $CreatedAt -Kind Date)
     }
@@ -2832,12 +2882,29 @@ ORDER BY [CreatedAt] DESC
                 $unread++
             }
 
+            $messageText = if ($rdr.IsDBNull(4)) {
+                ""
+            }
+            else {
+                [string]$rdr.GetValue(4)
+            }
+
+            if (
+                -not [string]::IsNullOrWhiteSpace($UserName) -and
+                -not $messageText.TrimStart().StartsWith(
+                    "Dear ",
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            ) {
+                $messageText = "Dear $($UserName.Trim()),`r`n$messageText"
+            }
+
             $items += @{
                 id = if ($rdr.IsDBNull(0)) { "" } else { [string]$rdr.GetValue(0) }
                 webApprovalId = if ($rdr.IsDBNull(1)) { "" } else { [string]$rdr.GetValue(1) }
                 type = if ($rdr.IsDBNull(2)) { "" } else { [string]$rdr.GetValue(2) }
                 title = if ($rdr.IsDBNull(3)) { "" } else { [string]$rdr.GetValue(3) }
-                message = if ($rdr.IsDBNull(4)) { "" } else { [string]$rdr.GetValue(4) }
+                message = $messageText
                 isRead = $isRead
                 createdAt = if ($rdr.IsDBNull(6)) { $null } else { $rdr.GetValue(6) }
                 readAt = if ($rdr.IsDBNull(7)) { $null } else { $rdr.GetValue(7) }
@@ -5257,6 +5324,133 @@ function Test-WebPushWorkerAuthorized {
     return $provided -eq ([string]$cfg.workerSecret)
 }
 
+
+function Get-WebPushSubscriptionStatus {
+    param(
+        [string]$UserName,
+        [string]$Endpoint,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $user = ([string]$UserName).Trim()
+    $endpointText = ([string]$Endpoint).Trim()
+
+    if ([string]::IsNullOrWhiteSpace($user)) {
+        return @{
+            success = $false
+            httpStatus = 401
+            error = "Authenticated BUSY user is required."
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($endpointText)) {
+        return @{
+            success = $true
+            data = @{
+                hasBrowserSubscription = $false
+                registeredForCurrentUser = $false
+                activeForCurrentUser = $false
+            }
+        }
+    }
+
+    $hash = Get-WebApprovalSha256 -Text $endpointText
+    $ctx = $null
+    $reader = $null
+
+    try {
+        $ctx = Get-WebApprovalPermanentDbContext `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        [void](Ensure-WebApprovalPermanentTables -Context $ctx)
+
+        $cmd = $ctx.connection.CreateCommand()
+
+        if ([int]$ctx.dbType -eq 1) {
+            $cmd.CommandText = @"
+SELECT TOP 1
+    Id,
+    IsActive,
+    DeviceName,
+    CreatedAt,
+    UpdatedAt,
+    LastSeenAt
+FROM dbo.BusyCloudPushSubscription
+WHERE EndpointHash=@hash
+  AND UserName=@userName
+"@
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@hash" -Value $hash -Kind Text -Size 64)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@userName" -Value $user -Kind Text -Size 100)
+        }
+        else {
+            $cmd.CommandText = @"
+SELECT TOP 1
+    [Id],
+    [IsActive],
+    [DeviceName],
+    [CreatedAt],
+    [UpdatedAt],
+    [LastSeenAt]
+FROM [BusyCloudPushSubscription]
+WHERE [EndpointHash]=?
+  AND [UserName]=?
+"@
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name "@p1" -Value $hash -Kind Text -Size 64)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name "@p2" -Value $user -Kind Text -Size 100)
+        }
+
+        $reader = $cmd.ExecuteReader()
+
+        if (-not $reader.Read()) {
+            return @{
+                success = $true
+                data = @{
+                    hasBrowserSubscription = $true
+                    registeredForCurrentUser = $false
+                    activeForCurrentUser = $false
+                }
+            }
+        }
+
+        $activeRaw = Read-WebApprovalReaderValue $reader "IsActive" 0
+        $isActive = $false
+
+        try { $isActive = ([int]$activeRaw -ne 0) } catch {
+            try { $isActive = [bool]$activeRaw } catch {}
+        }
+
+        return @{
+            success = $true
+            data = @{
+                hasBrowserSubscription = $true
+                registeredForCurrentUser = $true
+                activeForCurrentUser = $isActive
+                deviceName = [string](Read-WebApprovalReaderValue $reader "DeviceName" "")
+                createdAt = Read-WebApprovalReaderValue $reader "CreatedAt" $null
+                updatedAt = Read-WebApprovalReaderValue $reader "UpdatedAt" $null
+                lastSeenAt = Read-WebApprovalReaderValue $reader "LastSeenAt" $null
+            }
+        }
+    }
+    catch {
+        return @{
+            success = $false
+            httpStatus = 500
+            error = $_.Exception.Message
+        }
+    }
+    finally {
+        if ($reader) {
+            try { $reader.Close() } catch {}
+            try { $reader.Dispose() } catch {}
+        }
+
+        Close-WebApprovalDbContext -Context $ctx
+    }
+}
+
 function Save-WebPushSubscription {
     param(
         [string]$UserName,
@@ -5265,7 +5459,9 @@ function Save-WebPushSubscription {
         [string]$CompanyCode = ""
     )
 
-    if ([string]::IsNullOrWhiteSpace($UserName)) {
+    $user = ([string]$UserName).Trim()
+
+    if ([string]::IsNullOrWhiteSpace($user)) {
         return @{
             success = $false
             httpStatus = 401
@@ -5335,6 +5531,7 @@ function Save-WebPushSubscription {
 
     $hash = Get-WebApprovalSha256 -Text $endpoint
     $ctx = $null
+    $tx = $null
 
     try {
         $ctx = Get-WebApprovalPermanentDbContext `
@@ -5344,60 +5541,128 @@ function Save-WebPushSubscription {
         [void](Ensure-WebApprovalPermanentTables -Context $ctx)
 
         $existingId = ""
-        $cmd = $ctx.connection.CreateCommand()
+        $existingActive = $false
+        $existingCreatedAt = $null
+
+        $lookup = $ctx.connection.CreateCommand()
 
         if ([int]$ctx.dbType -eq 1) {
-            $cmd.CommandText = @"
-SELECT TOP 1 Id
+            $lookup.CommandText = @"
+SELECT TOP 1
+    Id, IsActive, CreatedAt
 FROM dbo.BusyCloudPushSubscription
 WHERE EndpointHash=@hash
+  AND UserName=@userName
 "@
-            [void](Add-WebApprovalCommandParameter `
-                -Command $cmd -DbType 1 -Name "@hash" `
-                -Value $hash -Kind Text -Size 64)
+            [void](Add-WebApprovalCommandParameter -Command $lookup -DbType 1 -Name "@hash" -Value $hash -Kind Text -Size 64)
+            [void](Add-WebApprovalCommandParameter -Command $lookup -DbType 1 -Name "@userName" -Value $user -Kind Text -Size 100)
         }
         else {
-            $cmd.CommandText = @"
-SELECT TOP 1 [Id]
+            $lookup.CommandText = @"
+SELECT TOP 1
+    [Id], [IsActive], [CreatedAt]
 FROM [BusyCloudPushSubscription]
 WHERE [EndpointHash]=?
+  AND [UserName]=?
 "@
-            [void](Add-WebApprovalCommandParameter `
-                -Command $cmd -DbType 0 -Name "@p1" `
-                -Value $hash -Kind Text -Size 64)
+            [void](Add-WebApprovalCommandParameter -Command $lookup -DbType 0 -Name "@p1" -Value $hash -Kind Text -Size 64)
+            [void](Add-WebApprovalCommandParameter -Command $lookup -DbType 0 -Name "@p2" -Value $user -Kind Text -Size 100)
         }
 
-        $rawId = $cmd.ExecuteScalar()
-        if ($null -ne $rawId -and $rawId -ne [System.DBNull]::Value) {
-            $existingId = ([string]$rawId).Trim()
+        $reader = $null
+
+        try {
+            $reader = $lookup.ExecuteReader()
+
+            if ($reader.Read()) {
+                $existingId = [string](Read-WebApprovalReaderValue $reader "Id" "")
+                $existingCreatedAt = Read-WebApprovalReaderValue $reader "CreatedAt" $null
+
+                $activeRaw = Read-WebApprovalReaderValue $reader "IsActive" 0
+                try { $existingActive = ([int]$activeRaw -ne 0) } catch {
+                    try { $existingActive = [bool]$activeRaw } catch {}
+                }
+            }
+        }
+        finally {
+            if ($reader) {
+                try { $reader.Close() } catch {}
+                try { $reader.Dispose() } catch {}
+            }
         }
 
         $now = [datetime]::UtcNow
+        $tx = $ctx.connection.BeginTransaction()
+
+        # One ACTIVE device per USER.
+        # This intentionally does NOT touch rows belonging to other users,
+        # even when they share this exact same browser/device endpoint.
+        $deactivate = $ctx.connection.CreateCommand()
+        $deactivate.Transaction = $tx
+
+        if ([int]$ctx.dbType -eq 1) {
+            $deactivate.CommandText = @"
+UPDATE dbo.BusyCloudPushSubscription
+SET
+    IsActive=0,
+    UpdatedAt=@updatedAt
+WHERE UserName=@userName
+  AND EndpointHash<>@endpointHash
+  AND IsActive<>0
+"@
+            [void](Add-WebApprovalCommandParameter -Command $deactivate -DbType 1 -Name "@updatedAt" -Value $now -Kind Date)
+            [void](Add-WebApprovalCommandParameter -Command $deactivate -DbType 1 -Name "@userName" -Value $user -Kind Text -Size 100)
+            [void](Add-WebApprovalCommandParameter -Command $deactivate -DbType 1 -Name "@endpointHash" -Value $hash -Kind Text -Size 64)
+        }
+        else {
+            $deactivate.CommandText = @"
+UPDATE [BusyCloudPushSubscription]
+SET
+    [IsActive]=0,
+    [UpdatedAt]=?
+WHERE [UserName]=?
+  AND [EndpointHash]<>?
+  AND [IsActive]<>0
+"@
+            [void](Add-WebApprovalCommandParameter -Command $deactivate -DbType 0 -Name "@p1" -Value $now -Kind Date)
+            [void](Add-WebApprovalCommandParameter -Command $deactivate -DbType 0 -Name "@p2" -Value $user -Kind Text -Size 100)
+            [void](Add-WebApprovalCommandParameter -Command $deactivate -DbType 0 -Name "@p3" -Value $hash -Kind Text -Size 64)
+        }
+
+        $deactivatedCount = [int]$deactivate.ExecuteNonQuery()
 
         if ($existingId) {
+            $activationAt = if ($existingActive -and $existingCreatedAt) {
+                $existingCreatedAt
+            }
+            else {
+                $now
+            }
+
             $update = $ctx.connection.CreateCommand()
+            $update.Transaction = $tx
 
             if ([int]$ctx.dbType -eq 1) {
                 $update.CommandText = @"
 UPDATE dbo.BusyCloudPushSubscription
 SET
-    UserName=@userName,
     Endpoint=@endpoint,
     P256dh=@p256dh,
     AuthKey=@authKey,
     DeviceName=@deviceName,
     UserAgent=@userAgent,
     IsActive=1,
+    CreatedAt=@createdAt,
     UpdatedAt=@updatedAt,
     LastSeenAt=@lastSeenAt
 WHERE Id=@id
 "@
-                [void](Add-WebApprovalCommandParameter -Command $update -DbType 1 -Name "@userName" -Value $UserName.Trim() -Kind Text -Size 100)
                 [void](Add-WebApprovalCommandParameter -Command $update -DbType 1 -Name "@endpoint" -Value $endpoint -Kind LongText)
                 [void](Add-WebApprovalCommandParameter -Command $update -DbType 1 -Name "@p256dh" -Value $p256dh -Kind Text -Size 255)
                 [void](Add-WebApprovalCommandParameter -Command $update -DbType 1 -Name "@authKey" -Value $authKey -Kind Text -Size 255)
                 [void](Add-WebApprovalCommandParameter -Command $update -DbType 1 -Name "@deviceName" -Value $deviceName -Kind Text -Size 150)
                 [void](Add-WebApprovalCommandParameter -Command $update -DbType 1 -Name "@userAgent" -Value $userAgent -Kind Text -Size 500)
+                [void](Add-WebApprovalCommandParameter -Command $update -DbType 1 -Name "@createdAt" -Value $activationAt -Kind Date)
                 [void](Add-WebApprovalCommandParameter -Command $update -DbType 1 -Name "@updatedAt" -Value $now -Kind Date)
                 [void](Add-WebApprovalCommandParameter -Command $update -DbType 1 -Name "@lastSeenAt" -Value $now -Kind Date)
                 [void](Add-WebApprovalCommandParameter -Command $update -DbType 1 -Name "@id" -Value $existingId -Kind Text -Size 36)
@@ -5406,23 +5671,23 @@ WHERE Id=@id
                 $update.CommandText = @"
 UPDATE [BusyCloudPushSubscription]
 SET
-    [UserName]=?,
     [Endpoint]=?,
     [P256dh]=?,
     [AuthKey]=?,
     [DeviceName]=?,
     [UserAgent]=?,
     [IsActive]=1,
+    [CreatedAt]=?,
     [UpdatedAt]=?,
     [LastSeenAt]=?
 WHERE [Id]=?
 "@
-                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p1" -Value $UserName.Trim() -Kind Text -Size 100)
-                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p2" -Value $endpoint -Kind LongText)
-                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p3" -Value $p256dh -Kind Text -Size 255)
-                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p4" -Value $authKey -Kind Text -Size 255)
-                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p5" -Value $deviceName -Kind Text -Size 150)
-                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p6" -Value $userAgent -Kind LongText)
+                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p1" -Value $endpoint -Kind LongText)
+                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p2" -Value $p256dh -Kind Text -Size 255)
+                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p3" -Value $authKey -Kind Text -Size 255)
+                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p4" -Value $deviceName -Kind Text -Size 150)
+                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p5" -Value $userAgent -Kind LongText)
+                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p6" -Value $activationAt -Kind Date)
                 [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p7" -Value $now -Kind Date)
                 [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p8" -Value $now -Kind Date)
                 [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p9" -Value $existingId -Kind Text -Size 36)
@@ -5430,17 +5695,24 @@ WHERE [Id]=?
 
             [void]$update.ExecuteNonQuery()
 
+            $tx.Commit()
+            $tx = $null
+
             return @{
                 success = $true
                 data = @{
                     id = $existingId
                     enabled = $true
+                    sharedDeviceSupported = $true
+                    latestDeviceOnlyForUser = $true
+                    deactivatedPreviousDevices = $deactivatedCount
                 }
             }
         }
 
         $id = [guid]::NewGuid().ToString()
         $insert = $ctx.connection.CreateCommand()
+        $insert.Transaction = $tx
 
         if ([int]$ctx.dbType -eq 1) {
             $insert.CommandText = @"
@@ -5458,7 +5730,7 @@ VALUES
 )
 "@
             [void](Add-WebApprovalCommandParameter -Command $insert -DbType 1 -Name "@id" -Value $id -Kind Text -Size 36)
-            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 1 -Name "@userName" -Value $UserName.Trim() -Kind Text -Size 100)
+            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 1 -Name "@userName" -Value $user -Kind Text -Size 100)
             [void](Add-WebApprovalCommandParameter -Command $insert -DbType 1 -Name "@endpointHash" -Value $hash -Kind Text -Size 64)
             [void](Add-WebApprovalCommandParameter -Command $insert -DbType 1 -Name "@endpoint" -Value $endpoint -Kind LongText)
             [void](Add-WebApprovalCommandParameter -Command $insert -DbType 1 -Name "@p256dh" -Value $p256dh -Kind Text -Size 255)
@@ -5483,7 +5755,7 @@ VALUES
 )
 "@
             [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p1" -Value $id -Kind Text -Size 36)
-            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p2" -Value $UserName.Trim() -Kind Text -Size 100)
+            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p2" -Value $user -Kind Text -Size 100)
             [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p3" -Value $hash -Kind Text -Size 64)
             [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p4" -Value $endpoint -Kind LongText)
             [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p5" -Value $p256dh -Kind Text -Size 255)
@@ -5497,15 +5769,25 @@ VALUES
 
         [void]$insert.ExecuteNonQuery()
 
+        $tx.Commit()
+        $tx = $null
+
         return @{
             success = $true
             data = @{
                 id = $id
                 enabled = $true
+                sharedDeviceSupported = $true
+                latestDeviceOnlyForUser = $true
+                deactivatedPreviousDevices = $deactivatedCount
             }
         }
     }
     catch {
+        if ($tx) {
+            try { $tx.Rollback() } catch {}
+        }
+
         return @{
             success = $false
             httpStatus = 500
@@ -5621,7 +5903,8 @@ function Get-WebPushSubscriptionsInternal {
             $cmd.CommandText = @"
 SELECT
     Id, UserName, EndpointHash, Endpoint,
-    P256dh, AuthKey, DeviceName, UserAgent
+    P256dh, AuthKey, DeviceName, UserAgent,
+    CreatedAt, UpdatedAt, LastSeenAt
 FROM dbo.BusyCloudPushSubscription
 WHERE IsActive<>0
 "@
@@ -5630,7 +5913,8 @@ WHERE IsActive<>0
             $cmd.CommandText = @"
 SELECT
     [Id], [UserName], [EndpointHash], [Endpoint],
-    [P256dh], [AuthKey], [DeviceName], [UserAgent]
+    [P256dh], [AuthKey], [DeviceName], [UserAgent],
+    [CreatedAt], [UpdatedAt], [LastSeenAt]
 FROM [BusyCloudPushSubscription]
 WHERE [IsActive]<>0
 "@
@@ -5639,6 +5923,14 @@ WHERE [IsActive]<>0
         $rdr = $cmd.ExecuteReader()
 
         while ($rdr.Read()) {
+            $createdAt = Read-WebApprovalReaderValue $rdr "CreatedAt" $null
+            $updatedAt = Read-WebApprovalReaderValue $rdr "UpdatedAt" $null
+            $lastSeenAt = Read-WebApprovalReaderValue $rdr "LastSeenAt" $null
+
+            $sortAt = $createdAt
+            if ($updatedAt) { $sortAt = $updatedAt }
+            if ($lastSeenAt) { $sortAt = $lastSeenAt }
+
             $items += @{
                 id = [string](Read-WebApprovalReaderValue $rdr "Id" "")
                 userName = [string](Read-WebApprovalReaderValue $rdr "UserName" "")
@@ -5648,6 +5940,10 @@ WHERE [IsActive]<>0
                 authKey = [string](Read-WebApprovalReaderValue $rdr "AuthKey" "")
                 deviceName = [string](Read-WebApprovalReaderValue $rdr "DeviceName" "")
                 userAgent = [string](Read-WebApprovalReaderValue $rdr "UserAgent" "")
+                activationAt = $createdAt
+                updatedAt = $updatedAt
+                lastSeenAt = $lastSeenAt
+                sortAt = $sortAt
             }
         }
     }
@@ -5659,7 +5955,38 @@ WHERE [IsActive]<>0
         Close-WebApprovalDbContext -Context $ctx
     }
 
-    return @($items)
+    # Safety for existing databases created by older versions:
+    # even if multiple rows are still marked active, the worker will use only
+    # the most recently seen device for each BUSY username.
+    $latestByUser = @{}
+
+    foreach ($item in $items) {
+        $key = ([string]$item.userName).Trim().ToLowerInvariant()
+        if (-not $key) { continue }
+
+        if (-not $latestByUser.ContainsKey($key)) {
+            $latestByUser[$key] = $item
+            continue
+        }
+
+        $current = $latestByUser[$key]
+        $candidateTime = [datetime]::MinValue
+        $currentTime = [datetime]::MinValue
+
+        try {
+            if ($item.sortAt) { $candidateTime = [datetime]$item.sortAt }
+        } catch {}
+
+        try {
+            if ($current.sortAt) { $currentTime = [datetime]$current.sortAt }
+        } catch {}
+
+        if ($candidateTime -gt $currentTime) {
+            $latestByUser[$key] = $item
+        }
+    }
+
+    return @($latestByUser.Values)
 }
 
 function Set-WebApprovalNotificationRead {
@@ -5671,7 +5998,9 @@ function Set-WebApprovalNotificationRead {
         [string]$CompanyCode = ""
     )
 
-    if ([string]::IsNullOrWhiteSpace($UserName)) {
+    $user = ([string]$UserName).Trim()
+
+    if ([string]::IsNullOrWhiteSpace($user)) {
         return @{
             success = $false
             httpStatus = 401
@@ -5688,7 +6017,6 @@ function Set-WebApprovalNotificationRead {
     }
 
     $ctx = $null
-    $tx = $null
 
     try {
         $ctx = Get-WebApprovalFiscalDbContext `
@@ -5697,11 +6025,8 @@ function Set-WebApprovalNotificationRead {
 
         [void](Ensure-WebApprovalFiscalTables -Context $ctx)
 
-        $tx = $ctx.connection.BeginTransaction()
-        $now = [datetime]::UtcNow
-
         $cmd = $ctx.connection.CreateCommand()
-        $cmd.Transaction = $tx
+        $now = [datetime]::UtcNow
 
         if ([int]$ctx.dbType -eq 1) {
             if ($ReadAll) {
@@ -5712,7 +6037,7 @@ WHERE RecipientUserName=@userName
   AND IsRead=0
 "@
                 [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@readAt" -Value $now -Kind Date)
-                [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@userName" -Value $UserName.Trim() -Kind Text -Size 100)
+                [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@userName" -Value $user -Kind Text -Size 100)
             }
             else {
                 $cmd.CommandText = @"
@@ -5723,7 +6048,7 @@ WHERE Id=@id
 "@
                 [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@readAt" -Value $now -Kind Date)
                 [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@id" -Value $NotificationId.Trim() -Kind Text -Size 36)
-                [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@userName" -Value $UserName.Trim() -Kind Text -Size 100)
+                [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@userName" -Value $user -Kind Text -Size 100)
             }
         }
         else {
@@ -5735,7 +6060,7 @@ WHERE [RecipientUserName]=?
   AND [IsRead]=0
 "@
                 [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name "@p1" -Value $now -Kind Date)
-                [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name "@p2" -Value $UserName.Trim() -Kind Text -Size 100)
+                [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name "@p2" -Value $user -Kind Text -Size 100)
             }
             else {
                 $cmd.CommandText = @"
@@ -5746,75 +6071,24 @@ WHERE [Id]=?
 "@
                 [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name "@p1" -Value $now -Kind Date)
                 [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name "@p2" -Value $NotificationId.Trim() -Kind Text -Size 36)
-                [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name "@p3" -Value $UserName.Trim() -Kind Text -Size 100)
+                [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name "@p3" -Value $user -Kind Text -Size 100)
             }
         }
 
-        [void]$cmd.ExecuteNonQuery()
+        $affected = [int]$cmd.ExecuteNonQuery()
 
-        # If the user has already read the notification inside the app,
-        # pending/retry push deliveries are no longer useful.
-        $cancel = $ctx.connection.CreateCommand()
-        $cancel.Transaction = $tx
-
-        if ([int]$ctx.dbType -eq 1) {
-            if ($ReadAll) {
-                $cancel.CommandText = @"
-UPDATE d
-SET d.State='CANCELLED', d.UpdatedAt=@updatedAt
-FROM dbo.BusyCloudNotificationDelivery d
-INNER JOIN dbo.BusyCloudNotification n
-    ON n.Id=d.NotificationId
-WHERE n.RecipientUserName=@userName
-  AND d.State IN ('PENDING','FAILED')
-"@
-                [void](Add-WebApprovalCommandParameter -Command $cancel -DbType 1 -Name "@updatedAt" -Value $now -Kind Date)
-                [void](Add-WebApprovalCommandParameter -Command $cancel -DbType 1 -Name "@userName" -Value $UserName.Trim() -Kind Text -Size 100)
-            }
-            else {
-                $cancel.CommandText = @"
-UPDATE dbo.BusyCloudNotificationDelivery
-SET State='CANCELLED', UpdatedAt=@updatedAt
-WHERE NotificationId=@id
-  AND State IN ('PENDING','FAILED')
-"@
-                [void](Add-WebApprovalCommandParameter -Command $cancel -DbType 1 -Name "@updatedAt" -Value $now -Kind Date)
-                [void](Add-WebApprovalCommandParameter -Command $cancel -DbType 1 -Name "@id" -Value $NotificationId.Trim() -Kind Text -Size 36)
+        # IMPORTANT:
+        # Push delivery is intentionally NOT cancelled here.
+        # IsRead only controls the in-app Bell UI.
+        return @{
+            success = $true
+            data = @{
+                affected = $affected
+                pushDeliveryUnaffected = $true
             }
         }
-        else {
-            if ($ReadAll) {
-                # Access does not support UPDATE JOIN consistently through all
-                # BUSY providers. Read-all cancellation is optional; unread
-                # notifications are excluded from future job creation anyway.
-                $cancel = $null
-            }
-            else {
-                $cancel.CommandText = @"
-UPDATE [BusyCloudNotificationDelivery]
-SET [State]='CANCELLED', [UpdatedAt]=?
-WHERE [NotificationId]=?
-  AND ([State]='PENDING' OR [State]='FAILED')
-"@
-                [void](Add-WebApprovalCommandParameter -Command $cancel -DbType 0 -Name "@p1" -Value $now -Kind Date)
-                [void](Add-WebApprovalCommandParameter -Command $cancel -DbType 0 -Name "@p2" -Value $NotificationId.Trim() -Kind Text -Size 36)
-            }
-        }
-
-        if ($cancel) {
-            [void]$cancel.ExecuteNonQuery()
-        }
-
-        $tx.Commit()
-        $tx = $null
-
-        return @{ success=$true }
     }
     catch {
-        if ($tx) {
-            try { $tx.Rollback() } catch {}
-        }
-
         return @{
             success = $false
             httpStatus = 500
@@ -5826,13 +6100,24 @@ WHERE [NotificationId]=?
     }
 }
 
-function Get-WebPushUnreadNotificationsInternal {
+function Get-WebPushNotificationsForRecipientSinceInternal {
     param(
         $Context,
+        [string]$RecipientUserName,
+        $SinceUtc,
         [int]$Limit = 100
     )
 
+    $user = ([string]$RecipientUserName).Trim()
+    if (-not $user) { return @() }
+
     $limitSafe = [Math]::Max(1, [Math]::Min(500, $Limit))
+
+    $since = [datetime]::MinValue
+    try {
+        if ($SinceUtc) { $since = [datetime]$SinceUtc }
+    } catch {}
+
     $cmd = $Context.connection.CreateCommand()
 
     if ([int]$Context.dbType -eq 1) {
@@ -5841,9 +6126,12 @@ SELECT TOP $limitSafe
     Id, RecipientUserName, WebApprovalId,
     NotificationType, Title, Message, CreatedAt
 FROM dbo.BusyCloudNotification
-WHERE IsRead=0
+WHERE RecipientUserName=@userName
+  AND CreatedAt>=@sinceUtc
 ORDER BY CreatedAt ASC
 "@
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@userName" -Value $user -Kind Text -Size 100)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@sinceUtc" -Value $since -Kind Date)
     }
     else {
         $cmd.CommandText = @"
@@ -5851,9 +6139,12 @@ SELECT TOP $limitSafe
     [Id], [RecipientUserName], [WebApprovalId],
     [NotificationType], [Title], [Message], [CreatedAt]
 FROM [BusyCloudNotification]
-WHERE [IsRead]=0
+WHERE [RecipientUserName]=?
+  AND [CreatedAt]>=?
 ORDER BY [CreatedAt] ASC
 "@
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name "@p1" -Value $user -Kind Text -Size 100)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name "@p2" -Value $since -Kind Date)
     }
 
     $rdr = $null
@@ -6053,27 +6344,14 @@ function Get-WebPushJobsForCompany {
         [int]$Limit = 50
     )
 
-    $permanentSubscriptions = @(
+    $subscriptions = @(
         Get-WebPushSubscriptionsInternal `
             -InstanceId $InstanceId `
             -CompanyCode $CompanyCode
     )
 
-    if ($permanentSubscriptions.Count -eq 0) {
+    if ($subscriptions.Count -eq 0) {
         return @()
-    }
-
-    $byUser = @{}
-
-    foreach ($sub in $permanentSubscriptions) {
-        $key = ([string]$sub.userName).Trim().ToLowerInvariant()
-        if (-not $key) { continue }
-
-        if (-not $byUser.ContainsKey($key)) {
-            $byUser[$key] = @()
-        }
-
-        $byUser[$key] += $sub
     }
 
     $ctx = $null
@@ -6086,22 +6364,32 @@ function Get-WebPushJobsForCompany {
 
         [void](Ensure-WebApprovalFiscalTables -Context $ctx)
 
-        $notifications = @(
-            Get-WebPushUnreadNotificationsInternal `
-                -Context $ctx `
-                -Limit 200
-        )
-
-        foreach ($notification in $notifications) {
+        foreach ($subscription in $subscriptions) {
             if ($jobs.Count -ge $Limit) { break }
 
-            $userKey = ([string]$notification.recipientUserName).Trim().ToLowerInvariant()
+            $user = ([string]$subscription.userName).Trim()
+            if (-not $user) { continue }
 
-            if (-not $byUser.ContainsKey($userKey)) {
-                continue
+            # CreatedAt is treated as the current-device activation boundary.
+            # Therefore:
+            # - notifications created while this device is active are eligible,
+            #   even if the user is logged out;
+            # - a newly activated replacement device does not receive old push
+            #   history that belonged to the previous device.
+            $activationAt = $subscription.activationAt
+            if (-not $activationAt) {
+                $activationAt = [datetime]::UtcNow.AddDays(-30)
             }
 
-            foreach ($subscription in @($byUser[$userKey])) {
+            $notifications = @(
+                Get-WebPushNotificationsForRecipientSinceInternal `
+                    -Context $ctx `
+                    -RecipientUserName $user `
+                    -SinceUtc $activationAt `
+                    -Limit 200
+            )
+
+            foreach ($notification in $notifications) {
                 if ($jobs.Count -ge $Limit) { break }
 
                 $delivery = Get-OrCreate-WebPushDeliveryInternal `
@@ -6134,6 +6422,7 @@ function Get-WebPushJobsForCompany {
                     deliveryId = [string]$delivery.id
                     notificationId = [string]$notification.id
                     subscriptionId = [string]$subscription.id
+                    recipientUserName = $user
                     instanceId = $InstanceId
                     companyCode = $CompanyCode
                     notificationType = [string]$notification.type
@@ -6352,29 +6641,52 @@ WHERE [Id]=?
                 -InstanceId $InstanceId `
                 -CompanyCode $CompanyCode
 
-            $disable = $perm.connection.CreateCommand()
-            $now = [datetime]::UtcNow
+            $endpointHash = ""
+            $findHash = $perm.connection.CreateCommand()
 
             if ([int]$perm.dbType -eq 1) {
-                $disable.CommandText = @"
-UPDATE dbo.BusyCloudPushSubscription
-SET IsActive=0, UpdatedAt=@updatedAt
-WHERE Id=@id
-"@
-                [void](Add-WebApprovalCommandParameter -Command $disable -DbType 1 -Name "@updatedAt" -Value $now -Kind Date)
-                [void](Add-WebApprovalCommandParameter -Command $disable -DbType 1 -Name "@id" -Value $SubscriptionId.Trim() -Kind Text -Size 36)
+                $findHash.CommandText = "SELECT TOP 1 EndpointHash FROM dbo.BusyCloudPushSubscription WHERE Id=@id"
+                [void](Add-WebApprovalCommandParameter -Command $findHash -DbType 1 -Name "@id" -Value $SubscriptionId.Trim() -Kind Text -Size 36)
             }
             else {
-                $disable.CommandText = @"
-UPDATE [BusyCloudPushSubscription]
-SET [IsActive]=0, [UpdatedAt]=?
-WHERE [Id]=?
-"@
-                [void](Add-WebApprovalCommandParameter -Command $disable -DbType 0 -Name "@p1" -Value $now -Kind Date)
-                [void](Add-WebApprovalCommandParameter -Command $disable -DbType 0 -Name "@p2" -Value $SubscriptionId.Trim() -Kind Text -Size 36)
+                $findHash.CommandText = "SELECT TOP 1 [EndpointHash] FROM [BusyCloudPushSubscription] WHERE [Id]=?"
+                [void](Add-WebApprovalCommandParameter -Command $findHash -DbType 0 -Name "@p1" -Value $SubscriptionId.Trim() -Kind Text -Size 36)
             }
 
-            [void]$disable.ExecuteNonQuery()
+            $rawHash = $findHash.ExecuteScalar()
+
+            if ($null -ne $rawHash -and $rawHash -ne [System.DBNull]::Value) {
+                $endpointHash = ([string]$rawHash).Trim()
+            }
+
+            if ($endpointHash) {
+                # 404/410 means the physical browser Push endpoint no longer
+                # exists, so every BUSY user mapping that shares this device
+                # endpoint must be disabled.
+                $disable = $perm.connection.CreateCommand()
+                $now = [datetime]::UtcNow
+
+                if ([int]$perm.dbType -eq 1) {
+                    $disable.CommandText = @"
+UPDATE dbo.BusyCloudPushSubscription
+SET IsActive=0, UpdatedAt=@updatedAt
+WHERE EndpointHash=@endpointHash
+"@
+                    [void](Add-WebApprovalCommandParameter -Command $disable -DbType 1 -Name "@updatedAt" -Value $now -Kind Date)
+                    [void](Add-WebApprovalCommandParameter -Command $disable -DbType 1 -Name "@endpointHash" -Value $endpointHash -Kind Text -Size 64)
+                }
+                else {
+                    $disable.CommandText = @"
+UPDATE [BusyCloudPushSubscription]
+SET [IsActive]=0, [UpdatedAt]=?
+WHERE [EndpointHash]=?
+"@
+                    [void](Add-WebApprovalCommandParameter -Command $disable -DbType 0 -Name "@p1" -Value $now -Kind Date)
+                    [void](Add-WebApprovalCommandParameter -Command $disable -DbType 0 -Name "@p2" -Value $endpointHash -Kind Text -Size 64)
+                }
+
+                [void]$disable.ExecuteNonQuery()
+            }
         }
         catch {}
         finally {
@@ -7049,5 +7361,748 @@ function Start-BusyCloudPushWorker {
             configured = $true
             error = $_.Exception.Message
         }
+    }
+}
+
+
+# =============================================================================
+# WEB APPROVAL - PRIVATE REQUESTED VOUCHER NUMBERING
+# =============================================================================
+#
+# This is deliberately separate from the final BUSY posting number.
+#
+# Rule:
+#   - Approval mode NONE/BUSY:
+#       return the normal existing BUSY/Web numbering result unchanged.
+#
+#   - Approval mode WEB:
+#       compare the normal next number with ONLY the current authenticated
+#       user's unsynchronized PENDING/APPROVED Web Approval requested numbers
+#       for the same voucher type + series + active numbering period.
+#
+#   - REJECTED rows are ignored.
+#   - SYNCED rows are ignored because the final voucher already exists in BUSY
+#     and is therefore represented by the normal BUSY numbering calculation.
+#   - APPROVED + FAILED / REVIEW_REQUIRED / SYNCING remain relevant until
+#     successfully synchronized.
+#
+# Different users may legitimately have the same provisional RequestedVoucherNo.
+# The final BusyVoucherNo remains authoritative at manager Sync time.
+# =============================================================================
+
+function ConvertTo-WebApprovalNumberingDate {
+    param(
+        $Value,
+        [datetime]$Fallback = [datetime]::MinValue
+    )
+
+    if ($null -eq $Value -or $Value -eq [System.DBNull]::Value) {
+        return $Fallback
+    }
+
+    if ($Value -is [datetime]) {
+        return ([datetime]$Value)
+    }
+
+    $text = ([string]$Value).Trim()
+
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return $Fallback
+    }
+
+    $formats = @(
+        "yyyy-MM-dd",
+        "dd-MM-yyyy",
+        "yyyy-MM-ddTHH:mm:ss",
+        "yyyy-MM-ddTHH:mm:ss.fff",
+        "M/d/yyyy h:mm:ss tt",
+        "M/d/yyyy H:mm:ss"
+    )
+
+    foreach ($format in $formats) {
+        $parsed = [datetime]::MinValue
+
+        if (
+            [datetime]::TryParseExact(
+                $text,
+                $format,
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::AllowWhiteSpaces,
+                [ref]$parsed
+            )
+        ) {
+            return $parsed
+        }
+    }
+
+    $general = [datetime]::MinValue
+
+    if (
+        [datetime]::TryParse(
+            $text,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::AllowWhiteSpaces,
+            [ref]$general
+        )
+    ) {
+        return $general
+    }
+
+    try {
+        return ConvertTo-WebApprovalVoucherDate -Value $text
+    }
+    catch {
+        return $Fallback
+    }
+}
+
+function Get-WebApprovalFinancialYearStart {
+    param([datetime]$Date)
+
+    if ($Date.Month -ge 4) {
+        return [datetime]::new($Date.Year, 4, 1)
+    }
+
+    return [datetime]::new($Date.Year - 1, 4, 1)
+}
+
+function Test-WebApprovalRequestedNumberPeriod {
+    param(
+        $ConfigData,
+        $RowVoucherDate,
+        $RowSubmittedAt,
+        [datetime]$CurrentNumberingDate
+    )
+
+    $source = ([string]$ConfigData.source).Trim().ToUpperInvariant()
+
+    if ($source -eq "WEB") {
+        $reset = ([string]$ConfigData.reset_frequency).Trim().ToUpperInvariant()
+
+        if (
+            [string]::IsNullOrWhiteSpace($reset) -or
+            $reset -eq "NONE"
+        ) {
+            return $true
+        }
+
+        $dateBasis = ([string]$ConfigData.date_basis).Trim().ToUpperInvariant()
+
+        $rowDate = if ($dateBasis -eq "REAL_TIME") {
+            ConvertTo-WebApprovalNumberingDate `
+                -Value $RowSubmittedAt `
+                -Fallback ([datetime]::MinValue)
+        }
+        else {
+            ConvertTo-WebApprovalNumberingDate `
+                -Value $RowVoucherDate `
+                -Fallback ([datetime]::MinValue)
+        }
+
+        if ($rowDate -eq [datetime]::MinValue) {
+            return $false
+        }
+
+        switch ($reset) {
+            "DAILY" {
+                return ($rowDate.Date -eq $CurrentNumberingDate.Date)
+            }
+
+            "MONTHLY" {
+                return (
+                    $rowDate.Year -eq $CurrentNumberingDate.Year -and
+                    $rowDate.Month -eq $CurrentNumberingDate.Month
+                )
+            }
+
+            "YEARLY" {
+                return ($rowDate.Year -eq $CurrentNumberingDate.Year)
+            }
+
+            "FINANCIAL_YEAR" {
+                return (
+                    (Get-WebApprovalFinancialYearStart -Date $rowDate) -eq
+                    (Get-WebApprovalFinancialYearStart -Date $CurrentNumberingDate)
+                )
+            }
+
+            default {
+                return $true
+            }
+        }
+    }
+
+    # BUSY numbering reset behavior used by Get-NumberingConfig:
+    # 0 = no reset, 1 = daily, 2 = monthly, 3 = financial year.
+    $frequency = 0
+    try { $frequency = [int]$ConfigData.frequency } catch {}
+
+    if ($frequency -eq 0) {
+        return $true
+    }
+
+    $rowDate = ConvertTo-WebApprovalNumberingDate `
+        -Value $RowVoucherDate `
+        -Fallback ([datetime]::MinValue)
+
+    if ($rowDate -eq [datetime]::MinValue) {
+        return $false
+    }
+
+    switch ($frequency) {
+        1 {
+            return ($rowDate.Date -eq $CurrentNumberingDate.Date)
+        }
+
+        2 {
+            return (
+                $rowDate.Year -eq $CurrentNumberingDate.Year -and
+                $rowDate.Month -eq $CurrentNumberingDate.Month
+            )
+        }
+
+        3 {
+            return (
+                (Get-WebApprovalFinancialYearStart -Date $rowDate) -eq
+                (Get-WebApprovalFinancialYearStart -Date $CurrentNumberingDate)
+            )
+        }
+
+        default {
+            return $true
+        }
+    }
+}
+
+function Get-WebApprovalRequestedNumberSequence {
+    param(
+        [string]$VoucherNumber,
+        $ConfigData,
+        [datetime]$CurrentNumberingDate
+    )
+
+    $number = ([string]$VoucherNumber).Trim()
+
+    if ([string]::IsNullOrWhiteSpace($number)) {
+        return 0L
+    }
+
+    $source = ([string]$ConfigData.source).Trim().ToUpperInvariant()
+
+    if ($source -eq "WEB") {
+        if (
+            -not (Get-Command Get-WebNumberRegex -ErrorAction SilentlyContinue)
+        ) {
+            return 0L
+        }
+
+        try {
+            $regex = Get-WebNumberRegex `
+                -Config $ConfigData `
+                -VoucherDate $CurrentNumberingDate
+
+            $match = $regex.Match($number)
+
+            if (-not $match.Success -or $match.Groups.Count -lt 2) {
+                return 0L
+            }
+
+            $seq = 0L
+
+            if (
+                [long]::TryParse(
+                    $match.Groups[1].Value,
+                    [ref]$seq
+                )
+            ) {
+                return $seq
+            }
+        }
+        catch {}
+
+        return 0L
+    }
+
+    if (
+        -not (Get-Command Get-NumberingVisibleSequence -ErrorAction SilentlyContinue)
+    ) {
+        return 0L
+    }
+
+    try {
+        return [long](
+            Get-NumberingVisibleSequence `
+                -VoucherNumber $number `
+                -Prefix ([string]$ConfigData.prefix) `
+                -Suffix ([string]$ConfigData.suffix) `
+                -Separator ([string]$ConfigData.separator) `
+                -DateText ([string]$ConfigData.date_text)
+        )
+    }
+    catch {
+        return 0L
+    }
+}
+
+function Format-WebApprovalRequestedVoucherNo {
+    param(
+        [long]$Sequence,
+        $ConfigData,
+        [datetime]$CurrentNumberingDate
+    )
+
+    $source = ([string]$ConfigData.source).Trim().ToUpperInvariant()
+
+    if ($source -eq "WEB") {
+        if (
+            -not (Get-Command Build-WebVoucherNumber -ErrorAction SilentlyContinue)
+        ) {
+            throw "Custom WEB numbering formatter is not loaded."
+        }
+
+        $effectiveDate = $CurrentNumberingDate
+
+        if (Get-Command Resolve-NumberingDate -ErrorAction SilentlyContinue) {
+            $effectiveDate = Resolve-NumberingDate `
+                -DateBasis ([string]$ConfigData.date_basis) `
+                -VoucherDate $CurrentNumberingDate
+        }
+
+        return Build-WebVoucherNumber `
+            -Config $ConfigData `
+            -VoucherDate $effectiveDate `
+            -Sequence $Sequence
+    }
+
+    if (
+        -not (Get-Command Format-NumberingVoucherNo -ErrorAction SilentlyContinue)
+    ) {
+        throw "BUSY numbering formatter is not loaded."
+    }
+
+    $padText = ([string]$ConfigData.padding_character)
+
+    $padChar = [char]'0'
+
+    if (-not [string]::IsNullOrEmpty($padText)) {
+        $padChar = [char]$padText[0]
+    }
+
+    return Format-NumberingVoucherNo `
+        -Sequence $Sequence `
+        -PaddingLength ([int]$ConfigData.padding_length) `
+        -PaddingCharacter $padChar `
+        -Prefix ([string]$ConfigData.prefix) `
+        -Suffix ([string]$ConfigData.suffix) `
+        -Separator ([string]$ConfigData.separator) `
+        -DateText ([string]$ConfigData.date_text) `
+        -EmbedPosition ([string]$ConfigData.embed_position)
+}
+
+function Get-WebApprovalAwareNumberingConfig {
+    param(
+        [int]$VchType,
+        [string]$SeriesName,
+        [string]$VoucherDate = "",
+        [string]$UserName = "",
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if (
+        -not (Get-Command Get-EffectiveNumberingConfig -ErrorAction SilentlyContinue)
+    ) {
+        return @{
+            success = $false
+            error = "Voucher numbering engine is not loaded."
+        }
+    }
+
+    # Always calculate the proven normal BUSY/Web numbering first.
+    $baseResult = Get-EffectiveNumberingConfig `
+        -VchType $VchType `
+        -SeriesName $SeriesName `
+        -VoucherDate $VoucherDate `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if ($null -eq $baseResult -or $baseResult.success -eq $false) {
+        return $baseResult
+    }
+
+    $user = ([string]$UserName).Trim()
+    $series = ([string]$SeriesName).Trim()
+
+    # No authenticated user means we cannot apply private Web Approval
+    # numbering. Preserve the existing numbering result.
+    if (
+        [string]::IsNullOrWhiteSpace($user) -or
+        [string]::IsNullOrWhiteSpace($series)
+    ) {
+        return $baseResult
+    }
+
+    $data = Get-WebApprovalPropertyValue `
+        -Object $baseResult `
+        -Names @("data") `
+        -DefaultValue $baseResult
+
+    $isAutoRaw = Get-WebApprovalPropertyValue `
+        -Object $data `
+        -Names @("is_auto", "isAuto") `
+        -DefaultValue $false
+
+    $isAuto = (
+        $isAutoRaw -eq $true -or
+        ([string]$isAutoRaw).Trim().ToLowerInvariant() -in @("1","true","yes")
+    )
+
+    # Private requested-number advancement applies only to an automatic
+    # numbering series. Manual-number series stay exactly as before.
+    if (-not $isAuto) {
+        return $baseResult
+    }
+
+    $ctx = $null
+    $reader = $null
+
+    try {
+        $ctx = Get-WebApprovalFiscalDbContext `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        $dbType = [int]$ctx.dbType
+
+        # -------------------------------------------------------------
+        # Approval mode check.
+        # Apply this feature ONLY when RecType 203 / I1 = 2 (WEB).
+        # NONE(0) and BUSY(1) retain the original numbering unchanged.
+        # -------------------------------------------------------------
+        $modeCmd = $ctx.connection.CreateCommand()
+
+        if ($dbType -eq 1) {
+            $modeCmd.CommandText = @"
+SELECT TOP 1 I1
+FROM Config
+WHERE RecType=203
+  AND [Type]=@vchType
+"@
+
+            [void](Add-WebApprovalCommandParameter `
+                -Command $modeCmd `
+                -DbType 1 `
+                -Name "@vchType" `
+                -Value $VchType `
+                -Kind Int)
+        }
+        else {
+            $modeCmd.CommandText = @"
+SELECT TOP 1 I1
+FROM Config
+WHERE RecType=203
+  AND [Type]=?
+"@
+
+            [void](Add-WebApprovalCommandParameter `
+                -Command $modeCmd `
+                -DbType 0 `
+                -Name "@p1" `
+                -Value $VchType `
+                -Kind Int)
+        }
+
+        $mode = 0
+        $rawMode = $modeCmd.ExecuteScalar()
+
+        if (
+            $null -ne $rawMode -and
+            $rawMode -ne [System.DBNull]::Value
+        ) {
+            try { $mode = [int]$rawMode } catch { $mode = 0 }
+        }
+
+        if ($mode -ne 2) {
+            return $baseResult
+        }
+
+        # -------------------------------------------------------------
+        # Determine the same effective period used by the current form.
+        # The existing frontend does not currently pass voucherDate to the
+        # numbering hook, so an empty value intentionally behaves as today.
+        # -------------------------------------------------------------
+        $currentDate = Get-Date
+
+        if (-not [string]::IsNullOrWhiteSpace($VoucherDate)) {
+            $parsedCurrentDate = ConvertTo-WebApprovalNumberingDate `
+                -Value $VoucherDate `
+                -Fallback ([datetime]::MinValue)
+
+            if ($parsedCurrentDate -ne [datetime]::MinValue) {
+                $currentDate = $parsedCurrentDate
+            }
+        }
+
+        # -------------------------------------------------------------
+        # Read only this user's provisional Web Approval numbers.
+        #
+        # Included:
+        #   PENDING
+        #   APPROVED + READY
+        #   APPROVED + FAILED
+        #   APPROVED + REVIEW_REQUIRED
+        #   APPROVED + SYNCING
+        #
+        # Excluded:
+        #   REJECTED
+        #   SYNCED
+        # -------------------------------------------------------------
+        $cmd = $ctx.connection.CreateCommand()
+
+        if ($dbType -eq 1) {
+            $cmd.CommandText = @"
+SELECT
+    RequestedSeries,
+    RequestedVoucherNo,
+    VoucherDate,
+    SubmittedAt,
+    ApprovalStatus,
+    SyncStatus
+FROM dbo.BusyCloudWebApproval
+WHERE SubmittedBy=@userName
+  AND VoucherType=@vchType
+  AND (ApprovalStatus='PENDING' OR ApprovalStatus='APPROVED')
+  AND SyncStatus<>'SYNCED'
+"@
+
+            [void](Add-WebApprovalCommandParameter `
+                -Command $cmd `
+                -DbType 1 `
+                -Name "@userName" `
+                -Value $user `
+                -Kind Text `
+                -Size 100)
+
+            [void](Add-WebApprovalCommandParameter `
+                -Command $cmd `
+                -DbType 1 `
+                -Name "@vchType" `
+                -Value $VchType `
+                -Kind Int)
+        }
+        else {
+            $cmd.CommandText = @"
+SELECT
+    [RequestedSeries],
+    [RequestedVoucherNo],
+    [VoucherDate],
+    [SubmittedAt],
+    [ApprovalStatus],
+    [SyncStatus]
+FROM [BusyCloudWebApproval]
+WHERE [SubmittedBy]=?
+  AND [VoucherType]=?
+  AND ([ApprovalStatus]='PENDING' OR [ApprovalStatus]='APPROVED')
+  AND [SyncStatus]<>'SYNCED'
+"@
+
+            [void](Add-WebApprovalCommandParameter `
+                -Command $cmd `
+                -DbType 0 `
+                -Name "@p1" `
+                -Value $user `
+                -Kind Text `
+                -Size 100)
+
+            [void](Add-WebApprovalCommandParameter `
+                -Command $cmd `
+                -DbType 0 `
+                -Name "@p2" `
+                -Value $VchType `
+                -Kind Int)
+        }
+
+        $reader = $cmd.ExecuteReader()
+
+        $highestRequestedSequence = 0L
+        $matchedCount = 0
+
+        while ($reader.Read()) {
+            $rowSeries = ([string](
+                Read-WebApprovalReaderValue `
+                    $reader `
+                    "RequestedSeries" `
+                    ""
+            )).Trim()
+
+            if (
+                -not $rowSeries.Equals(
+                    $series,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            ) {
+                continue
+            }
+
+            $rowVoucherDate = Read-WebApprovalReaderValue `
+                $reader `
+                "VoucherDate" `
+                $null
+
+            $rowSubmittedAt = Read-WebApprovalReaderValue `
+                $reader `
+                "SubmittedAt" `
+                $null
+
+            if (
+                -not (
+                    Test-WebApprovalRequestedNumberPeriod `
+                        -ConfigData $data `
+                        -RowVoucherDate $rowVoucherDate `
+                        -RowSubmittedAt $rowSubmittedAt `
+                        -CurrentNumberingDate $currentDate
+                )
+            ) {
+                continue
+            }
+
+            $requestedNo = ([string](
+                Read-WebApprovalReaderValue `
+                    $reader `
+                    "RequestedVoucherNo" `
+                    ""
+            )).Trim()
+
+            $seq = Get-WebApprovalRequestedNumberSequence `
+                -VoucherNumber $requestedNo `
+                -ConfigData $data `
+                -CurrentNumberingDate $currentDate
+
+            if ($seq -gt 0) {
+                $matchedCount++
+
+                if ($seq -gt $highestRequestedSequence) {
+                    $highestRequestedSequence = $seq
+                }
+            }
+        }
+
+        try { $reader.Close() } catch {}
+        try { $reader.Dispose() } catch {}
+        $reader = $null
+
+        $baseNextSequence = 0L
+
+        try {
+            $baseNextSequence = [long](
+                Get-WebApprovalPropertyValue `
+                    -Object $data `
+                    -Names @("current_no", "currentNo") `
+                    -DefaultValue 0
+            )
+        }
+        catch {}
+
+        if ($baseNextSequence -le 0) {
+            return $baseResult
+        }
+
+        $effectiveNextSequence = [Math]::Max(
+            $baseNextSequence,
+            ($highestRequestedSequence + 1L)
+        )
+
+        $endingNo = 0L
+        try {
+            $endingNo = [long](
+                Get-WebApprovalPropertyValue `
+                    -Object $data `
+                    -Names @("ending_no", "endingNo") `
+                    -DefaultValue 0
+            )
+        }
+        catch {}
+
+        if (
+            $endingNo -gt 0 -and
+            $effectiveNextSequence -gt $endingNo
+        ) {
+            return @{
+                success = $false
+                error = (
+                    "Next requested voucher number sequence " +
+                    "$effectiveNextSequence exceeds configured ending " +
+                    "number $endingNo."
+                )
+            }
+        }
+
+        # Nothing from this user is ahead of BUSY, so return the exact normal
+        # response. This keeps NONE/BUSY-like behavior and formatting stable.
+        if ($effectiveNextSequence -eq $baseNextSequence) {
+            try {
+                $data.web_approval_numbering = $true
+                $data.web_approval_mode = 2
+                $data.requested_sequence_highest = $highestRequestedSequence
+                $data.requested_match_count = $matchedCount
+                $data.busy_next_sequence = $baseNextSequence
+            }
+            catch {}
+
+            return $baseResult
+        }
+
+        $nextVoucherNo = Format-WebApprovalRequestedVoucherNo `
+            -Sequence $effectiveNextSequence `
+            -ConfigData $data `
+            -CurrentNumberingDate $currentDate
+
+        # Preserve the exact existing response shape consumed by
+        # useNumberingConfig. Frontend code does not need a new endpoint.
+        $data.current_no = $effectiveNextSequence
+        $data.next_vch_no = $nextVoucherNo
+
+        # Extra diagnostic fields are backward-compatible and useful for
+        # support/debugging. Existing frontend ignores them.
+        $data.web_approval_numbering = $true
+        $data.web_approval_mode = 2
+        $data.requested_sequence_highest = $highestRequestedSequence
+        $data.requested_match_count = $matchedCount
+        $data.busy_next_sequence = $baseNextSequence
+        $data.numbering_scope = "CURRENT_USER"
+
+        Write-Host (
+            "  [WEB-APPROVAL NUMBERING] {0}/{1} user='{2}' type={3} series='{4}' busyNext={5} requestedHigh={6} effectiveNext={7} vchNo='{8}'" -f `
+            $InstanceId,
+            $CompanyCode,
+            $user,
+            $VchType,
+            $series,
+            $baseNextSequence,
+            $highestRequestedSequence,
+            $effectiveNextSequence,
+            $nextVoucherNo
+        ) -ForegroundColor DarkCyan
+
+        return @{
+            success = $true
+            data = $data
+        }
+    }
+    catch {
+        return @{
+            success = $false
+            error = (
+                "Web Approval requested-number calculation failed. " +
+                $_.Exception.Message
+            )
+        }
+    }
+    finally {
+        if ($reader) {
+            try { $reader.Close() } catch {}
+            try { $reader.Dispose() } catch {}
+        }
+
+        Close-WebApprovalDbContext -Context $ctx
     }
 }

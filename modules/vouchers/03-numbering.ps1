@@ -1584,17 +1584,23 @@ WHERE L1 = $seriesCode
             success = $true
 
             data = @{
-                vch_type       = $VchType
-                series_name    = $SeriesName
-                prefix         = $prefix
-                suffix         = $suffix
-                padding_length = $paddingLength
-                current_no     = $currentNo
-                is_auto        = $isAuto
-                frequency      = $frequency
-                ending_no      = $endingNo
-                next_vch_no    = $nextVchNo
-                last_vch_no    = $lastVchNo
+                vch_type          = $VchType
+                series_name       = $SeriesName
+                source            = "BUSY"
+                prefix            = $prefix
+                suffix            = $suffix
+                separator         = $sep
+                date_text         = $dateStr
+                embed_position    = $embedPos
+                padding_length    = $paddingLength
+                padding_character = [string]$padChar
+                start_no          = $startNo
+                current_no        = $currentNo
+                is_auto           = $isAuto
+                frequency         = $frequency
+                ending_no         = $endingNo
+                next_vch_no       = $nextVchNo
+                last_vch_no       = $lastVchNo
             }
         }
     }

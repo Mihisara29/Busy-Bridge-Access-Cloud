@@ -2545,18 +2545,24 @@ function Get-EffectiveNumberingConfig {
         return @{
             success = $true
             data = @{
-                vch_type       = $VchType
-                series_name    = $SeriesName
-                source         = "WEB"
-                date_basis     = $web.date_basis
-                prefix         = $web.prefix
-                suffix         = $web.suffix
-                padding_length = $web.padding_length
-                current_no     = $web.next_sequence
-                is_auto        = $true
-                frequency      = switch ($web.reset_frequency) { "DAILY" {1}; "MONTHLY" {2}; "YEARLY" {3}; "FINANCIAL_YEAR" {3}; default {0} }
-                ending_no      = $web.ending_number
-                next_vch_no    = $web.next_vch_no
+                vch_type          = $VchType
+                series_name       = $SeriesName
+                source            = "WEB"
+                date_basis        = $web.date_basis
+                prefix            = $web.prefix
+                suffix            = $web.suffix
+                separator         = $web.separator
+                organisation_code = $web.organisation_code
+                year_format       = $web.year_format
+                month_format      = $web.month_format
+                reset_frequency   = $web.reset_frequency
+                starting_number   = $web.starting_number
+                padding_length    = $web.padding_length
+                current_no        = $web.next_sequence
+                is_auto           = $true
+                frequency         = switch ($web.reset_frequency) { "DAILY" {1}; "MONTHLY" {2}; "YEARLY" {3}; "FINANCIAL_YEAR" {3}; default {0} }
+                ending_no         = $web.ending_number
+                next_vch_no       = $web.next_vch_no
                 last_vch_no    = if ($web.last_sequence -gt 0) {
                     $rawVoucherDate = if ($VoucherDate) {
                         [datetime]::Parse(

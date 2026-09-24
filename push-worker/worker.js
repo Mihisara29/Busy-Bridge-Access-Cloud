@@ -124,10 +124,18 @@ const minimalPushContent = (job) => {
     job.notificationType || '',
   ).toUpperCase();
 
+  const userName = String(
+    job.recipientUserName || '',
+  ).trim();
+
+  const dear = userName
+    ? `Dear ${userName},\n`
+    : '';
+
   if (type === 'WEB_APPROVAL_SUBMITTED') {
     return {
       title: 'New Web Approval',
-      body: 'A transaction is waiting for your approval.',
+      body: `${dear}A transaction is waiting for your approval.`,
       url: job.webApprovalId
         ? `/web-approvals?id=${encodeURIComponent(
             job.webApprovalId,
@@ -139,7 +147,7 @@ const minimalPushContent = (job) => {
   if (type === 'WEB_APPROVAL_APPROVED') {
     return {
       title: 'Voucher Approved',
-      body: 'Your Web Approval transaction was approved.',
+      body: `${dear}Your Web Approval transaction was approved.`,
       url: '/',
     };
   }
@@ -147,7 +155,7 @@ const minimalPushContent = (job) => {
   if (type === 'WEB_APPROVAL_REJECTED') {
     return {
       title: 'Voucher Rejected',
-      body: 'Your Web Approval transaction was rejected. Sign in to view details.',
+      body: `${dear}Your Web Approval transaction was rejected. Sign in to view details.`,
       url: '/',
     };
   }
@@ -155,7 +163,7 @@ const minimalPushContent = (job) => {
   if (type === 'WEB_APPROVAL_SYNCED') {
     return {
       title: 'Voucher Posted to BUSY',
-      body: 'Your approved transaction was synchronized to BUSY.',
+      body: `${dear}Your approved transaction was synchronized to BUSY.`,
       url: '/',
     };
   }
@@ -165,7 +173,7 @@ const minimalPushContent = (job) => {
   ) {
     return {
       title: 'Web Approval Needs Review',
-      body: 'A BUSY synchronization requires review. Automatic retry is blocked.',
+      body: `${dear}A BUSY synchronization requires review. Automatic retry is blocked.`,
       url: job.webApprovalId
         ? `/web-approvals?id=${encodeURIComponent(
             job.webApprovalId,
@@ -177,7 +185,7 @@ const minimalPushContent = (job) => {
   if (type === 'WEB_APPROVAL_SYNC_FAILED') {
     return {
       title: 'Web Approval Sync Failed',
-      body: 'A synchronization attempt failed. Sign in to review the transaction.',
+      body: `${dear}A synchronization attempt failed. Sign in to review the transaction.`,
       url: job.webApprovalId
         ? `/web-approvals?id=${encodeURIComponent(
             job.webApprovalId,
@@ -188,7 +196,7 @@ const minimalPushContent = (job) => {
 
   return {
     title: 'BUSY Cloud',
-    body: 'You have a new notification.',
+    body: `${dear}You have a new notification.`,
     url: '/',
   };
 };

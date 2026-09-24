@@ -3057,6 +3057,34 @@ function Start-BUSYServer {
             } elseif ($path -eq "/busy/push/config" -and $method -eq "GET") {
                 $result = Get-WebPushPublicConfig
 
+            } elseif ($path -eq "/busy/push/status" -and $method -eq "POST") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user -or
+                    [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $result = @{ success=$false; error="Authenticated BUSY user is required." }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $data = Read-RequestBody $request | ConvertFrom-Json
+
+                    $result = Get-WebPushSubscriptionStatus `
+                        -UserName ([string]$authResult.user.name) `
+                        -Endpoint ([string]$data.endpoint) `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false) {
+                        $response.StatusCode = if ($result.httpStatus) {
+                            [int]$result.httpStatus
+                        } else {
+                            400
+                        }
+                    }
+                }
+
             } elseif ($path -eq "/busy/push/subscribe" -and $method -eq "POST") {
                 if (
                     -not $requireAuth -or
@@ -4368,12 +4396,42 @@ function Start-BUSYServer {
                     }
                     $response.StatusCode = 400
                 } else {
-                    $result = Get-EffectiveNumberingConfig `
-                        -VchType ([int]$vchTypeStr) `
-                        -SeriesName $seriesName.Trim() `
-                        -VoucherDate $voucherDate `
-                        -InstanceId $instanceId `
-                        -CompanyCode $companyCode
+                    $numberingUserName = ""
+
+                    try {
+                        if (
+                            $requireAuth -and
+                            $null -ne $authResult -and
+                            $null -ne $authResult.user
+                        ) {
+                            $numberingUserName =
+                                ([string]$authResult.user.name).Trim()
+                        }
+                    }
+                    catch {}
+
+                    if (
+                        Get-Command Get-WebApprovalAwareNumberingConfig `
+                            -ErrorAction SilentlyContinue
+                    ) {
+                        $result = Get-WebApprovalAwareNumberingConfig `
+                            -VchType ([int]$vchTypeStr) `
+                            -SeriesName $seriesName.Trim() `
+                            -VoucherDate $voucherDate `
+                            -UserName $numberingUserName `
+                            -InstanceId $instanceId `
+                            -CompanyCode $companyCode
+                    }
+                    else {
+                        # Safe compatibility fallback if the Web Approval
+                        # module is not installed.
+                        $result = Get-EffectiveNumberingConfig `
+                            -VchType ([int]$vchTypeStr) `
+                            -SeriesName $seriesName.Trim() `
+                            -VoucherDate $voucherDate `
+                            -InstanceId $instanceId `
+                            -CompanyCode $companyCode
+                    }
 
                     if ($result.success -eq $false) {
                         $response.StatusCode = 400
