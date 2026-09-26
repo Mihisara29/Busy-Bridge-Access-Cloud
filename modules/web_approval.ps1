@@ -5,11 +5,13 @@
 # Purpose
 # -------
 # 1. Automatically creates the complete Web Approval support tables when missing.
-#    This baseline build does NOT modify existing table structures.
+#    V6.7 also applies small idempotent schema extensions required for audited
+#    Sales Manager item quantity/remove operations.
 # 2. Works with BOTH BUSY SQL Server and Access/BDS companies.
 # 3. Stores sales workflow role in two existing Boolean-style fields:
 #       B35 = Salesman flag
 #       B36 = Sales Manager flag
+#       B37 = Sales Manager may edit pending Web Approval items
 #
 #    Valid combinations:
 #       B35=0, B36=0 -> NONE
@@ -31,7 +33,7 @@
 # ============================================================================
 # BUSYCLOUD WEB APPROVAL MODULE VERSION
 # ============================================================================
-$script:BusyCloudWebApprovalModuleVersion = "6.6-private-requested-numbering"
+$script:BusyCloudWebApprovalModuleVersion = "6.8-direct-manager-edit-comparison"
 Write-Host "  [WEB-APPROVAL] Module version $script:BusyCloudWebApprovalModuleVersion loaded." -ForegroundColor DarkCyan
 
 $script:WebApprovalSchemaVersion = 1
@@ -1647,12 +1649,16 @@ WHERE [WebApprovalId]=?
 # ============================================================================
 # PHASE 3 - WEB APPROVAL SUBMISSION ROUTING
 # ============================================================================
-# When Config RecType=203 / I1=2 (WEB), a CREATE request is NOT sent to
-# Create-Voucher. Instead the validated payload is stored in
-# BusyCloudWebApproval as PENDING and assigned managers receive notifications.
+# When the derived approval policy enables Web Approval, a CREATE request is
+# NOT sent to Create-Voucher immediately. Instead the validated payload is
+# stored in BusyCloudWebApproval as PENDING and assigned managers receive
+# notifications.
 #
 # IMPORTANT:
 # - Existing BUSY approval (I1=1) remains unchanged.
+# - BOTH uses Web Approval first. The later Sync calls the ORIGINAL
+#   Create-Voucher unchanged; mode 3 makes its existing approval layer set
+#   ApprovalStatus=2 after the complete BUSY voucher has been saved.
 # - No Approval (I1=0) remains unchanged.
 # - Modify requests remain unchanged.
 # - Actual BUSY voucher creation is NOT performed in this phase.
@@ -2560,7 +2566,11 @@ function Invoke-WebApprovalVoucherCreateRouting {
         $mode = [int]$config.data.approval_mode_value
     }
     catch {
-        if (([string]$config.data.approval_mode).Trim().ToUpperInvariant() -eq "WEB") {
+        $modeName = ([string]$config.data.approval_mode).Trim().ToUpperInvariant()
+        if ($modeName -eq "BOTH") {
+            $mode = 3
+        }
+        elseif ($modeName -eq "WEB") {
             $mode = 2
         }
         elseif ([bool]$config.data.approval_required) {
@@ -2568,7 +2578,7 @@ function Invoke-WebApprovalVoucherCreateRouting {
         }
     }
 
-    if ($mode -ne 2) {
+    if ($mode -notin @(2,3)) {
         # NONE and BUSY continue through the existing Create-Voucher path.
         return @{
             success = $true
@@ -3551,7 +3561,7 @@ ORDER BY [ActionTime] ASC
                 actionBy = [string](Read-WebApprovalReaderValue $rdr "ActionBy" "")
                 remarks = [string](Read-WebApprovalReaderValue $rdr "Remarks" "")
                 metadata = $metadata
-                actionTime = Read-WebApprovalReaderValue $rdr "ActionTime" $null
+                actionTime = ConvertTo-WebApprovalUtcIsoString (Read-WebApprovalReaderValue $rdr "ActionTime" $null)
             }
         }
     }
@@ -3606,12 +3616,19 @@ function Get-WebApprovalDetailForManager {
             -Context $ctx `
             -WebApprovalId $Id
 
+        $publicTransaction = Convert-WebApprovalRecordToPublic `
+            -Record $record `
+            -IncludePayload $true
+
+        $publicTransaction["syncedVoucher"] = Get-WebApprovalSyncedVoucherSnapshot `
+            -Record $record `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
         return @{
             success = $true
             data = @{
-                transaction = Convert-WebApprovalRecordToPublic `
-                    -Record $record `
-                    -IncludePayload $true
+                transaction = $publicTransaction
                 actions = @($history)
             }
         }
@@ -7774,54 +7791,15 @@ function Get-WebApprovalAwareNumberingConfig {
         $dbType = [int]$ctx.dbType
 
         # -------------------------------------------------------------
-        # Approval mode check.
-        # Apply this feature ONLY when RecType 203 / I1 = 2 (WEB).
-        # NONE(0) and BUSY(1) retain the original numbering unchanged.
+        # Approval policy check. Web Approval is stored independently from
+        # BUSY native approval. RecType=203/I1 intentionally remains 0 or 1.
         # -------------------------------------------------------------
-        $modeCmd = $ctx.connection.CreateCommand()
+        $policy = Get-VoucherApprovalConfig `
+            -VchType $VchType `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
 
-        if ($dbType -eq 1) {
-            $modeCmd.CommandText = @"
-SELECT TOP 1 I1
-FROM Config
-WHERE RecType=203
-  AND [Type]=@vchType
-"@
-
-            [void](Add-WebApprovalCommandParameter `
-                -Command $modeCmd `
-                -DbType 1 `
-                -Name "@vchType" `
-                -Value $VchType `
-                -Kind Int)
-        }
-        else {
-            $modeCmd.CommandText = @"
-SELECT TOP 1 I1
-FROM Config
-WHERE RecType=203
-  AND [Type]=?
-"@
-
-            [void](Add-WebApprovalCommandParameter `
-                -Command $modeCmd `
-                -DbType 0 `
-                -Name "@p1" `
-                -Value $VchType `
-                -Kind Int)
-        }
-
-        $mode = 0
-        $rawMode = $modeCmd.ExecuteScalar()
-
-        if (
-            $null -ne $rawMode -and
-            $rawMode -ne [System.DBNull]::Value
-        ) {
-            try { $mode = [int]$rawMode } catch { $mode = 0 }
-        }
-
-        if ($mode -ne 2) {
+        if (-not $policy.success -or -not [bool]$policy.data.web_approval_required) {
             return $baseResult
         }
 
@@ -8106,3 +8084,1038 @@ WHERE [SubmittedBy]=?
         Close-WebApprovalDbContext -Context $ctx
     }
 }
+
+# ============================================================================
+# BUSYCLOUD WEB APPROVAL V6.7 - MANAGER ITEM EDIT + AUDIT EXTENSION
+# ============================================================================
+# B37 is dedicated to Sales Manager permission for editing item quantities and
+# removing items while a Web Approval transaction is still PENDING/NOT_READY.
+# Existing PayloadJson/PayloadHash remain the working copy used by safe COM sync.
+# OriginalPayloadJson/OriginalPayloadHash preserve the salesman submission.
+# ============================================================================
+$script:BusyCloudWebApprovalModuleVersion = "6.8-direct-manager-edit-comparison"
+$script:WebApprovalSchemaVersion = 2
+Write-Host "  [WEB-APPROVAL] Direct manager item edit/audit extension $script:BusyCloudWebApprovalModuleVersion loaded." -ForegroundColor DarkCyan
+
+function Ensure-WebApprovalManagerEditPermanentSchema {
+    param($Context)
+
+    $conn = $Context.connection
+    $dbType = [int]$Context.dbType
+
+    if (-not (Test-WebApprovalColumnExists -Connection $conn -DbType $dbType -TableName "MobileUserPreference" -ColumnName "B37")) {
+        if ($dbType -eq 1) {
+            [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql "ALTER TABLE dbo.MobileUserPreference ADD B37 BIT NULL")
+        }
+        else {
+            [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql "ALTER TABLE [MobileUserPreference] ADD COLUMN [B37] BYTE")
+        }
+        Write-Host "  [WEB-APPROVAL MIGRATION] Added MobileUserPreference.B37 manager item-edit permission." -ForegroundColor Yellow
+    }
+
+    try {
+        [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql "UPDATE [MobileUserPreference] SET [B37]=0 WHERE [B37] IS NULL")
+    } catch {}
+
+    return $true
+}
+
+function Ensure-WebApprovalManagerEditFiscalSchema {
+    param($Context)
+
+    $conn = $Context.connection
+    $dbType = [int]$Context.dbType
+    [void](Ensure-WebApprovalFiscalTables -Context $Context)
+
+    $columns = @(
+        @{ Name="OriginalPayloadJson"; SqlType="NVARCHAR(MAX) NULL"; AccessType="MEMO" },
+        @{ Name="OriginalPayloadHash"; SqlType="CHAR(64) NULL"; AccessType="TEXT(64)" },
+        @{ Name="HasManagerChanges"; SqlType="BIT NULL"; AccessType="BYTE" },
+        @{ Name="ModifiedBy"; SqlType="NVARCHAR(100) NULL"; AccessType="TEXT(100)" },
+        @{ Name="ModifiedAt"; SqlType="DATETIME2 NULL"; AccessType="DATETIME" }
+    )
+
+    foreach ($column in $columns) {
+        if (-not (Test-WebApprovalColumnExists -Connection $conn -DbType $dbType -TableName "BusyCloudWebApproval" -ColumnName $column.Name)) {
+            if ($dbType -eq 1) {
+                $sql = "ALTER TABLE dbo.BusyCloudWebApproval ADD [$($column.Name)] $($column.SqlType)"
+            }
+            else {
+                $sql = "ALTER TABLE [BusyCloudWebApproval] ADD COLUMN [$($column.Name)] $($column.AccessType)"
+            }
+            [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql $sql)
+            Write-Host "  [WEB-APPROVAL MIGRATION] Added BusyCloudWebApproval.$($column.Name)." -ForegroundColor Yellow
+        }
+    }
+
+    try {
+        [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql "UPDATE [BusyCloudWebApproval] SET [HasManagerChanges]=0 WHERE [HasManagerChanges] IS NULL")
+    } catch {}
+
+    return $true
+}
+
+# Override role directory so the frontend receives the dedicated B37 permission.
+function Get-WebApprovalRoleDirectory {
+    param(
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $ctx = $null
+    $rdr = $null
+    try {
+        $ctx = Get-WebApprovalPermanentDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        [void](Ensure-WebApprovalPermanentTables -Context $ctx)
+        [void](Ensure-WebApprovalManagerEditPermanentSchema -Context $ctx)
+
+        $cmd = $ctx.connection.CreateCommand()
+        $cmd.CommandText = "SELECT [Name], B35, B36, B37 FROM MobileUserPreference ORDER BY [Name]"
+        $rdr = $cmd.ExecuteReader()
+        $items = @()
+
+        while ($rdr.Read()) {
+            $name = if ($rdr.IsDBNull(0)) { "" } else { ([string]$rdr.GetValue(0)).Trim() }
+            $salesmanFlag = 0; $managerFlag = 0; $editFlag = 0
+            if (-not $rdr.IsDBNull(1)) { try { $salesmanFlag = [int]$rdr.GetValue(1) } catch {} }
+            if (-not $rdr.IsDBNull(2)) { try { $managerFlag = [int]$rdr.GetValue(2) } catch {} }
+            if (-not $rdr.IsDBNull(3)) { try { $editFlag = [int]$rdr.GetValue(3) } catch {} }
+            $role = Get-WebApprovalRoleFromFlags -SalesmanFlag $salesmanFlag -ManagerFlag $managerFlag
+
+            if ($name) {
+                $items += @{
+                    userName = $name
+                    role = $role
+                    roleName = Get-WebApprovalRoleName -Role $role
+                    canEditItems = ($role -eq $script:WebApprovalRoleSalesManager -and $editFlag -ne 0)
+                }
+            }
+        }
+
+        return @{ success=$true; data=@($items) }
+    }
+    catch { return @{ success=$false; error=$_.Exception.Message } }
+    finally {
+        if ($rdr) { try { $rdr.Close() } catch {}; try { $rdr.Dispose() } catch {} }
+        Close-WebApprovalDbContext -Context $ctx
+    }
+}
+
+# Override role setter to clear B37 when a user stops being a Sales Manager.
+function Set-WebApprovalUserRole {
+    param(
+        [string]$UserName,
+        $Role,
+        [string]$ActionBy = "",
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($UserName)) { return @{ success=$false; error="UserName is required." } }
+    $roleValue = ConvertTo-WebApprovalRoleValue -Value $Role
+    if ($roleValue -notin @(0,1,2)) { return @{ success=$false; error="Role must be NONE, SALESMAN or SALES_MANAGER." } }
+
+    $ctx=$null; $tx=$null
+    try {
+        $ctx = Get-WebApprovalPermanentDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        [void](Ensure-WebApprovalPermanentTables -Context $ctx)
+        [void](Ensure-WebApprovalManagerEditPermanentSchema -Context $ctx)
+        $safeUser = $UserName.Trim().Replace("'", "''")
+
+        $check = $ctx.connection.CreateCommand()
+        $check.CommandText = "SELECT COUNT(*) FROM MobileUserPreference WHERE [Name]='$safeUser'"
+        if ([int]$check.ExecuteScalar() -le 0) {
+            return @{ success=$false; httpStatus=404; error="MobileUserPreference profile was not found for '$($UserName.Trim())'." }
+        }
+
+        $salesmanFlag = if ($roleValue -eq $script:WebApprovalRoleSalesman) { 1 } else { 0 }
+        $managerFlag = if ($roleValue -eq $script:WebApprovalRoleSalesManager) { 1 } else { 0 }
+        $editFlagSql = if ($roleValue -eq $script:WebApprovalRoleSalesManager) { "[B37]" } else { "0" }
+
+        $tx = $ctx.connection.BeginTransaction()
+        [void](Invoke-WebApprovalNonQuery -Connection $ctx.connection -Transaction $tx -Sql "UPDATE [MobileUserPreference] SET [B35]=$salesmanFlag, [B36]=$managerFlag, [B37]=$editFlagSql WHERE [Name]='$safeUser'")
+        if ($roleValue -ne $script:WebApprovalRoleSalesman) {
+            [void](Invoke-WebApprovalNonQuery -Connection $ctx.connection -Transaction $tx -Sql "UPDATE [BusyCloudSalesmanManager] SET [IsActive]=0 WHERE [SalesmanUserName]='$safeUser'")
+        }
+        if ($roleValue -ne $script:WebApprovalRoleSalesManager) {
+            [void](Invoke-WebApprovalNonQuery -Connection $ctx.connection -Transaction $tx -Sql "UPDATE [BusyCloudSalesmanManager] SET [IsActive]=0 WHERE [ManagerUserName]='$safeUser'")
+        }
+        $tx.Commit(); $tx=$null
+
+        return @{
+            success=$true
+            message="Sales workflow role updated successfully."
+            data=@{
+                userName=$UserName.Trim()
+                role=$roleValue
+                roleName=Get-WebApprovalRoleName -Role $roleValue
+                canEditItems=$false
+                updatedBy=$ActionBy
+            }
+        }
+    }
+    catch { if ($tx) { try { $tx.Rollback() } catch {} }; return @{ success=$false; error=$_.Exception.Message } }
+    finally { Close-WebApprovalDbContext -Context $ctx }
+}
+
+function Set-WebApprovalManagerItemEditPermission {
+    param(
+        [string]$UserName,
+        [bool]$CanEditItems,
+        [string]$ActionBy = "",
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($UserName)) { return @{ success=$false; httpStatus=400; error="UserName is required." } }
+    $ctx=$null
+    try {
+        $ctx = Get-WebApprovalPermanentDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        [void](Ensure-WebApprovalPermanentTables -Context $ctx)
+        [void](Ensure-WebApprovalManagerEditPermanentSchema -Context $ctx)
+        $safe = $UserName.Trim().Replace("'", "''")
+        $cmd = $ctx.connection.CreateCommand()
+        $cmd.CommandText = "SELECT B35, B36 FROM MobileUserPreference WHERE [Name]='$safe'"
+        $rdr = $cmd.ExecuteReader()
+        if (-not $rdr.Read()) { try { $rdr.Close() } catch {}; return @{ success=$false; httpStatus=404; error="User profile was not found." } }
+        $b35=0; $b36=0
+        if (-not $rdr.IsDBNull(0)) { try { $b35=[int]$rdr.GetValue(0) } catch {} }
+        if (-not $rdr.IsDBNull(1)) { try { $b36=[int]$rdr.GetValue(1) } catch {} }
+        try { $rdr.Close() } catch {}
+        $role = Get-WebApprovalRoleFromFlags -SalesmanFlag $b35 -ManagerFlag $b36
+        if ($role -ne $script:WebApprovalRoleSalesManager) {
+            return @{ success=$false; httpStatus=409; error="Item-edit permission can only be assigned to a Sales Manager." }
+        }
+        $flag = if ($CanEditItems) { 1 } else { 0 }
+        [void](Invoke-WebApprovalNonQuery -Connection $ctx.connection -Sql "UPDATE [MobileUserPreference] SET [B37]=$flag WHERE [Name]='$safe'")
+        return @{ success=$true; data=@{ userName=$UserName.Trim(); canEditItems=[bool]$CanEditItems; updatedBy=$ActionBy } }
+    }
+    catch { return @{ success=$false; httpStatus=500; error=$_.Exception.Message } }
+    finally { Close-WebApprovalDbContext -Context $ctx }
+}
+
+function Get-WebApprovalRecordByIdInternal {
+    param($Context, [string]$Id)
+    if ([string]::IsNullOrWhiteSpace($Id)) { return $null }
+    [void](Ensure-WebApprovalManagerEditFiscalSchema -Context $Context)
+    $cmd=$Context.connection.CreateCommand(); $dbType=[int]$Context.dbType
+    if ($dbType -eq 1) {
+        $cmd.CommandText="SELECT TOP 1 * FROM dbo.BusyCloudWebApproval WHERE Id=@id"
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@id" -Value $Id.Trim() -Kind Text -Size 36)
+    } else {
+        $cmd.CommandText="SELECT TOP 1 * FROM [BusyCloudWebApproval] WHERE [Id]=?"
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name "@p1" -Value $Id.Trim() -Kind Text -Size 36)
+    }
+    $rdr=$null
+    try {
+        $rdr=$cmd.ExecuteReader(); if (-not $rdr.Read()) { return $null }
+        return @{
+            Id=Read-WebApprovalReaderValue $rdr "Id" ""; SubmittedBy=Read-WebApprovalReaderValue $rdr "SubmittedBy" "";
+            VoucherType=Read-WebApprovalReaderValue $rdr "VoucherType" 0; VoucherDate=Read-WebApprovalReaderValue $rdr "VoucherDate" $null;
+            RequestedSeries=Read-WebApprovalReaderValue $rdr "RequestedSeries" ""; RequestedVoucherNo=Read-WebApprovalReaderValue $rdr "RequestedVoucherNo" "";
+            PartyName=Read-WebApprovalReaderValue $rdr "PartyName" ""; Amount=Read-WebApprovalReaderValue $rdr "Amount" 0;
+            PayloadJson=Read-WebApprovalReaderValue $rdr "PayloadJson" ""; PayloadHash=Read-WebApprovalReaderValue $rdr "PayloadHash" "";
+            OriginalPayloadJson=Read-WebApprovalReaderValue $rdr "OriginalPayloadJson" ""; OriginalPayloadHash=Read-WebApprovalReaderValue $rdr "OriginalPayloadHash" "";
+            HasManagerChanges=Read-WebApprovalReaderValue $rdr "HasManagerChanges" 0; ModifiedBy=Read-WebApprovalReaderValue $rdr "ModifiedBy" ""; ModifiedAt=Read-WebApprovalReaderValue $rdr "ModifiedAt" $null;
+            ApprovalStatus=Read-WebApprovalReaderValue $rdr "ApprovalStatus" ""; SyncStatus=Read-WebApprovalReaderValue $rdr "SyncStatus" "";
+            DecisionBy=Read-WebApprovalReaderValue $rdr "DecisionBy" ""; DecisionAt=Read-WebApprovalReaderValue $rdr "DecisionAt" $null; RejectionReason=Read-WebApprovalReaderValue $rdr "RejectionReason" "";
+            BusyVoucherNo=Read-WebApprovalReaderValue $rdr "BusyVoucherNo" ""; BusyVoucherCode=Read-WebApprovalReaderValue $rdr "BusyVoucherCode" "";
+            NumberChangeReason=Read-WebApprovalReaderValue $rdr "NumberChangeReason" ""; NumberResolvedAt=Read-WebApprovalReaderValue $rdr "NumberResolvedAt" $null;
+            SyncAttempts=Read-WebApprovalReaderValue $rdr "SyncAttempts" 0; LastSyncError=Read-WebApprovalReaderValue $rdr "LastSyncError" "";
+            SubmittedAt=Read-WebApprovalReaderValue $rdr "SubmittedAt" $null; UpdatedAt=Read-WebApprovalReaderValue $rdr "UpdatedAt" $null; SyncedAt=Read-WebApprovalReaderValue $rdr "SyncedAt" $null; Version=Read-WebApprovalReaderValue $rdr "Version" 1
+        }
+    }
+    finally { if ($rdr) { try { $rdr.Close() } catch {}; try { $rdr.Dispose() } catch {} } }
+}
+
+# ---------------------------------------------------------------------------
+# Web Approval UTC JSON boundary (v7.2 + UTC merge)
+#
+# All Web Approval audit timestamps are written using [datetime]::UtcNow.
+# SQL DATETIME/DATETIME2 preserves the clock value but not DateTimeKind, so a
+# SqlDataReader returns Kind=Unspecified. PowerShell ConvertTo-Json can then
+# serialize that value as if it were server-local time, causing the browser to
+# display the UTC wall-clock (for example 06:43) instead of Sri Lanka local time
+# (12:13). Normalize the database wall-clock back to explicit UTC ISO-8601.
+# ---------------------------------------------------------------------------
+function ConvertTo-WebApprovalUtcIsoString {
+    param($Value)
+
+    if ($null -eq $Value -or $Value -eq [System.DBNull]::Value) {
+        return $null
+    }
+
+    try {
+        if ($Value -is [System.DateTimeOffset]) {
+            return ([System.DateTimeOffset]$Value).UtcDateTime.ToString(
+                "yyyy-MM-ddTHH:mm:ss.fffZ",
+                [System.Globalization.CultureInfo]::InvariantCulture
+            )
+        }
+
+        $date = [datetime]$Value
+
+        # Database values in BusyCloudWebApproval / BusyCloudWebApprovalAction
+        # are UTC wall-clock values by contract. SpecifyKind is intentional:
+        # do NOT call ToUniversalTime() on an Unspecified DateTime because that
+        # would subtract the bridge machine's local offset a second time.
+        $utc = [datetime]::SpecifyKind($date, [System.DateTimeKind]::Utc)
+
+        return $utc.ToString(
+            "yyyy-MM-ddTHH:mm:ss.fffZ",
+            [System.Globalization.CultureInfo]::InvariantCulture
+        )
+    }
+    catch {
+        return [string]$Value
+    }
+}
+
+function Convert-WebApprovalRecordToPublic {
+    param($Record, [bool]$IncludePayload=$false)
+    if ($null -eq $Record) { return $null }
+    $id=([string]$Record.Id).Trim(); $reference=$id
+    if ($id.Length -ge 8) { $reference="WA-"+$id.Substring(0,8).ToUpperInvariant() }
+    $out=[ordered]@{
+        id=$id; reference=$reference; submittedBy=([string]$Record.SubmittedBy).Trim(); voucherType=[int]$Record.VoucherType; voucherDate=$Record.VoucherDate;
+        requestedSeries=([string]$Record.RequestedSeries).Trim(); requestedVoucherNo=([string]$Record.RequestedVoucherNo).Trim(); partyName=([string]$Record.PartyName).Trim(); amount=[double]$Record.Amount;
+        approvalStatus=([string]$Record.ApprovalStatus).Trim(); syncStatus=([string]$Record.SyncStatus).Trim(); decisionBy=([string]$Record.DecisionBy).Trim(); decisionAt=(ConvertTo-WebApprovalUtcIsoString $Record.DecisionAt);
+        rejectionReason=([string]$Record.RejectionReason).Trim(); busyVoucherNo=([string]$Record.BusyVoucherNo).Trim(); busyVoucherCode=([string]$Record.BusyVoucherCode).Trim();
+        numberChangeReason=([string]$Record.NumberChangeReason).Trim(); numberResolvedAt=(ConvertTo-WebApprovalUtcIsoString $Record.NumberResolvedAt); syncAttempts=[int]$Record.SyncAttempts; lastSyncError=([string]$Record.LastSyncError).Trim();
+        submittedAt=(ConvertTo-WebApprovalUtcIsoString $Record.SubmittedAt); updatedAt=(ConvertTo-WebApprovalUtcIsoString $Record.UpdatedAt); syncedAt=(ConvertTo-WebApprovalUtcIsoString $Record.SyncedAt); version=[int]$Record.Version;
+        hasManagerChanges=([int]$Record.HasManagerChanges -ne 0); modifiedBy=([string]$Record.ModifiedBy).Trim(); modifiedAt=(ConvertTo-WebApprovalUtcIsoString $Record.ModifiedAt)
+    }
+    if ($IncludePayload) {
+        $payload=$null; $originalPayload=$null
+        try { if (-not [string]::IsNullOrWhiteSpace([string]$Record.PayloadJson)) { $payload=([string]$Record.PayloadJson)|ConvertFrom-Json } } catch {}
+        $originalJson=[string]$Record.OriginalPayloadJson
+        if ([string]::IsNullOrWhiteSpace($originalJson)) { $originalJson=[string]$Record.PayloadJson }
+        try { if (-not [string]::IsNullOrWhiteSpace($originalJson)) { $originalPayload=$originalJson|ConvertFrom-Json } } catch {}
+        $originalHash=([string]$Record.OriginalPayloadHash).Trim(); if (-not $originalHash) { $originalHash=([string]$Record.PayloadHash).Trim() }
+        $out["payload"]=$payload; $out["payloadJson"]=[string]$Record.PayloadJson; $out["payloadHash"]=([string]$Record.PayloadHash).Trim()
+        $out["originalPayload"]=$originalPayload; $out["originalPayloadJson"]=$originalJson; $out["originalPayloadHash"]=$originalHash
+    }
+    return $out
+}
+
+function Get-WebApprovalManagerEditPermission {
+    param([string]$ManagerUserName,[string]$InstanceId="",[string]$CompanyCode="")
+    $role=Get-WebApprovalUserRole -UserName $ManagerUserName -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $role.success) { return @{ success=$false; allowed=$false; httpStatus=500; error=$role.error } }
+    if ([int]$role.data.role -ne $script:WebApprovalRoleSalesManager) { return @{ success=$true; allowed=$false; httpStatus=403; error="Sales Manager role is required." } }
+    if (-not [bool]$role.data.canEditItems) { return @{ success=$true; allowed=$false; httpStatus=403; error="The Super User has not granted permission to edit pending Web Approval items." } }
+    return @{ success=$true; allowed=$true }
+}
+
+function Get-WebApprovalRecalculatedAmount {
+    param($Payload)
+    $itemsTotal=0.0
+    foreach ($item in @($Payload.items)) { $itemsTotal += [double](Get-WebApprovalPropertyValue -Object $item -Names @("amount") -DefaultValue 0) }
+    $itemsTotal=[Math]::Round($itemsTotal,2)
+    $effect=0.0
+    foreach ($s in @($Payload.billSundries)) {
+        $percent=[double](Get-WebApprovalPropertyValue -Object $s -Names @("percentVal") -DefaultValue 0)
+        if ($percent -gt 0) {
+            $newAmount=[Math]::Round(($itemsTotal*$percent/100.0),2)
+            try { $s.amount=$newAmount } catch {}
+        }
+        $amount=[Math]::Abs([double](Get-WebApprovalPropertyValue -Object $s -Names @("amount") -DefaultValue 0))
+        $name=[string](Get-WebApprovalPropertyValue -Object $s -Names @("name") -DefaultValue "")
+        if ($name -match '(?i)discount|less|\(-\)') { $effect -= $amount } else { $effect += $amount }
+    }
+    return [Math]::Round(($itemsTotal+$effect),2)
+}
+
+function Edit-WebApprovalPendingItem {
+    param(
+        [string]$Id,[string]$ManagerUserName,[int]$ItemIndex,[string]$Action,$Quantity,[string]$Reason,
+        [string]$InstanceId="",[string]$CompanyCode=""
+    )
+    if ([string]::IsNullOrWhiteSpace($Id)) { return @{ success=$false; httpStatus=400; error="Web Approval id is required." } }
+
+    # Manager quantity/removal edits are intentionally direct actions.
+    # A free-text reason is optional; the structured audit metadata below is
+    # the source of truth for what changed, who changed it, and when.
+    $auditRemark = if ([string]::IsNullOrWhiteSpace($Reason)) { "" } else { $Reason.Trim() }
+
+    $actionText=([string]$Action).Trim().ToUpperInvariant()
+    if ($actionText -notin @("REMOVE","UPDATE_QTY")) { return @{ success=$false; httpStatus=400; error="Action must be REMOVE or UPDATE_QTY." } }
+
+    $ctx=$null; $tx=$null
+    try {
+        $ctx=Get-WebApprovalFiscalDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        [void](Ensure-WebApprovalManagerEditFiscalSchema -Context $ctx)
+        $record=Get-WebApprovalRecordByIdInternal -Context $ctx -Id $Id
+        if ($null -eq $record) { return @{ success=$false; httpStatus=404; error="Web Approval transaction was not found." } }
+        $access=Test-WebApprovalManagerCanActOnRecord -ManagerUserName $ManagerUserName -Record $record -InstanceId $InstanceId -CompanyCode $CompanyCode
+        if (-not $access.success -or -not $access.allowed) { return $access }
+        $permission=Get-WebApprovalManagerEditPermission -ManagerUserName $ManagerUserName -InstanceId $InstanceId -CompanyCode $CompanyCode
+        if (-not $permission.success -or -not $permission.allowed) { return $permission }
+        if (([string]$record.ApprovalStatus).Trim().ToUpperInvariant() -ne "PENDING" -or ([string]$record.SyncStatus).Trim().ToUpperInvariant() -ne "NOT_READY") {
+            return @{ success=$false; httpStatus=409; error="Items can only be edited while the transaction is Pending and has not been approved for sync." }
+        }
+
+        $payload=([string]$record.PayloadJson)|ConvertFrom-Json
+        $items=@($payload.items)
+        if ($ItemIndex -lt 0 -or $ItemIndex -ge $items.Count) { return @{ success=$false; httpStatus=400; error="The selected item no longer exists in this transaction." } }
+        if ($actionText -eq "REMOVE" -and $items.Count -le 1) { return @{ success=$false; httpStatus=409; error="The last item cannot be removed. A transaction must contain at least one item." } }
+
+        $before=$items[$ItemIndex]
+        $oldQty=[double](Get-WebApprovalPropertyValue -Object $before -Names @("qty") -DefaultValue 0)
+        $price=[double](Get-WebApprovalPropertyValue -Object $before -Names @("price") -DefaultValue 0)
+        $oldAmount=[double](Get-WebApprovalPropertyValue -Object $before -Names @("amount") -DefaultValue 0)
+        $itemName=[string](Get-WebApprovalPropertyValue -Object $before -Names @("itemName","name") -DefaultValue "")
+        $itemCode=Get-WebApprovalPropertyValue -Object $before -Names @("itemCode","code") -DefaultValue 0
+        $beforeHash=([string]$record.PayloadHash).Trim(); $previousTotal=[double]$record.Amount
+
+        if ($actionText -eq "REMOVE") {
+            $newItems=@()
+            for ($i=0; $i -lt $items.Count; $i++) { if ($i -ne $ItemIndex) { $newItems += $items[$i] } }
+            for ($i=0; $i -lt $newItems.Count; $i++) { try { $newItems[$i].srNo=$i+1 } catch {} }
+            $payload.items=@($newItems)
+            $auditAction="ITEM_REMOVED"
+            $metadata=[ordered]@{ itemIndex=$ItemIndex; itemName=$itemName; itemCode=$itemCode; qty=$oldQty; price=$price; amount=$oldAmount; previousTransactionAmount=$previousTotal }
+        }
+        else {
+            $newQty=0.0; try { $newQty=[double]$Quantity } catch {}
+            if ($newQty -le 0) { return @{ success=$false; httpStatus=400; error="Quantity must be greater than zero." } }
+            if ([Math]::Abs($newQty-$oldQty) -lt 0.0000001) { return @{ success=$false; httpStatus=400; error="Enter a quantity different from the current quantity." } }
+            $pendingQty = [double](Get-WebApprovalPropertyValue -Object $before -Names @("pendingQty") -DefaultValue 0)
+            if ($pendingQty -gt 0 -and $newQty -gt $pendingQty) {
+                return @{ success=$false; httpStatus=409; error=("Quantity cannot exceed the pending linked quantity of {0}." -f $pendingQty) }
+            }
+            $newAmount=[Math]::Round(($newQty*$price),2)
+            try { $before.qty=$newQty } catch {}
+            try { $before.amount=$newAmount } catch {}
+
+            # Keep BUSY main/alternate quantities consistent with the same rules
+            # used by VoucherForm.tsx.
+            $unit=[string](Get-WebApprovalPropertyValue -Object $before -Names @("unit") -DefaultValue "")
+            $altUnit=[string](Get-WebApprovalPropertyValue -Object $before -Names @("altUnit") -DefaultValue "")
+            $factor=[double](Get-WebApprovalPropertyValue -Object $before -Names @("altQtyConFactor","conFactor") -DefaultValue 0)
+            if ($factor -le 0) {
+                $oldAlt=[double](Get-WebApprovalPropertyValue -Object $before -Names @("altQty") -DefaultValue 0)
+                $oldMain=[double](Get-WebApprovalPropertyValue -Object $before -Names @("mainQty") -DefaultValue 0)
+                if ($oldMain -gt 0 -and $oldAlt -gt 0) { $factor=$oldAlt/$oldMain } else { $factor=1 }
+            }
+            if ($altUnit -and $unit.Trim().Equals($altUnit.Trim(),[System.StringComparison]::OrdinalIgnoreCase)) {
+                try { $before.altQty=$newQty } catch {}
+                try { $before.mainQty=[Math]::Round(($newQty/$factor),3) } catch {}
+            } else {
+                try { $before.mainQty=$newQty } catch {}
+                try { $before.altQty=[Math]::Round(($newQty*$factor),3) } catch {}
+            }
+            $payload.items[$ItemIndex]=$before
+            $auditAction="ITEM_QTY_CHANGED"
+            $metadata=[ordered]@{ itemIndex=$ItemIndex; itemName=$itemName; itemCode=$itemCode; oldQty=$oldQty; newQty=$newQty; unit=[string](Get-WebApprovalPropertyValue -Object $before -Names @("unit") -DefaultValue ""); price=$price; oldAmount=$oldAmount; newAmount=$newAmount; previousTransactionAmount=$previousTotal }
+        }
+
+        $newTotal=Get-WebApprovalRecalculatedAmount -Payload $payload
+
+        # Keep payment allocations safe when a Sale carried settlement data.
+        # Card/gift allocations are never silently rewritten. If they alone now
+        # exceed the reduced total, the manager must reject the transaction and
+        # let the salesman resubmit with corrected payments. Cash is the only
+        # allocation that may be reduced to fit the new total.
+        try {
+            $setts = $payload.settlements
+            if ($null -ne $setts) {
+                $cardAmount = [double](Get-WebApprovalPropertyValue -Object $setts.card -Names @("amount") -DefaultValue 0)
+                $giftAmount = [double](Get-WebApprovalPropertyValue -Object $setts.gift -Names @("amount") -DefaultValue 0)
+                $cashAmount = [double](Get-WebApprovalPropertyValue -Object $setts.cash -Names @("amount") -DefaultValue 0)
+                if (($cardAmount + $giftAmount) -gt ($newTotal + 0.000001)) {
+                    return @{ success=$false; httpStatus=409; error="The new total would be lower than existing card/gift settlements. Reject the transaction and let the Salesman resubmit payment details." }
+                }
+                if ($cashAmount -gt 0) {
+                    $safeCash = [Math]::Max(0, [Math]::Round(($newTotal - $cardAmount - $giftAmount),2))
+                    try { $setts.cash.amount = $safeCash } catch {}
+                }
+            }
+        } catch {}
+
+        foreach ($propName in @("amount","grandTotal","netAmount","totalAmount")) {
+            try { $prop=$payload.PSObject.Properties[$propName]; if ($null -ne $prop) { $prop.Value=$newTotal } } catch {}
+        }
+        $newJson=$payload|ConvertTo-Json -Depth 100 -Compress
+        $newHash=Get-WebApprovalSha256 -Text $newJson
+        $metadata["newTransactionAmount"]=$newTotal; $metadata["beforePayloadHash"]=$beforeHash; $metadata["afterPayloadHash"]=$newHash
+        $metadataJson=$metadata|ConvertTo-Json -Depth 20 -Compress
+        $originalJson=[string]$record.OriginalPayloadJson; if ([string]::IsNullOrWhiteSpace($originalJson)) { $originalJson=[string]$record.PayloadJson }
+        $originalHash=([string]$record.OriginalPayloadHash).Trim(); if (-not $originalHash) { $originalHash=([string]$record.PayloadHash).Trim() }
+        $now=[datetime]::UtcNow
+
+        $tx=$ctx.connection.BeginTransaction(); $cmd=$ctx.connection.CreateCommand(); $cmd.Transaction=$tx; $dbType=[int]$ctx.dbType
+        if ($dbType -eq 1) {
+            $cmd.CommandText=@"
+UPDATE dbo.BusyCloudWebApproval SET
+    PayloadJson=@payloadJson, PayloadHash=@payloadHash, Amount=@amount,
+    OriginalPayloadJson=@originalJson, OriginalPayloadHash=@originalHash,
+    HasManagerChanges=1, ModifiedBy=@modifiedBy, ModifiedAt=@modifiedAt,
+    UpdatedAt=@updatedAt, Version=Version+1
+WHERE Id=@id AND ApprovalStatus='PENDING' AND SyncStatus='NOT_READY'
+"@
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@payloadJson" -Value $newJson -Kind LongText)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@payloadHash" -Value $newHash -Kind Text -Size 64)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@amount" -Value $newTotal -Kind Decimal)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@originalJson" -Value $originalJson -Kind LongText)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@originalHash" -Value $originalHash -Kind Text -Size 64)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@modifiedBy" -Value $ManagerUserName.Trim() -Kind Text -Size 100)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@modifiedAt" -Value $now -Kind Date)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@updatedAt" -Value $now -Kind Date)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@id" -Value $Id.Trim() -Kind Text -Size 36)
+        } else {
+            $cmd.CommandText=@"
+UPDATE [BusyCloudWebApproval] SET
+    [PayloadJson]=?, [PayloadHash]=?, [Amount]=?,
+    [OriginalPayloadJson]=?, [OriginalPayloadHash]=?,
+    [HasManagerChanges]=1, [ModifiedBy]=?, [ModifiedAt]=?,
+    [UpdatedAt]=?, [Version]=[Version]+1
+WHERE [Id]=? AND [ApprovalStatus]='PENDING' AND [SyncStatus]='NOT_READY'
+"@
+            $vals=@(
+                @{v=$newJson;k='LongText';z=0},@{v=$newHash;k='Text';z=64},@{v=$newTotal;k='Decimal';z=0},@{v=$originalJson;k='LongText';z=0},@{v=$originalHash;k='Text';z=64},
+                @{v=$ManagerUserName.Trim();k='Text';z=100},@{v=$now;k='Date';z=0},@{v=$now;k='Date';z=0},@{v=$Id.Trim();k='Text';z=36}
+            )
+            for ($i=0;$i -lt $vals.Count;$i++) { [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name ("@p"+($i+1)) -Value $vals[$i].v -Kind $vals[$i].k -Size $vals[$i].z) }
+        }
+        if ([int]$cmd.ExecuteNonQuery() -ne 1) { throw "The transaction changed while you were editing it. Refresh and try again." }
+
+        Add-WebApprovalActionRow `
+            -Context $ctx `
+            -Transaction $tx `
+            -WebApprovalId $Id `
+            -Action $auditAction `
+            -ActionBy $ManagerUserName.Trim() `
+            -Remarks $auditRemark `
+            -MetadataJson $metadataJson `
+            -ActionTime $now
+
+        $safeItemName = if ([string]::IsNullOrWhiteSpace($itemName)) { "an item" } else { $itemName }
+        $changeMessage = if ($actionText -eq "REMOVE") {
+            "Sales Manager {0} removed {1} (Qty {2}) from {3}." -f $ManagerUserName.Trim(), $safeItemName, $oldQty, $Id
+        }
+        else {
+            "Sales Manager {0} changed {1} quantity from {2} to {3} in {4}." -f $ManagerUserName.Trim(), $safeItemName, $oldQty, $newQty, $Id
+        }
+
+        Add-WebApprovalNotificationRow `
+            -Context $ctx `
+            -Transaction $tx `
+            -RecipientUserName ([string]$record.SubmittedBy) `
+            -WebApprovalId $Id `
+            -NotificationType "MANAGER_ITEM_CHANGED" `
+            -Title "Web Approval transaction updated" `
+            -Message $changeMessage `
+            -CreatedAt $now
+
+        $tx.Commit(); $tx=$null
+
+        $updated=Get-WebApprovalRecordByIdInternal -Context $ctx -Id $Id
+        return @{ success=$true; data=@{ transaction=Convert-WebApprovalRecordToPublic -Record $updated -IncludePayload $true; action=$auditAction } }
+    }
+    catch { if ($tx) { try { $tx.Rollback() } catch {} }; return @{ success=$false; httpStatus=500; error=$_.Exception.Message } }
+    finally { Close-WebApprovalDbContext -Context $ctx }
+}
+
+function Get-WebApprovalMySubmissions {
+    param([string]$UserName,[string]$InstanceId="",[string]$CompanyCode="")
+    if ([string]::IsNullOrWhiteSpace($UserName)) { return @{ success=$false; httpStatus=401; error="Authenticated BUSY user is required." } }
+    $ctx=$null; $rdr=$null
+    try {
+        $ctx=Get-WebApprovalFiscalDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode; [void](Ensure-WebApprovalManagerEditFiscalSchema -Context $ctx)
+        $cmd=$ctx.connection.CreateCommand(); $dbType=[int]$ctx.dbType
+        if ($dbType -eq 1) { $cmd.CommandText="SELECT TOP 200 * FROM dbo.BusyCloudWebApproval WHERE SubmittedBy=@u ORDER BY SubmittedAt DESC"; [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@u" -Value $UserName.Trim() -Kind Text -Size 100) }
+        else { $cmd.CommandText="SELECT TOP 200 * FROM [BusyCloudWebApproval] WHERE [SubmittedBy]=? ORDER BY [SubmittedAt] DESC"; [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name "@p1" -Value $UserName.Trim() -Kind Text -Size 100) }
+        $rdr=$cmd.ExecuteReader(); $items=@()
+        while ($rdr.Read()) {
+            $rec=@{}; foreach ($name in @("Id","SubmittedBy","VoucherType","VoucherDate","RequestedSeries","RequestedVoucherNo","PartyName","Amount","ApprovalStatus","SyncStatus","DecisionBy","DecisionAt","RejectionReason","BusyVoucherNo","BusyVoucherCode","NumberChangeReason","NumberResolvedAt","SyncAttempts","LastSyncError","SubmittedAt","UpdatedAt","SyncedAt","Version","HasManagerChanges","ModifiedBy","ModifiedAt")) { $rec[$name]=Read-WebApprovalReaderValue $rdr $name $null }
+            $items += Convert-WebApprovalRecordToPublic -Record $rec
+        }
+        return @{ success=$true; data=@{ items=@($items); count=@($items).Count } }
+    } catch { return @{ success=$false; httpStatus=500; error=$_.Exception.Message } }
+    finally { if ($rdr) { try{$rdr.Close()}catch{};try{$rdr.Dispose()}catch{} }; Close-WebApprovalDbContext -Context $ctx }
+}
+
+function Get-WebApprovalAssignedQueue {
+    param([string]$ManagerUserName,[string]$Status="PENDING",[string]$InstanceId="",[string]$CompanyCode="")
+    $salesmenResult=Get-WebApprovalSalesmenForManager -ManagerUserName $ManagerUserName -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $salesmenResult.success -or -not $salesmenResult.allowed) { return $salesmenResult }
+    $assignedSalesmen=@($salesmenResult.data.salesmen); $lookup=@{}; foreach($n in $assignedSalesmen){$k=([string]$n).Trim().ToLowerInvariant();if($k){$lookup[$k]=$true}}
+    if($lookup.Count -eq 0){return @{success=$true;data=@{status=$Status;items=@();count=0;assignedSalesmen=@()}}}
+    $ctx=$null;$rdr=$null
+    try{
+        $ctx=Get-WebApprovalFiscalDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode;[void](Ensure-WebApprovalManagerEditFiscalSchema -Context $ctx)
+        $cmd=$ctx.connection.CreateCommand();if([int]$ctx.dbType -eq 1){$cmd.CommandText="SELECT TOP 500 * FROM dbo.BusyCloudWebApproval ORDER BY SubmittedAt DESC"}else{$cmd.CommandText="SELECT TOP 500 * FROM [BusyCloudWebApproval] ORDER BY [SubmittedAt] DESC"}
+        $rdr=$cmd.ExecuteReader();$items=@()
+        while($rdr.Read()){
+            $rec=@{};foreach($name in @("Id","SubmittedBy","VoucherType","VoucherDate","RequestedSeries","RequestedVoucherNo","PartyName","Amount","ApprovalStatus","SyncStatus","DecisionBy","DecisionAt","RejectionReason","BusyVoucherNo","BusyVoucherCode","NumberChangeReason","NumberResolvedAt","SyncAttempts","LastSyncError","SubmittedAt","UpdatedAt","SyncedAt","Version","HasManagerChanges","ModifiedBy","ModifiedAt")){$rec[$name]=Read-WebApprovalReaderValue $rdr $name $null}
+            $key=([string]$rec.SubmittedBy).Trim().ToLowerInvariant();if(-not $lookup.ContainsKey($key)){continue};if(-not(Test-WebApprovalQueueStatusMatch -Record $rec -Status $Status)){continue};$items+=Convert-WebApprovalRecordToPublic -Record $rec
+        }
+        return @{success=$true;data=@{status=$Status;items=@($items);count=@($items).Count;assignedSalesmen=@($assignedSalesmen)}}
+    }catch{return @{success=$false;httpStatus=500;error=$_.Exception.Message}}finally{if($rdr){try{$rdr.Close()}catch{};try{$rdr.Dispose()}catch{}};Close-WebApprovalDbContext -Context $ctx}
+}
+
+function Get-WebApprovalSyncedVoucherSnapshot {
+    param(
+        $Record,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if ($null -eq $Record) { return $null }
+
+    $syncStatus = ([string]$Record.SyncStatus).Trim().ToUpperInvariant()
+    $busyVoucherNo = ([string]$Record.BusyVoucherNo).Trim()
+
+    if ($syncStatus -ne "SYNCED" -or [string]::IsNullOrWhiteSpace($busyVoucherNo)) {
+        return $null
+    }
+
+    if (-not (Get-Command Get-VoucherDetail -ErrorAction SilentlyContinue)) {
+        return $null
+    }
+
+    $voucherDate = ""
+    try {
+        if ($null -ne $Record.VoucherDate) {
+            $voucherDate = ([datetime]$Record.VoucherDate).ToString("dd-MM-yyyy")
+        }
+    }
+    catch {
+        $voucherDate = [string]$Record.VoucherDate
+    }
+
+    try {
+        $detail = Get-VoucherDetail `
+            -VchType ([int]$Record.VoucherType) `
+            -VchNo $busyVoucherNo `
+            -VchSeries ([string]$Record.RequestedSeries) `
+            -VchDate $voucherDate `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        if ($null -ne $detail -and [bool]$detail.success -and $null -ne $detail.data) {
+            return $detail.data
+        }
+    }
+    catch {
+        # Comparison data is supplementary. A BUSY read-back failure must not
+        # prevent users from opening Web Approval history/audit details.
+    }
+
+    return $null
+}
+
+function Get-WebApprovalDetailForSubmitter {
+    param([string]$Id,[string]$UserName,[string]$InstanceId="",[string]$CompanyCode="")
+    $ctx=$null
+    try{
+        $ctx=Get-WebApprovalFiscalDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode;$record=Get-WebApprovalRecordByIdInternal -Context $ctx -Id $Id
+        if($null -eq $record){return @{success=$false;httpStatus=404;error="Web Approval transaction was not found."}}
+        if(-not ([string]$record.SubmittedBy).Trim().Equals($UserName.Trim(),[System.StringComparison]::OrdinalIgnoreCase)){return @{success=$false;httpStatus=403;error="You can only view Web Approval transactions submitted by your user."}}
+        $history=Get-WebApprovalActionHistoryInternal -Context $ctx -WebApprovalId $Id
+        $publicTransaction=Convert-WebApprovalRecordToPublic -Record $record -IncludePayload $true
+        $publicTransaction["syncedVoucher"]=Get-WebApprovalSyncedVoucherSnapshot -Record $record -InstanceId $InstanceId -CompanyCode $CompanyCode
+        return @{success=$true;data=@{transaction=$publicTransaction;actions=@($history)}}
+    }catch{return @{success=$false;httpStatus=500;error=$_.Exception.Message}}finally{Close-WebApprovalDbContext -Context $ctx}
+}
+
+function Get-WebApprovalAdminOverview {
+    param([string]$Status="ALL",[string]$InstanceId="",[string]$CompanyCode="")
+    $ctx=$null;$rdr=$null
+    try{
+        $ctx=Get-WebApprovalFiscalDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode;[void](Ensure-WebApprovalManagerEditFiscalSchema -Context $ctx)
+        $cmd=$ctx.connection.CreateCommand();if([int]$ctx.dbType -eq 1){$cmd.CommandText="SELECT TOP 1000 * FROM dbo.BusyCloudWebApproval ORDER BY SubmittedAt DESC"}else{$cmd.CommandText="SELECT TOP 1000 * FROM [BusyCloudWebApproval] ORDER BY [SubmittedAt] DESC"}
+        $rdr=$cmd.ExecuteReader();$all=@()
+        while($rdr.Read()){$rec=@{};foreach($name in @("Id","SubmittedBy","VoucherType","VoucherDate","RequestedSeries","RequestedVoucherNo","PartyName","Amount","ApprovalStatus","SyncStatus","DecisionBy","DecisionAt","RejectionReason","BusyVoucherNo","BusyVoucherCode","NumberChangeReason","NumberResolvedAt","SyncAttempts","LastSyncError","SubmittedAt","UpdatedAt","SyncedAt","Version","HasManagerChanges","ModifiedBy","ModifiedAt")){$rec[$name]=Read-WebApprovalReaderValue $rdr $name $null};$all+=Convert-WebApprovalRecordToPublic -Record $rec}
+        $summary=@{total=@($all).Count;pending=@($all|Where-Object{$_.approvalStatus-eq'PENDING'}).Count;approvedReady=@($all|Where-Object{$_.approvalStatus-eq'APPROVED'-and$_.syncStatus-notin@('SYNCED','REVIEW_REQUIRED','FAILED')}).Count;rejected=@($all|Where-Object{$_.approvalStatus-eq'REJECTED'}).Count;synced=@($all|Where-Object{$_.syncStatus-eq'SYNCED'}).Count;reviewRequired=@($all|Where-Object{$_.syncStatus-eq'REVIEW_REQUIRED'}).Count;failed=@($all|Where-Object{$_.syncStatus-eq'FAILED'}).Count;modified=@($all|Where-Object{$_.hasManagerChanges}).Count}
+        $items=@($all|Where-Object{Test-WebApprovalQueueStatusMatch -Record $_ -Status $Status})
+        return @{success=$true;data=@{status=$Status;items=$items;count=$items.Count;summary=$summary}}
+    }catch{return @{success=$false;httpStatus=500;error=$_.Exception.Message}}finally{if($rdr){try{$rdr.Close()}catch{};try{$rdr.Dispose()}catch{}};Close-WebApprovalDbContext -Context $ctx}
+}
+
+function Get-WebApprovalDetailForAdmin {
+    param([string]$Id,[string]$InstanceId="",[string]$CompanyCode="")
+    $ctx=$null
+    try{$ctx=Get-WebApprovalFiscalDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode;$record=Get-WebApprovalRecordByIdInternal -Context $ctx -Id $Id;if($null-eq$record){return @{success=$false;httpStatus=404;error="Web Approval transaction was not found."}};$history=Get-WebApprovalActionHistoryInternal -Context $ctx -WebApprovalId $Id;$publicTransaction=Convert-WebApprovalRecordToPublic -Record $record -IncludePayload $true;$publicTransaction["syncedVoucher"]=Get-WebApprovalSyncedVoucherSnapshot -Record $record -InstanceId $InstanceId -CompanyCode $CompanyCode;return @{success=$true;data=@{transaction=$publicTransaction;actions=@($history)}}}catch{return @{success=$false;httpStatus=500;error=$_.Exception.Message}}finally{Close-WebApprovalDbContext -Context $ctx}
+}
+
+# ============================================================================
+# BUSYCLOUD WEB APPROVAL V6.9 - SERVER PAGINATION + FILTERED LISTS
+# ============================================================================
+# List endpoints now return a server-paged result. The detail/action functions
+# above remain unchanged. This override intentionally sits at the end of the
+# module so it supersedes the earlier list implementations without disturbing
+# create/approve/reject/sync behavior.
+# ============================================================================
+$script:BusyCloudWebApprovalModuleVersion = "6.9-server-pagination-filters"
+Write-Host "  [WEB-APPROVAL] Server pagination/filter extension $script:BusyCloudWebApprovalModuleVersion loaded." -ForegroundColor DarkCyan
+
+function Resolve-WebApprovalListPageSizeV69 {
+    param([int]$PageSize = 50)
+    $allowed = @(50, 100, 250, 500, 1000, 2000)
+    if ($allowed -notcontains $PageSize) { return 50 }
+    return $PageSize
+}
+
+function New-WebApprovalListPaginationV69 {
+    param([int]$Page = 1, [int]$PageSize = 50, [int]$Total = 0)
+
+    $safeSize = Resolve-WebApprovalListPageSizeV69 -PageSize $PageSize
+    $safePage = [Math]::Max(1, $Page)
+    $totalPages = if ($Total -le 0) { 1 } else { [int][Math]::Ceiling($Total / [double]$safeSize) }
+    if ($safePage -gt $totalPages) { $safePage = $totalPages }
+
+    $from = if ($Total -eq 0) { 0 } else { (($safePage - 1) * $safeSize) + 1 }
+    $to = if ($Total -eq 0) { 0 } else { [Math]::Min($Total, $safePage * $safeSize) }
+
+    return @{
+        page = $safePage
+        pageSize = $safeSize
+        total = $Total
+        totalPages = $totalPages
+        from = $from
+        to = $to
+        hasPrevious = ($safePage -gt 1)
+        hasNext = ($safePage -lt $totalPages)
+    }
+}
+
+function Convert-WebApprovalReaderToListRecordV69 {
+    param($Reader)
+
+    $record = @{}
+    foreach ($name in @(
+        "Id","SubmittedBy","VoucherType","VoucherDate","RequestedSeries","RequestedVoucherNo",
+        "PartyName","Amount","ApprovalStatus","SyncStatus","DecisionBy","DecisionAt",
+        "RejectionReason","BusyVoucherNo","BusyVoucherCode","NumberChangeReason","NumberResolvedAt",
+        "SyncAttempts","LastSyncError","SubmittedAt","UpdatedAt","SyncedAt","Version",
+        "HasManagerChanges","ModifiedBy","ModifiedAt"
+    )) {
+        $record[$name] = Read-WebApprovalReaderValue $Reader $name $null
+    }
+    return $record
+}
+
+function Get-WebApprovalAllListRecordsV69 {
+    param($Context)
+
+    $cmd = $Context.connection.CreateCommand()
+    if ([int]$Context.dbType -eq 1) {
+        $cmd.CommandText = "SELECT * FROM dbo.BusyCloudWebApproval ORDER BY SubmittedAt DESC"
+    }
+    else {
+        $cmd.CommandText = "SELECT * FROM [BusyCloudWebApproval] ORDER BY [SubmittedAt] DESC"
+    }
+
+    $rdr = $null
+    $records = @()
+    try {
+        $rdr = $cmd.ExecuteReader()
+        while ($rdr.Read()) {
+            $records += Convert-WebApprovalReaderToListRecordV69 -Reader $rdr
+        }
+        return @($records)
+    }
+    finally {
+        if ($rdr) {
+            try { $rdr.Close() } catch {}
+            try { $rdr.Dispose() } catch {}
+        }
+        try { $cmd.Dispose() } catch {}
+    }
+}
+
+function Test-WebApprovalListFiltersV69 {
+    param(
+        $Record,
+        [string]$Search = "",
+        [int]$VchType = 0,
+        [string]$FromDate = "",
+        [string]$ToDate = "",
+        [string]$Salesman = "",
+        [string]$Manager = ""
+    )
+
+    if ($VchType -gt 0 -and [int]$Record.VoucherType -ne $VchType) {
+        return $false
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Salesman)) {
+        $needle = $Salesman.Trim().ToLowerInvariant()
+        $value = ([string]$Record.SubmittedBy).Trim().ToLowerInvariant()
+        if (-not $value.Contains($needle)) { return $false }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Manager)) {
+        $needle = $Manager.Trim().ToLowerInvariant()
+        $decision = ([string]$Record.DecisionBy).Trim().ToLowerInvariant()
+        $modified = ([string]$Record.ModifiedBy).Trim().ToLowerInvariant()
+        if (-not $decision.Contains($needle) -and -not $modified.Contains($needle)) {
+            return $false
+        }
+    }
+
+    $voucherDate = $null
+    try {
+        if ($null -ne $Record.VoucherDate -and $Record.VoucherDate -ne [System.DBNull]::Value) {
+            $voucherDate = ([datetime]$Record.VoucherDate).Date
+        }
+    } catch {}
+
+    if (-not [string]::IsNullOrWhiteSpace($FromDate)) {
+        try {
+            $from = [datetime]::ParseExact($FromDate.Trim(), "yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture).Date
+            if ($null -eq $voucherDate -or $voucherDate -lt $from) { return $false }
+        } catch {}
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ToDate)) {
+        try {
+            $to = [datetime]::ParseExact($ToDate.Trim(), "yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture).Date
+            if ($null -eq $voucherDate -or $voucherDate -gt $to) { return $false }
+        } catch {}
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Search)) {
+        $needle = $Search.Trim().ToLowerInvariant()
+        $id = ([string]$Record.Id).Trim()
+        $reference = if ($id.Length -ge 8) { "WA-" + $id.Substring(0, 8).ToUpperInvariant() } else { $id }
+        $haystack = @(
+            $reference,
+            $Record.Id,
+            $Record.SubmittedBy,
+            $Record.RequestedSeries,
+            $Record.RequestedVoucherNo,
+            $Record.BusyVoucherNo,
+            $Record.PartyName,
+            $Record.DecisionBy,
+            $Record.ModifiedBy,
+            $Record.ApprovalStatus,
+            $Record.SyncStatus,
+            [string]$Record.VoucherType
+        ) | ForEach-Object { ([string]$_).ToLowerInvariant() }
+
+        $matched = $false
+        foreach ($value in $haystack) {
+            if ($value.Contains($needle)) { $matched = $true; break }
+        }
+        if (-not $matched) { return $false }
+    }
+
+    return $true
+}
+
+function Get-WebApprovalSummaryV69 {
+    param([array]$Records)
+    $all = @($Records)
+    return @{
+        total = $all.Count
+        pending = @($all | Where-Object { ([string]$_.ApprovalStatus).ToUpperInvariant() -eq 'PENDING' }).Count
+        approvedReady = @($all | Where-Object {
+            ([string]$_.ApprovalStatus).ToUpperInvariant() -eq 'APPROVED' -and
+            ([string]$_.SyncStatus).ToUpperInvariant() -notin @('SYNCED','REVIEW_REQUIRED','FAILED')
+        }).Count
+        rejected = @($all | Where-Object { ([string]$_.ApprovalStatus).ToUpperInvariant() -eq 'REJECTED' }).Count
+        synced = @($all | Where-Object { ([string]$_.SyncStatus).ToUpperInvariant() -eq 'SYNCED' }).Count
+        reviewRequired = @($all | Where-Object { ([string]$_.SyncStatus).ToUpperInvariant() -eq 'REVIEW_REQUIRED' }).Count
+        failed = @($all | Where-Object { ([string]$_.SyncStatus).ToUpperInvariant() -eq 'FAILED' }).Count
+        modified = @($all | Where-Object { try { [int]$_.HasManagerChanges -ne 0 } catch { $false } }).Count
+    }
+}
+
+function Get-WebApprovalPagedPublicResultV69 {
+    param([array]$Records, [int]$Page = 1, [int]$PageSize = 50)
+
+    $safeSize = Resolve-WebApprovalListPageSizeV69 -PageSize $PageSize
+    $total = @($Records).Count
+    $pagination = New-WebApprovalListPaginationV69 -Page $Page -PageSize $safeSize -Total $total
+    $skip = ([int]$pagination.page - 1) * $safeSize
+    $pageRecords = @($Records | Select-Object -Skip $skip -First $safeSize)
+    $items = @($pageRecords | ForEach-Object { Convert-WebApprovalRecordToPublic -Record $_ })
+
+    return @{
+        items = $items
+        count = $items.Count
+        pagination = $pagination
+    }
+}
+
+function Get-WebApprovalMySubmissions {
+    param(
+        [string]$UserName,
+        [string]$Status = "ALL",
+        [string]$Search = "",
+        [int]$VchType = 0,
+        [string]$FromDate = "",
+        [string]$ToDate = "",
+        [int]$Page = 1,
+        [int]$PageSize = 50,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($UserName)) {
+        return @{ success=$false; httpStatus=401; error="Authenticated BUSY user is required." }
+    }
+
+    $ctx = $null
+    try {
+        $ctx = Get-WebApprovalFiscalDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        [void](Ensure-WebApprovalManagerEditFiscalSchema -Context $ctx)
+
+        $userKey = $UserName.Trim().ToLowerInvariant()
+        $base = @(
+            Get-WebApprovalAllListRecordsV69 -Context $ctx |
+            Where-Object {
+                ([string]$_.SubmittedBy).Trim().ToLowerInvariant() -eq $userKey -and
+                (Test-WebApprovalListFiltersV69 -Record $_ -Search $Search -VchType $VchType -FromDate $FromDate -ToDate $ToDate)
+            }
+        )
+
+        $summary = Get-WebApprovalSummaryV69 -Records $base
+        $statusFiltered = @($base | Where-Object { Test-WebApprovalQueueStatusMatch -Record $_ -Status $Status })
+        $paged = Get-WebApprovalPagedPublicResultV69 -Records $statusFiltered -Page $Page -PageSize $PageSize
+
+        return @{ success=$true; data=@{
+            status=$Status
+            items=@($paged.items)
+            count=[int]$paged.count
+            pagination=$paged.pagination
+            summary=$summary
+        }}
+    }
+    catch { return @{ success=$false; httpStatus=500; error=$_.Exception.Message } }
+    finally { Close-WebApprovalDbContext -Context $ctx }
+}
+
+function Get-WebApprovalAssignedQueue {
+    param(
+        [string]$ManagerUserName,
+        [string]$Status = "PENDING",
+        [string]$Search = "",
+        [int]$VchType = 0,
+        [string]$Salesman = "",
+        [string]$FromDate = "",
+        [string]$ToDate = "",
+        [int]$Page = 1,
+        [int]$PageSize = 50,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $salesmenResult = Get-WebApprovalSalesmenForManager -ManagerUserName $ManagerUserName -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $salesmenResult.success -or -not $salesmenResult.allowed) { return $salesmenResult }
+
+    $assignedSalesmen = @($salesmenResult.data.salesmen)
+    $lookup = @{}
+    foreach ($name in $assignedSalesmen) {
+        $key = ([string]$name).Trim().ToLowerInvariant()
+        if ($key) { $lookup[$key] = $true }
+    }
+
+    if ($lookup.Count -eq 0) {
+        return @{ success=$true; data=@{
+            status=$Status; items=@(); count=0; assignedSalesmen=@(); summary=(Get-WebApprovalSummaryV69 -Records @());
+            pagination=(New-WebApprovalListPaginationV69 -Page $Page -PageSize $PageSize -Total 0)
+        }}
+    }
+
+    $ctx = $null
+    try {
+        $ctx = Get-WebApprovalFiscalDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        [void](Ensure-WebApprovalManagerEditFiscalSchema -Context $ctx)
+
+        $base = @(
+            Get-WebApprovalAllListRecordsV69 -Context $ctx |
+            Where-Object {
+                $submitterKey = ([string]$_.SubmittedBy).Trim().ToLowerInvariant()
+                $lookup.ContainsKey($submitterKey) -and
+                (Test-WebApprovalListFiltersV69 -Record $_ -Search $Search -VchType $VchType -FromDate $FromDate -ToDate $ToDate -Salesman $Salesman)
+            }
+        )
+
+        $summary = Get-WebApprovalSummaryV69 -Records $base
+        $statusFiltered = @($base | Where-Object { Test-WebApprovalQueueStatusMatch -Record $_ -Status $Status })
+        $paged = Get-WebApprovalPagedPublicResultV69 -Records $statusFiltered -Page $Page -PageSize $PageSize
+
+        return @{ success=$true; data=@{
+            status=$Status
+            items=@($paged.items)
+            count=[int]$paged.count
+            pagination=$paged.pagination
+            summary=$summary
+            assignedSalesmen=@($assignedSalesmen)
+        }}
+    }
+    catch { return @{ success=$false; httpStatus=500; error=$_.Exception.Message } }
+    finally { Close-WebApprovalDbContext -Context $ctx }
+}
+
+function Get-WebApprovalAdminOverview {
+    param(
+        [string]$Status = "ALL",
+        [string]$Search = "",
+        [int]$VchType = 0,
+        [string]$Salesman = "",
+        [string]$Manager = "",
+        [string]$FromDate = "",
+        [string]$ToDate = "",
+        [int]$Page = 1,
+        [int]$PageSize = 50,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $ctx = $null
+    try {
+        $ctx = Get-WebApprovalFiscalDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        [void](Ensure-WebApprovalManagerEditFiscalSchema -Context $ctx)
+
+        $base = @(
+            Get-WebApprovalAllListRecordsV69 -Context $ctx |
+            Where-Object {
+                Test-WebApprovalListFiltersV69 -Record $_ -Search $Search -VchType $VchType -FromDate $FromDate -ToDate $ToDate -Salesman $Salesman -Manager $Manager
+            }
+        )
+
+        $summary = Get-WebApprovalSummaryV69 -Records $base
+        $statusFiltered = @($base | Where-Object { Test-WebApprovalQueueStatusMatch -Record $_ -Status $Status })
+        $paged = Get-WebApprovalPagedPublicResultV69 -Records $statusFiltered -Page $Page -PageSize $PageSize
+
+        return @{ success=$true; data=@{
+            status=$Status
+            items=@($paged.items)
+            count=[int]$paged.count
+            pagination=$paged.pagination
+            summary=$summary
+        }}
+    }
+    catch { return @{ success=$false; httpStatus=500; error=$_.Exception.Message } }
+    finally { Close-WebApprovalDbContext -Context $ctx }
+}
+
+# Keep status buckets mutually exclusive for the paged UIs.
+function Test-WebApprovalQueueStatusMatch {
+    param($Record, [string]$Status)
+    $statusText = ([string]$Status).Trim().ToUpperInvariant()
+    if (-not $statusText -or $statusText -eq 'ALL') { return $true }
+    $approval = ([string]$Record.ApprovalStatus).Trim().ToUpperInvariant()
+    $sync = ([string]$Record.SyncStatus).Trim().ToUpperInvariant()
+    switch ($statusText) {
+        'PENDING' { return ($approval -eq 'PENDING') }
+        'APPROVED' { return ($approval -eq 'APPROVED' -and $sync -notin @('SYNCED','REVIEW_REQUIRED','FAILED')) }
+        'FAILED' { return ($approval -eq 'APPROVED' -and $sync -eq 'FAILED') }
+        'REJECTED' { return ($approval -eq 'REJECTED') }
+        'SYNCED' { return ($sync -eq 'SYNCED') }
+        'REVIEW_REQUIRED' { return ($sync -eq 'REVIEW_REQUIRED') }
+        default { return $true }
+    }
+}
+
+
+# ============================================================================
+# BUSYCLOUD WEB APPROVAL V7.1 - BOTH MODE / ORIGINAL CREATE-VOUCHER PIPELINE
+# ============================================================================
+$script:BusyCloudWebApprovalModuleVersion = "7.2-independent-approval-flags+utc-json"
+Write-Host "  [WEB-APPROVAL] Independent BUSY/Web approval extension $script:BusyCloudWebApprovalModuleVersion loaded." -ForegroundColor DarkCyan

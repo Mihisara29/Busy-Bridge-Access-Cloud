@@ -50,7 +50,7 @@ function Test-IsPermissionAdminUser {
     }
 
     $role = ([string]$User.role).Trim().ToLowerInvariant()
-    return ($role -eq "superadmin" -or $role -eq "companyadmin")
+    return ($role -eq "superadmin")
 }
 
 function Get-PartyGroupAccessForAuthUser {
@@ -1458,7 +1458,7 @@ function Filter-VoucherItemSearchResultByAccess {
 # ===============================================================
 # Approved vouchers are more restrictive than normal vouchers:
 #   normal user -> normal Modify permission AND approval permission
-#   companyadmin/superadmin -> allowed
+#   superadmin -> allowed
 # Non-approved vouchers continue through the existing permission checks.
 function Test-ApprovedVoucherModifyAccess {
     param(
@@ -2629,7 +2629,7 @@ function Start-BUSYServer {
             # --- BUSYCLOUD VOUCHER APPROVAL CONFIGURATION (ADMIN) ---
             } elseif ($path -eq "/busy/voucher-approval-config" -and $method -eq "GET") {
                 if (-not $requireAuth -or $null -eq $authResult -or $null -eq $authResult.user -or -not (Test-IsPermissionAdminUser -User $authResult.user)) {
-                    $result = @{ success=$false; error="Administrator permission is required." }
+                    $result = @{ success=$false; error="Super User permission is required." }
                     $response.StatusCode = 403
                 } else {
                     $vchTypeStr = Get-QueryStringValue $request.QueryString "vchType" ""
@@ -2647,7 +2647,7 @@ function Start-BUSYServer {
 
             } elseif ($path -eq "/busy/voucher-approval-config" -and $method -eq "POST") {
                 if (-not $requireAuth -or $null -eq $authResult -or $null -eq $authResult.user -or -not (Test-IsPermissionAdminUser -User $authResult.user)) {
-                    $result = @{ success=$false; error="Administrator permission is required." }
+                    $result = @{ success=$false; error="Super User permission is required." }
                     $response.StatusCode = 403
                 } else {
                     $data = Read-RequestBody $request | ConvertFrom-Json
@@ -2917,7 +2917,7 @@ function Start-BUSYServer {
             # --- USER PERMISSIONS (db.bds OLEDB Integration) ---
             } elseif ($path -eq "/busy/permissions" -and $method -eq "GET") {
                 if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
-                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
                     continue
                 }
                 $result = Get-UserPermissions -InstanceId $instanceId -CompanyCode $companyCode
@@ -2944,7 +2944,7 @@ function Start-BUSYServer {
 
             } elseif ($path -eq "/busy/permissions/default-access" -and $method -eq "GET") {
                 if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
-                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
                     continue
                 }
 
@@ -2959,7 +2959,7 @@ function Start-BUSYServer {
 
             } elseif ($path -eq "/busy/permissions/save" -and $method -eq "POST") {
                 if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
-                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
                     continue
                 }
 
@@ -2973,7 +2973,7 @@ function Start-BUSYServer {
 
             } elseif ($path -eq "/busy/users" -and $method -eq "GET") {
                 if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
-                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
                     continue
                 }
                 $result = Get-CompanyUsers -InstanceId $instanceId -CompanyCode $companyCode
@@ -2981,7 +2981,7 @@ function Start-BUSYServer {
             # --- BUSYCLOUD WEB APPROVAL FOUNDATION (PHASE 1) ---
             } elseif ($path -eq "/busy/web-approval/storage" -and $method -eq "GET") {
                 if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
-                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
                     continue
                 }
 
@@ -2995,7 +2995,7 @@ function Start-BUSYServer {
 
             } elseif ($path -eq "/busy/web-approval/users" -and $method -eq "GET") {
                 if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
-                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
                     continue
                 }
 
@@ -3040,8 +3040,27 @@ function Start-BUSYServer {
                     $response.StatusCode = 401
                 }
                 else {
+                    $status = Get-QueryStringValue $request.QueryString "status" "ALL"
+                    $search = Get-QueryStringValue $request.QueryString "search" ""
+                    $fromDate = Get-QueryStringValue $request.QueryString "from" ""
+                    $toDate = Get-QueryStringValue $request.QueryString "to" ""
+                    $vchTypeText = Get-QueryStringValue $request.QueryString "vchType" "0"
+                    $pageText = Get-QueryStringValue $request.QueryString "page" "1"
+                    $pageSizeText = Get-QueryStringValue $request.QueryString "pageSize" "50"
+                    $vchType = 0; $page = 1; $pageSize = 50
+                    try { $vchType = [int]$vchTypeText } catch {}
+                    try { $page = [int]$pageText } catch {}
+                    try { $pageSize = [int]$pageSizeText } catch {}
+
                     $result = Get-WebApprovalMySubmissions `
                         -UserName ([string]$authResult.user.name) `
+                        -Status $status `
+                        -Search $search `
+                        -VchType $vchType `
+                        -FromDate $fromDate `
+                        -ToDate $toDate `
+                        -Page $page `
+                        -PageSize $pageSize `
                         -InstanceId $instanceId `
                         -CompanyCode $companyCode
 
@@ -3051,6 +3070,29 @@ function Start-BUSYServer {
                         } else {
                             500
                         }
+                    }
+                }
+
+            } elseif ($path -eq "/busy/web-approval/my-detail" -and $method -eq "GET") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user -or
+                    [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $result = @{ success=$false; error="Authenticated BUSY user is required." }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $id = Get-QueryStringValue $request.QueryString "id" ""
+                    $result = Get-WebApprovalDetailForSubmitter `
+                        -Id $id `
+                        -UserName ([string]$authResult.user.name) `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false) {
+                        $response.StatusCode = if ($result.httpStatus) { [int]$result.httpStatus } else { 400 }
                     }
                 }
 
@@ -3220,10 +3262,28 @@ function Start-BUSYServer {
                 }
                 else {
                     $status = Get-QueryStringValue $request.QueryString "status" "PENDING"
+                    $search = Get-QueryStringValue $request.QueryString "search" ""
+                    $salesman = Get-QueryStringValue $request.QueryString "salesman" ""
+                    $fromDate = Get-QueryStringValue $request.QueryString "from" ""
+                    $toDate = Get-QueryStringValue $request.QueryString "to" ""
+                    $vchTypeText = Get-QueryStringValue $request.QueryString "vchType" "0"
+                    $pageText = Get-QueryStringValue $request.QueryString "page" "1"
+                    $pageSizeText = Get-QueryStringValue $request.QueryString "pageSize" "50"
+                    $vchType = 0; $page = 1; $pageSize = 50
+                    try { $vchType = [int]$vchTypeText } catch {}
+                    try { $page = [int]$pageText } catch {}
+                    try { $pageSize = [int]$pageSizeText } catch {}
 
                     $result = Get-WebApprovalAssignedQueue `
                         -ManagerUserName ([string]$authResult.user.name) `
                         -Status $status `
+                        -Search $search `
+                        -VchType $vchType `
+                        -Salesman $salesman `
+                        -FromDate $fromDate `
+                        -ToDate $toDate `
+                        -Page $page `
+                        -PageSize $pageSize `
                         -InstanceId $instanceId `
                         -CompanyCode $companyCode
 
@@ -3267,6 +3327,33 @@ function Start-BUSYServer {
                                 400
                             }
                         }
+                    }
+                }
+
+            } elseif ($path -eq "/busy/web-approval/edit-item" -and $method -eq "POST") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user -or
+                    [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $result = @{ success=$false; error="Authenticated Sales Manager is required." }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $data = Read-RequestBody $request | ConvertFrom-Json
+                    $result = Edit-WebApprovalPendingItem `
+                        -Id ([string]$data.id) `
+                        -ManagerUserName ([string]$authResult.user.name) `
+                        -ItemIndex ([int]$data.itemIndex) `
+                        -Action ([string]$data.action) `
+                        -Quantity $data.quantity `
+                        -Reason ([string]$data.reason) `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false -or $result.allowed -eq $false) {
+                        $response.StatusCode = if ($result.httpStatus) { [int]$result.httpStatus } else { 400 }
                     }
                 }
 
@@ -3357,9 +3444,84 @@ function Start-BUSYServer {
                     }
                 }
 
+            } elseif ($path -eq "/busy/web-approval/manager-edit-permission" -and $method -eq "POST") {
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
+                    continue
+                }
+
+                $data = Read-RequestBody $request | ConvertFrom-Json
+                $canEdit = $false
+                try { $canEdit = [System.Convert]::ToBoolean($data.canEditItems) } catch {}
+                $actionBy = if ($null -ne $authResult -and $null -ne $authResult.user) { [string]$authResult.user.name } else { "" }
+
+                $result = Set-WebApprovalManagerItemEditPermission `
+                    -UserName ([string]$data.userName) `
+                    -CanEditItems $canEdit `
+                    -ActionBy $actionBy `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode
+
+                if ($result.success -eq $false) {
+                    $response.StatusCode = if ($result.httpStatus) { [int]$result.httpStatus } else { 400 }
+                }
+
+            } elseif ($path -eq "/busy/web-approval/admin/overview" -and $method -eq "GET") {
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
+                    continue
+                }
+
+                $status = Get-QueryStringValue $request.QueryString "status" "ALL"
+                $search = Get-QueryStringValue $request.QueryString "search" ""
+                $salesman = Get-QueryStringValue $request.QueryString "salesman" ""
+                $manager = Get-QueryStringValue $request.QueryString "manager" ""
+                $fromDate = Get-QueryStringValue $request.QueryString "from" ""
+                $toDate = Get-QueryStringValue $request.QueryString "to" ""
+                $vchTypeText = Get-QueryStringValue $request.QueryString "vchType" "0"
+                $pageText = Get-QueryStringValue $request.QueryString "page" "1"
+                $pageSizeText = Get-QueryStringValue $request.QueryString "pageSize" "50"
+                $vchType = 0; $page = 1; $pageSize = 50
+                try { $vchType = [int]$vchTypeText } catch {}
+                try { $page = [int]$pageText } catch {}
+                try { $pageSize = [int]$pageSizeText } catch {}
+
+                $result = Get-WebApprovalAdminOverview `
+                    -Status $status `
+                    -Search $search `
+                    -VchType $vchType `
+                    -Salesman $salesman `
+                    -Manager $manager `
+                    -FromDate $fromDate `
+                    -ToDate $toDate `
+                    -Page $page `
+                    -PageSize $pageSize `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode
+
+                if ($result.success -eq $false) {
+                    $response.StatusCode = if ($result.httpStatus) { [int]$result.httpStatus } else { 500 }
+                }
+
+            } elseif ($path -eq "/busy/web-approval/admin/detail" -and $method -eq "GET") {
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
+                    continue
+                }
+
+                $id = Get-QueryStringValue $request.QueryString "id" ""
+                $result = Get-WebApprovalDetailForAdmin `
+                    -Id $id `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode
+
+                if ($result.success -eq $false) {
+                    $response.StatusCode = if ($result.httpStatus) { [int]$result.httpStatus } else { 500 }
+                }
+
             } elseif ($path -eq "/busy/web-approval/user-role" -and $method -eq "POST") {
                 if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
-                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
                     continue
                 }
 
@@ -3383,7 +3545,7 @@ function Start-BUSYServer {
 
             } elseif ($path -eq "/busy/web-approval/managers" -and $method -eq "GET") {
                 if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
-                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
                     continue
                 }
 
@@ -3409,7 +3571,7 @@ function Start-BUSYServer {
 
             } elseif ($path -eq "/busy/web-approval/managers" -and $method -eq "POST") {
                 if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
-                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
                     continue
                 }
 
@@ -4183,7 +4345,7 @@ function Start-BUSYServer {
 
             } elseif ($path -eq "/busy/item-group-access-tree" -and $method -eq "GET") {
                 if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
-                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
                     continue
                 }
 
@@ -4195,7 +4357,7 @@ function Start-BUSYServer {
                 # Voucher Settings POS account picker. Keep this admin-only because
                 # the endpoint exposes the company ledger master.
                 if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
-                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
                     continue
                 }
 
@@ -4220,7 +4382,7 @@ function Start-BUSYServer {
 
             } elseif ($path -eq "/busy/account-access-tree" -and $method -eq "GET") {
                 if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
-                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
                     continue
                 }
 
@@ -4230,7 +4392,7 @@ function Start-BUSYServer {
 
             } elseif ($path -eq "/busy/party-account-groups" -and $method -eq "GET") {
                 if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
-                    Send-Response $response @{ success=$false; error="Administrator permission is required." } 403
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
                     continue
                 }
 

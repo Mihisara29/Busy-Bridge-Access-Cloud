@@ -2807,6 +2807,74 @@ function Invoke-OfflineVoucherSync {
         $payload = Normalize-OfflineVoucherPostingPayload `
             -Payload $accessResult.data
 
+        # Web Approval (mode 2) and Web + BUSY Approval (mode 3) must never be
+        # bypassed by the local/offline Sale synchronization path. Offline sync
+        # currently owns a BUSY-create/final-voucher-number contract, while Web
+        # Approval intentionally creates no BUSY voucher until a Sales Manager
+        # approves and explicitly synchronizes it. Stop safely before numbering
+        # or the dangerous Create-Voucher boundary.
+        if (Get-Command Get-VoucherApprovalConfig -ErrorAction SilentlyContinue) {
+            $approvalConfig = Get-VoucherApprovalConfig `
+                -VchType 9 `
+                -InstanceId $InstanceId `
+                -CompanyCode $CompanyCode
+
+            if (-not $approvalConfig.success) {
+                $approvalError = if ($approvalConfig.error) {
+                    [string]$approvalConfig.error
+                }
+                else {
+                    'Could not read the current Sale approval policy.'
+                }
+
+                [void](Set-OfflineSyncLedgerFailed `
+                    -Connection $connection `
+                    -IsSqlServer $isSqlServer `
+                    -Data $Data `
+                    -InstanceId $InstanceId `
+                    -CompanyCode $CompanyCode `
+                    -ProcessingToken $processingToken `
+                    -ErrorMessage $approvalError `
+                    -CanRetry $true)
+
+                return @{
+                    success = $false
+                    httpStatus = 500
+                    errorCode = 'OFFLINE_SYNC_APPROVAL_CONFIG_FAILED'
+                    error = $approvalError
+                }
+            }
+
+            $approvalMode = 0
+            try { $approvalMode = [int]$approvalConfig.data.approval_mode_value } catch {}
+
+            if ($approvalMode -in @(2,3)) {
+                $modeName = if ($approvalMode -eq 3) { 'Web + BUSY Approval' } else { 'Web Approval' }
+                $message = "Sale currently uses $modeName. Local/offline synchronization is blocked so it cannot bypass the Web Approval stage. Submit this transaction through LIVE posting so it enters Web Approval first."
+
+                [void](Set-OfflineSyncLedgerFailed `
+                    -Connection $connection `
+                    -IsSqlServer $isSqlServer `
+                    -Data $Data `
+                    -InstanceId $InstanceId `
+                    -CompanyCode $CompanyCode `
+                    -ProcessingToken $processingToken `
+                    -ErrorMessage $message `
+                    -CanRetry $true)
+
+                return @{
+                    success = $false
+                    httpStatus = 409
+                    canRetry = $true
+                    webApprovalRequired = $true
+                    approvalMode = $approvalMode
+                    approvalModeName = if ($approvalMode -eq 3) { 'BOTH' } else { 'WEB' }
+                    errorCode = 'OFFLINE_SYNC_WEB_APPROVAL_REQUIRED'
+                    error = $message
+                }
+            }
+        }
+
         Write-Host (
             "  [OFFLINE-SYNC ROWS] normalized items={0} sundries={1}" -f `
             @($payload.items).Count,

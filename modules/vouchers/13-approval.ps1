@@ -109,6 +109,65 @@ ORDER BY VchCode DESC
     finally { if ($ownsConnection) { Disconnect-BUSY $fi } }
 }
 
+function Set-BusyPendingVoucherStructure {
+    param(
+        $fi,
+        [int]$VchCode,
+        [int]$VchType
+    )
+
+    # -------------------------------------------------------------------------
+    # BUSY pending-approval detail normalization.
+    #
+    # IMPORTANT:
+    # - Do not guess BUSY internal mappings for unverified voucher types.
+    # - Add a voucher-type rule only after comparing a BusyWeb-created pending
+    #   voucher with an equivalent native BUSY-created pending voucher.
+    #
+    # VERIFIED CURRENTLY:
+    #   12 = Sale Order
+    #
+    # Controlled test:
+    #   BusyWeb Sale Order item row : Tran2.RecType = 4
+    #   Native BUSY pending row      : Tran2.RecType = 15
+    #
+    # Changing only 4 -> 15 made the item, quantity, price and amount visible
+    # in BUSY while Tran1.ApprovalStatus remained 2 (To be Approved).
+    # -------------------------------------------------------------------------
+
+    switch ($VchType) {
+        12 {
+            $fi.ExecuteQuery(@"
+UPDATE Tran2
+SET RecType=15
+WHERE VchCode=$VchCode
+  AND VchType=12
+  AND RecType=4
+"@)
+        }
+
+        # The remaining BUSY Approval voucher types are intentionally left
+        # unchanged until their native pending structures are verified:
+        #   9  Sale
+        #   26 Sales Quotation
+        #   11 Delivery Order
+        #   3  Sale Return
+        #   14 Receipt
+        #   2  Purchase
+        #   27 Purchase Quotation
+        #   13 Purchase Order
+        #   4  Goods Received Note
+        #   10 Purchase Return
+        #   19 Payment
+        #   16 Journal
+        #   15 Contra
+        #   5  Stock Transfer
+        #   8  Stock Journal
+        #   6  Production
+        default { }
+    }
+}
+
 function Set-WebCreatedVoucherApprovalState {
     param(
         $fi,
@@ -141,6 +200,16 @@ function Set-WebCreatedVoucherApprovalState {
 
         $vchCode = [int]$state.vchCode
         $fi.ExecuteQuery("UPDATE Tran1 SET ApprovalStatus=$targetStatus WHERE VchCode=$vchCode")
+
+        # When BUSY approval is required, normalize only the detail structure
+        # that has been empirically verified for the current voucher type.
+        # At present, only Sale Order (VchType 12) has a verified mapping.
+        if ($approvalRequired) {
+            Set-BusyPendingVoucherStructure `
+                -fi $fi `
+                -VchCode $vchCode `
+                -VchType $VchType
+        }
 
         # SaveVchFromXML can auto-approve at creation. Normalize a newly-created
         # voucher to the BusyCloud policy before any human can act on it.

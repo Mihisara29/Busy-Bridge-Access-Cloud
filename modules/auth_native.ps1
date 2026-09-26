@@ -324,7 +324,7 @@ function Sync-CachedUserPermissions {
         $cachedRole = ([string]$cachedUser.role).Trim().ToLowerInvariant()
 
         # Superadmins intentionally retain their unrestricted permission set.
-        if ($cachedRole -eq "superadmin" -or $cachedRole -eq "companyadmin") {
+        if ($cachedRole -eq "superadmin") {
             continue
         }
 
