@@ -1904,6 +1904,78 @@ function Start-BUSYServer {
                     $bodyObj | Add-Member -MemberType NoteProperty -Name "bridgeUserName" -Value $authResult.user.name -Force
                 }
 
+                # Sales Tracking v3: location is required for EVERY new ONLINE
+                # voucher created by a user with the SALESMAN workflow role,
+                # independently of NONE / BUSY / WEB / BOTH approval mode.
+                # Validate BEFORE accounting/Web Approval creation so malformed/missing
+                # coordinates are still caught. Browser-reported accuracy is never
+                # used to reject a Salesman voucher; it is stored as metadata.
+                $salesTrackingContext = $null
+                if (
+                    $requireAuth -and
+                    $null -ne $authResult -and
+                    $null -ne $authResult.user -and
+                    -not [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $trackingUserName = ([string]$authResult.user.name).Trim()
+                    $trackingRoleResult = Get-WebApprovalUserRole `
+                        -UserName $trackingUserName `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if (-not $trackingRoleResult.success) {
+                        Send-Response $response @{ success=$false; error="Could not resolve Sales Workflow role for transaction tracking." } 500
+                        continue
+                    }
+
+                    $trackingRole = 0
+                    try { $trackingRole = [int]$trackingRoleResult.data.role } catch {}
+
+                    if ($trackingRole -eq $script:WebApprovalRoleSalesman) {
+                        $trackingVchType = 0
+                        try { $trackingVchType = [int]$bodyObj.vchType } catch {}
+
+                        # Current Sales Tracking scope remains the six customer-facing
+                        # Salesman vouchers: SQ, SO, Sale, Sale Return, Receipt, DO.
+                        if (-not (Test-WebApprovalSupportedVoucherType -VchType $trackingVchType)) {
+                            $trackingVchType = 0
+                        }
+
+                        if ($trackingVchType -gt 0) {
+                        $modeResult = Get-SalesTrackingApprovalMode `
+                            -VchType $trackingVchType `
+                            -InstanceId $instanceId `
+                            -CompanyCode $companyCode
+
+                        if (-not $modeResult.success) {
+                            Send-Response $response @{ success=$false; error=if ($modeResult.error) { $modeResult.error } else { "Could not resolve voucher approval mode." } } 500
+                            continue
+                        }
+
+                        $trackingLocation = Get-WebApprovalSubmissionLocation `
+                            -Data $bodyObj `
+                            -MaximumAccuracyMetres 150 `
+                            -EnforceMaximumAccuracy $false
+
+                        if (-not $trackingLocation.success) {
+                            $trackingHttpStatus = 400
+                            if ($trackingLocation.httpStatus) { $trackingHttpStatus = [int]$trackingLocation.httpStatus }
+                            Send-Response $response @{
+                                success = $false
+                                errorCode = $trackingLocation.errorCode
+                                error = $trackingLocation.error
+                            } $trackingHttpStatus
+                            continue
+                        }
+
+                        $salesTrackingContext = @{
+                            salesmanUserName = $trackingUserName
+                            approvalMode = [string]$modeResult.data.approvalMode
+                        }
+                        }
+                    }
+                }
+
                 # PHASE 3 WEB APPROVAL ROUTING:
                 # For RecType=203 / I1=2, the voucher is stored as a PENDING
                 # BusyCloud Web Approval transaction and Create-Voucher is NOT called.
@@ -1932,6 +2004,32 @@ function Start-BUSYServer {
                         -Data $bodyObj `
                         -InstanceId $instanceId `
                         -CompanyCode $companyCode
+                }
+
+                # Persist one generic transaction-location row only after the
+                # underlying operation succeeded. Tracking persistence is
+                # best-effort at this point: once BUSY/Web Approval creation has
+                # succeeded, a tracking DB warning must never make the client
+                # retry and accidentally duplicate an accounting transaction.
+                if ($null -ne $salesTrackingContext -and $null -ne $result -and $result.success -ne $false) {
+                    $webApprovalId = ""
+                    try { $webApprovalId = ([string]$result.webApprovalId).Trim() } catch {}
+
+                    $trackingCreateResult = $null
+                    if (-not $webApprovalRouting.handled) { $trackingCreateResult = $result }
+
+                    $trackingSave = Save-SalesmanTransactionLocation `
+                        -Data $bodyObj `
+                        -SalesmanUserName ([string]$salesTrackingContext.salesmanUserName) `
+                        -ApprovalMode ([string]$salesTrackingContext.approvalMode) `
+                        -WebApprovalId $webApprovalId `
+                        -CreateResult $trackingCreateResult `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if (-not $trackingSave.success) {
+                        Write-Host "  [SALES-TRACKING WARNING] Voucher succeeded but transaction location could not be stored: $($trackingSave.error)" -ForegroundColor DarkYellow
+                    }
                 }
 
             # --- LOCAL VOUCHER SYNCHRONIZATION (NEW IMPLEMENTATION) ---
@@ -2220,6 +2318,49 @@ function Start-BUSYServer {
 
             } elseif ($path -eq "/busy/voucher/modify" -and $method -eq "POST") {
                 $bodyObj = Read-RequestBody $request | ConvertFrom-Json
+
+                # Web Approval workflow state overrides ordinary Modify permission.
+                # SALESMAN: locked after APPROVED or SYNCED.
+                # SALES_MANAGER: locked after SYNCED.
+                if (
+                    $requireAuth -and
+                    $null -ne $authResult -and
+                    $null -ne $authResult.user -and
+                    -not [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $webApprovalEditLock = Get-WebApprovalVoucherEditLock `
+                        -VchType ([int]$bodyObj.vchType) `
+                        -VchNo ([string]$bodyObj.vchNo) `
+                        -UserName ([string]$authResult.user.name) `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if (-not $webApprovalEditLock.success) {
+                        $webApprovalLockStatus = 500
+                        if ($webApprovalEditLock.httpStatus) {
+                            $webApprovalLockStatus = [int]$webApprovalEditLock.httpStatus
+                        }
+
+                        Send-Response $response @{
+                            success = $false
+                            errorCode = if ($webApprovalEditLock.errorCode) { $webApprovalEditLock.errorCode } else { "WEB_APPROVAL_EDIT_LOCK_CHECK_FAILED" }
+                            error = if ($webApprovalEditLock.error) { $webApprovalEditLock.error } else { "Could not validate Web Approval edit state." }
+                        } $webApprovalLockStatus
+                        continue
+                    }
+
+                    if ($webApprovalEditLock.locked) {
+                        Send-Response $response @{
+                            success = $false
+                            errorCode = $webApprovalEditLock.errorCode
+                            error = $webApprovalEditLock.reason
+                            webApprovalId = $webApprovalEditLock.webApprovalId
+                            approvalStatus = $webApprovalEditLock.approvalStatus
+                            syncStatus = $webApprovalEditLock.syncStatus
+                        } 409
+                        continue
+                    }
+                }
 
                 # Approved vouchers require BOTH the normal Modify permission
                 # and approval permission for the voucher type (admins bypass).
@@ -2625,6 +2766,83 @@ function Start-BUSYServer {
             } elseif ($path -eq "/busy/column-config" -and $method -eq "POST") {
                 $data = Read-RequestBody $request | ConvertFrom-Json
                 $result = Save-ColumnConfig -Data $data -InstanceId $instanceId -CompanyCode $companyCode
+
+            # --- SALESMAN TRANSACTION LOCATION POLICY (AUTHENTICATED USER) ---
+            # Safe minimal endpoint used by voucher-entry screens. A user with
+            # Sales Workflow role SALESMAN must provide GPS for every new ONLINE
+            # voucher, regardless of NONE / BUSY / WEB / BOTH approval mode.
+            } elseif ($path -eq "/busy/web-approval/submission-policy" -and $method -eq "GET") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user -or
+                    [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $result = @{ success=$false; error="Authenticated BUSY user is required." }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $vchTypeText = Get-QueryStringValue $request.QueryString "vchType" ""
+                    if ([string]::IsNullOrWhiteSpace($vchTypeText)) {
+                        $vchTypeText = Get-QueryStringValue $request.QueryString "params[vchType]" ""
+                    }
+
+                    $policyVchType = 0
+                    [void][int]::TryParse([string]$vchTypeText, [ref]$policyVchType)
+
+                    if ($policyVchType -le 0) {
+                        $result = @{ success=$false; error="vchType is required." }
+                        $response.StatusCode = 400
+                    }
+                    else {
+                        $requester = ([string]$authResult.user.name).Trim()
+                        $roleResult = Get-WebApprovalUserRole `
+                            -UserName $requester `
+                            -InstanceId $instanceId `
+                            -CompanyCode $companyCode
+
+                        if (-not $roleResult.success) {
+                            $result = @{
+                                success = $false
+                                error = if ($roleResult.error) { [string]$roleResult.error } else { "Could not read Sales Workflow role." }
+                            }
+                            $response.StatusCode = 500
+                        }
+                        else {
+                            $modeResult = Get-SalesTrackingApprovalMode `
+                                -VchType $policyVchType `
+                                -InstanceId $instanceId `
+                                -CompanyCode $companyCode
+
+                            if (-not $modeResult.success) {
+                                $result = @{ success=$false; error=$modeResult.error }
+                                $response.StatusCode = 500
+                            }
+                            else {
+                                $role = 0
+                                try { $role = [int]$roleResult.data.role } catch {}
+                                $isSalesman = ($role -eq $script:WebApprovalRoleSalesman)
+
+                                $trackableSalesVoucher = Test-WebApprovalSupportedVoucherType -VchType $policyVchType
+                                $result = @{
+                                    success = $true
+                                    data = @{
+                                        vchType = $policyVchType
+                                        approvalMode = [string]$modeResult.data.approvalMode
+                                        approvalModeValue = [int]$modeResult.data.approvalModeValue
+                                        webApprovalRequired = [bool]$modeResult.data.webApprovalRequired
+                                        salesmanSubmission = [bool]$isSalesman
+                                        locationRequired = [bool]($isSalesman -and $trackableSalesVoucher)
+                                        # Accuracy is informational for transaction submissions.
+                                        # Route breadcrumbs still enforce their separate 100m policy.
+                                        maxAccuracyMetres = 0
+                                        accuracyBlocksSubmission = $false
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
             # --- BUSYCLOUD VOUCHER APPROVAL CONFIGURATION (ADMIN) ---
             } elseif ($path -eq "/busy/voucher-approval-config" -and $method -eq "GET") {
@@ -3330,6 +3548,103 @@ function Start-BUSYServer {
                     }
                 }
 
+
+            } elseif ($path -eq "/busy/web-approval/voucher-list" -and $method -eq "GET") {
+                if (-not $requireAuth -or $null -eq $authResult -or $null -eq $authResult.user -or [string]::IsNullOrWhiteSpace([string]$authResult.user.name)) {
+                    $result=@{success=$false;errorCode="AUTH_REQUIRED";error="Authenticated BUSY user is required."}
+                    $response.StatusCode=401
+                } else {
+                    $vchType=0
+                    [void][int]::TryParse([string](Get-QueryStringValue $request.QueryString "vchType" "0"),[ref]$vchType)
+                    $fromDate=Get-QueryStringValue $request.QueryString "from" ""
+                    $toDate=Get-QueryStringValue $request.QueryString "to" ""
+                    $result=Get-WebApprovalVoucherListForUser -UserName ([string]$authResult.user.name) -VchType $vchType -FromDate $fromDate -ToDate $toDate -InstanceId $instanceId -CompanyCode $companyCode
+                    if($result.success -eq $false){$response.StatusCode=if($result.httpStatus){[int]$result.httpStatus}else{500}}
+                }
+
+            } elseif ($path -eq "/busy/web-approval/update-my-pending" -and $method -eq "POST") {
+                if (-not $requireAuth -or $null -eq $authResult -or $null -eq $authResult.user -or [string]::IsNullOrWhiteSpace([string]$authResult.user.name)) {
+                    $result=@{success=$false;errorCode="AUTH_REQUIRED";error="Authenticated BUSY user is required."}
+                    $response.StatusCode=401
+                } else {
+                    $data=Read-RequestBody $request | ConvertFrom-Json
+                    $result=Update-WebApprovalPendingSubmissionBySalesman -Id ([string]$data.id) -SalesmanUserName ([string]$authResult.user.name) -Payload $data.payload -InstanceId $instanceId -CompanyCode $companyCode
+                    if($result.success -eq $false){$response.StatusCode=if($result.httpStatus){[int]$result.httpStatus}else{400}}
+                }
+
+
+            } elseif ($path -eq "/busy/web-approval/update-manager-pending" -and $method -eq "POST") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user -or
+                    [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $result = @{
+                        success = $false
+                        errorCode = "AUTH_REQUIRED"
+                        error = "Authenticated Sales Manager is required."
+                    }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $data = Read-RequestBody $request | ConvertFrom-Json
+
+                    $result = Update-WebApprovalPendingSubmissionByManager `
+                        -Id ([string]$data.id) `
+                        -ManagerUserName ([string]$authResult.user.name) `
+                        -Payload $data.payload `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false -or $result.allowed -eq $false) {
+                        $response.StatusCode = if ($result.httpStatus) {
+                            [int]$result.httpStatus
+                        } else {
+                            400
+                        }
+                    }
+                }
+
+            } elseif ($path -eq "/busy/web-approval/voucher-edit-lock" -and $method -eq "GET") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user -or
+                    [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $result = @{
+                        success = $false
+                        errorCode = "AUTH_REQUIRED"
+                        error = "Authenticated BUSY user is required."
+                    }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $vchType = 0
+                    [void][int]::TryParse(
+                        [string](Get-QueryStringValue $request.QueryString "vchType" "0"),
+                        [ref]$vchType
+                    )
+
+                    $vchNo = Get-QueryStringValue $request.QueryString "vchNo" ""
+
+                    $result = Get-WebApprovalVoucherEditLock `
+                        -VchType $vchType `
+                        -VchNo $vchNo `
+                        -UserName ([string]$authResult.user.name) `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false) {
+                        $response.StatusCode = if ($result.httpStatus) {
+                            [int]$result.httpStatus
+                        } else {
+                            500
+                        }
+                    }
+                }
+
             } elseif ($path -eq "/busy/web-approval/edit-item" -and $method -eq "POST") {
                 if (
                     -not $requireAuth -or
@@ -3599,6 +3914,165 @@ function Start-BUSYServer {
 
                 if ($result.success -eq $false) {
                     $response.StatusCode = if ($result.httpStatus) { [int]$result.httpStatus } else { 400 }
+                }
+
+
+            # --- SALESMAN TRANSACTION LOCATION TRACKING ---
+            } elseif ($path -eq "/busy/web-approval/tracking-permissions" -and $method -eq "GET") {
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
+                    continue
+                }
+
+                $salesmanUserName = Get-QueryStringValue $request.QueryString "salesmanUserName" ""
+                $result = Get-WebApprovalTrackingPermissionsForSalesman `
+                    -SalesmanUserName $salesmanUserName `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode
+
+                if ($result.success -eq $false) {
+                    $response.StatusCode = if ($result.httpStatus) { [int]$result.httpStatus } else { 400 }
+                }
+
+            } elseif ($path -eq "/busy/web-approval/tracking-permission" -and $method -eq "POST") {
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
+                    continue
+                }
+
+                $data = Read-RequestBody $request | ConvertFrom-Json
+                $canTrack = $false
+                try { $canTrack = [System.Convert]::ToBoolean($data.canTrackLocation) } catch {}
+                $actionBy = if ($null -ne $authResult -and $null -ne $authResult.user) { [string]$authResult.user.name } else { "" }
+
+                $result = Set-WebApprovalManagerTrackingPermission `
+                    -SalesmanUserName ([string]$data.salesmanUserName) `
+                    -ManagerUserName ([string]$data.managerUserName) `
+                    -CanTrackLocation $canTrack `
+                    -ActionBy $actionBy `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode
+
+                if ($result.success -eq $false) {
+                    $response.StatusCode = if ($result.httpStatus) { [int]$result.httpStatus } else { 400 }
+                }
+
+            } elseif ($path -eq "/busy/sales-tracking/location" -and $method -eq "POST") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user -or
+                    [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $result = @{ success=$false; error="Authenticated user is required." }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $requester = ([string]$authResult.user.name).Trim()
+                    $roleResult = Get-WebApprovalUserRole `
+                        -UserName $requester `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if (-not $roleResult.success) {
+                        $result = @{
+                            success = $false
+                            error = if ($roleResult.error) { [string]$roleResult.error } else { "Could not read Sales Workflow role." }
+                        }
+                        $response.StatusCode = 500
+                    }
+                    elseif ([int]$roleResult.data.role -ne $script:WebApprovalRoleSalesman) {
+                        $result = @{ success=$false; error="Salesman Web Approval role is required." }
+                        $response.StatusCode = 403
+                    }
+                    else {
+                        $data = Read-RequestBody $request | ConvertFrom-Json
+                        $result = Add-SalesTrackingForegroundPoint `
+                            -SalesmanUserName $requester `
+                            -Data $data `
+                            -InstanceId $instanceId `
+                            -CompanyCode $companyCode `
+                            -MaximumAccuracyMetres 100 `
+                            -MovementThresholdMetres 100 `
+                            -HeartbeatSeconds 180
+
+                        if ($result.success -eq $false) {
+                            $response.StatusCode = if ($result.httpStatus) { [int]$result.httpStatus } else { 400 }
+                        }
+                    }
+                }
+
+            } elseif ($path -eq "/busy/sales-tracking/salesmen" -and $method -eq "GET") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user -or
+                    [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $result = @{ success=$false; error="Authenticated user is required." }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $requester = ([string]$authResult.user.name).Trim()
+                    $isAdmin = Test-IsPermissionAdminUser -User $authResult.user
+
+                    if (-not $isAdmin) {
+                        $roleResult = Get-WebApprovalUserRole -UserName $requester -InstanceId $instanceId -CompanyCode $companyCode
+                        if (-not $roleResult.success -or [int]$roleResult.data.role -ne $script:WebApprovalRoleSalesManager) {
+                            Send-Response $response @{ success=$false; error="Sales Manager or Super User access is required." } 403
+                            continue
+                        }
+                    }
+
+                    $result = Get-SalesTrackingSalesmen `
+                        -RequesterUserName $requester `
+                        -IsAdmin ([bool]$isAdmin) `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false) {
+                        $response.StatusCode = if ($result.httpStatus) { [int]$result.httpStatus } else { 500 }
+                    }
+                }
+
+            } elseif ($path -eq "/busy/sales-tracking/day" -and $method -eq "GET") {
+                if (
+                    -not $requireAuth -or
+                    $null -eq $authResult -or
+                    $null -eq $authResult.user -or
+                    [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
+                ) {
+                    $result = @{ success=$false; error="Authenticated user is required." }
+                    $response.StatusCode = 401
+                }
+                else {
+                    $salesmanUserName = Get-QueryStringValue $request.QueryString "salesmanUserName" ""
+                    if ([string]::IsNullOrWhiteSpace($salesmanUserName)) {
+                        $salesmanUserName = Get-QueryStringValue $request.QueryString "salesman" ""
+                    }
+                    $date = Get-QueryStringValue $request.QueryString "date" ""
+                    $requester = ([string]$authResult.user.name).Trim()
+                    $isAdmin = Test-IsPermissionAdminUser -User $authResult.user
+
+                    if (-not $isAdmin) {
+                        $roleResult = Get-WebApprovalUserRole -UserName $requester -InstanceId $instanceId -CompanyCode $companyCode
+                        if (-not $roleResult.success -or [int]$roleResult.data.role -ne $script:WebApprovalRoleSalesManager) {
+                            Send-Response $response @{ success=$false; error="Sales Manager or Super User access is required." } 403
+                            continue
+                        }
+                    }
+
+                    $result = Get-SalesTrackingDay `
+                        -RequesterUserName $requester `
+                        -SalesmanUserName $salesmanUserName `
+                        -Date $date `
+                        -IsAdmin ([bool]$isAdmin) `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+
+                    if ($result.success -eq $false) {
+                        $response.StatusCode = if ($result.httpStatus) { [int]$result.httpStatus } else { 500 }
+                    }
                 }
 
             # --- MASTER DATA ---

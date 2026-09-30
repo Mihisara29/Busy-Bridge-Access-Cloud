@@ -1,4 +1,4 @@
-﻿
+
 # ─────────────────────────────────────────────────────────────
 # REPORT ENGINE DIAGNOSTICS AND CACHE
 # ─────────────────────────────────────────────────────────────
@@ -31,12 +31,6 @@ $script:StockStatusReportCacheSeconds = 1800
 $script:StockStatusReportCacheMaxEntries = 4
 
 $script:ReportDebugEnabled = $true
-
-Write-Host "  [REPORT-DIRECT-DB-V1] Outstanding + Stock Status read directly from fiscal DB; no BUSY COM." -ForegroundColor DarkCyan
-Write-Host "  [REPORT-PAGING-GUARD-V2] Large Stock Status All requests are safely paginated." -ForegroundColor DarkCyan
-Write-Host "  [REPORT-STOCK-LARGE-FAST-V3] SQL Stock Status supports large/all exact-valuation requests on the fast path." -ForegroundColor DarkCyan
-Write-Host "  [REPORT-STOCK-WA-BATCH-V4] Large SQL Method-5 scans use safe 100-item DB batches." -ForegroundColor DarkCyan
-Write-Host "  [REPORT-STOCK-SINGLE-SCAN-V5] Large SQL Method-5 scans use one indexed temp-table Tran2 stream." -ForegroundColor DarkCyan
 
 function Write-ReportEngineLog {
     param(
@@ -324,12 +318,8 @@ function Get-StockStatusPageSizeOptions {
         $dynamicSize += 5000
     }
 
-    # pageSize=0 means "All".  The SQL direct-report engine can now keep
-    # All inside the fast exact-valuation path up to 2500 matching items.
-    # Access/BDS is still provider-capped later in Get-StockStatusReport.
-    if ($ItemCount -le 2500) {
-        $options.Add(0)
-    }
+    # 0 means "All".  The frontend renders this as the All option.
+    $options.Add(0)
 
     return @($options)
 }
@@ -496,335 +486,6 @@ function Get-ReportSqlDateLiteral {
     $value = $Date.ToString("yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture)
     if ($IsSql) { return "'$value'" }
     return "#$($Date.ToString('MM/dd/yyyy', [System.Globalization.CultureInfo]::InvariantCulture))#"
-}
-
-function Get-ReportDirectDbContext {
-    param(
-        [string]$InstanceId,
-        [string]$CompanyCode,
-        [int]$FinancialYearStart = 0
-    )
-
-    $instance = Get-InstanceConfig -InstanceId $InstanceId
-    if ($null -eq $instance) {
-        throw "Report database instance '$InstanceId' was not found."
-    }
-
-    $dbType = 0
-    try {
-        if ($null -ne $instance.dbType) {
-            $dbType = [int]$instance.dbType
-        }
-    }
-    catch {}
-
-    if ($FinancialYearStart -le 0) {
-        $today = Get-Date
-        $FinancialYearStart = if ($today.Month -ge 4) {
-            $today.Year
-        }
-        else {
-            $today.Year - 1
-        }
-    }
-
-    # Prefer the established fiscal resolver for the current FY. It already
-    # resolves SQL -> BusyCompXXXX_db1YYYY and Access -> db1YYYY.bds without COM.
-    $todayForFy = Get-Date
-    $currentFy = if ($todayForFy.Month -ge 4) {
-        $todayForFy.Year
-    }
-    else {
-        $todayForFy.Year - 1
-    }
-
-    if (
-        $FinancialYearStart -eq $currentFy -and
-        (Get-Command Get-BusyCloudFastConfigDbContext -ErrorAction SilentlyContinue)
-    ) {
-        $ctx = Get-BusyCloudFastConfigDbContext `
-            -InstanceId $InstanceId `
-            -CompanyCode $CompanyCode
-
-        if ($null -eq $ctx -or $null -eq $ctx.connection) {
-            throw "Could not open the active fiscal database for reports."
-        }
-
-        $dbIdentity = [string]$ctx.database
-        $fileTicks = [int64]0
-        $fileLength = [int64]0
-        $allowPersistentDiskCache = $false
-
-        if ([int]$ctx.dbType -eq 0 -and (Test-Path -LiteralPath $dbIdentity -PathType Leaf)) {
-            $info = Get-Item -LiteralPath $dbIdentity
-            $fileTicks = [int64]$info.LastWriteTimeUtc.Ticks
-            $fileLength = [int64]$info.Length
-            $allowPersistentDiskCache = $true
-        }
-
-        return [pscustomobject]@{
-            dbType = [int]$ctx.dbType
-            isSql = ([int]$ctx.dbType -eq 1)
-            connection = $ctx.connection
-            database = $dbIdentity
-            path = $dbIdentity
-            writeTicks = $fileTicks
-            length = $fileLength
-            allowPersistentDiskCache = $allowPersistentDiskCache
-        }
-    }
-
-    # Historical/specified FY path. Preserve the existing BUSY naming rules.
-    if ($dbType -eq 1) {
-        if (-not (Get-Command Get-SqlDatabaseName -ErrorAction SilentlyContinue)) {
-            throw "Get-SqlDatabaseName is unavailable."
-        }
-        if (-not (Get-Command Open-SqlConnection -ErrorAction SilentlyContinue)) {
-            throw "Open-SqlConnection is unavailable."
-        }
-
-        $baseDb = Get-SqlDatabaseName `
-            -CompanyCode $CompanyCode `
-            -InstanceId $InstanceId
-
-        if ([string]::IsNullOrWhiteSpace($baseDb)) {
-            throw "Could not resolve the BUSY SQL base database."
-        }
-
-        $dbName = "${baseDb}1${FinancialYearStart}"
-        $connection = Open-SqlConnection `
-            -SqlServer $instance.sqlServer `
-            -Database $dbName `
-            -SqlUser $instance.sqlUser `
-            -SqlPassword $instance.sqlPassword
-
-        if ($null -eq $connection) {
-            throw "Could not open fiscal SQL database '$dbName'."
-        }
-
-        return [pscustomobject]@{
-            dbType = 1
-            isSql = $true
-            connection = $connection
-            database = $dbName
-            path = $dbName
-            writeTicks = [int64]0
-            length = [int64]0
-            allowPersistentDiskCache = $false
-        }
-    }
-
-    if (-not (Get-Command Open-BdsConnection -ErrorAction SilentlyContinue)) {
-        throw "Open-BdsConnection is unavailable."
-    }
-
-    $companyFolder = Join-Path ([string]$instance.dataPath) $CompanyCode
-    $preferred = Join-Path $companyFolder ("db1{0}.bds" -f $FinancialYearStart)
-
-    $dbFile = ""
-    if (Test-Path -LiteralPath $preferred -PathType Leaf) {
-        $dbFile = $preferred
-    }
-    else {
-        # Fallback to the established fiscal resolver only if a historical
-        # filename is not present. This keeps unusual BUSY Access layouts usable.
-        if (Get-Command Get-BusyCloudFastConfigDbContext -ErrorAction SilentlyContinue) {
-            $fallback = Get-BusyCloudFastConfigDbContext `
-                -InstanceId $InstanceId `
-                -CompanyCode $CompanyCode
-
-            if ($fallback -and [int]$fallback.dbType -eq 0) {
-                $dbFile = [string]$fallback.database
-                $connection = $fallback.connection
-            }
-        }
-    }
-
-    if ([string]::IsNullOrWhiteSpace($dbFile)) {
-        throw "Could not resolve fiscal Access/BDS database for FY $FinancialYearStart."
-    }
-
-    if ($null -eq $connection) {
-        $connection = Open-BdsConnection -DbFile $dbFile
-    }
-
-    if ($null -eq $connection) {
-        throw "Could not open fiscal Access/BDS database '$dbFile'."
-    }
-
-    $fileTicks = [int64]0
-    $fileLength = [int64]0
-    if (Test-Path -LiteralPath $dbFile -PathType Leaf) {
-        $info = Get-Item -LiteralPath $dbFile
-        $fileTicks = [int64]$info.LastWriteTimeUtc.Ticks
-        $fileLength = [int64]$info.Length
-    }
-
-    return [pscustomobject]@{
-        dbType = 0
-        isSql = $false
-        connection = $connection
-        database = $dbFile
-        path = $dbFile
-        writeTicks = $fileTicks
-        length = $fileLength
-        allowPersistentDiskCache = $true
-    }
-}
-
-function Invoke-ReportDirectTable {
-    param(
-        [Parameter(Mandatory)]
-        $Connection,
-
-        [Parameter(Mandatory)]
-        [string]$Sql,
-
-        [int]$Timeout = 180
-    )
-
-    $command = $null
-    $reader = $null
-    $table = New-Object System.Data.DataTable
-
-    try {
-        $command = $Connection.CreateCommand()
-        $command.CommandText = $Sql
-        try { $command.CommandTimeout = $Timeout } catch {}
-
-        $reader = $command.ExecuteReader()
-        $table.Load($reader)
-        return ,$table
-    }
-    finally {
-        if ($reader) {
-            try { $reader.Close() } catch {}
-            try { $reader.Dispose() } catch {}
-        }
-
-        if ($command) {
-            try { $command.Dispose() } catch {}
-        }
-    }
-}
-
-function New-ReportDirectRecordset {
-    param(
-        [Parameter(Mandatory)]
-        [System.Data.DataTable]$Table
-    )
-
-    # Small compatibility wrapper for the handful of existing Stock Status
-    # loops that use ADO-style EOF / MoveFirst / MoveNext / Fields.Item().
-    # It is backed by a DataTable returned from the DIRECT database connection.
-    $recordset = [pscustomobject]@{
-        Table = $Table
-        Position = 0
-        Closed = $false
-    }
-
-    Add-Member -InputObject $recordset -MemberType ScriptProperty -Name EOF -Value {
-        return (
-            $this.Closed -or
-            $null -eq $this.Table -or
-            $this.Table.Rows.Count -eq 0 -or
-            $this.Position -lt 0 -or
-            $this.Position -ge $this.Table.Rows.Count
-        )
-    }
-
-    Add-Member -InputObject $recordset -MemberType ScriptMethod -Name MoveFirst -Value {
-        $this.Position = 0
-    }
-
-    Add-Member -InputObject $recordset -MemberType ScriptMethod -Name MoveNext -Value {
-        $this.Position = [int]$this.Position + 1
-    }
-
-    Add-Member -InputObject $recordset -MemberType ScriptMethod -Name Close -Value {
-        $this.Closed = $true
-    }
-
-    $fields = [pscustomobject]@{
-        Recordset = $recordset
-    }
-
-    Add-Member -InputObject $fields -MemberType ScriptProperty -Name Count -Value {
-        if ($null -eq $this.Recordset.Table) { return 0 }
-        return $this.Recordset.Table.Columns.Count
-    }
-
-    Add-Member -InputObject $fields -MemberType ScriptMethod -Name Item -Value {
-        param($Key)
-
-        $column = $null
-        $columnIndex = -1
-
-        if ($Key -is [int] -or $Key -is [long] -or $Key -is [short]) {
-            $columnIndex = [int]$Key
-            if (
-                $columnIndex -ge 0 -and
-                $columnIndex -lt $this.Recordset.Table.Columns.Count
-            ) {
-                $column = $this.Recordset.Table.Columns[$columnIndex]
-            }
-        }
-        else {
-            $columnName = [string]$Key
-            if ($this.Recordset.Table.Columns.Contains($columnName)) {
-                $column = $this.Recordset.Table.Columns[$columnName]
-            }
-        }
-
-        if ($null -eq $column) {
-            throw "Report field '$Key' was not found."
-        }
-
-        $field = [pscustomobject]@{
-            Name = [string]$column.ColumnName
-            Recordset = $this.Recordset
-            ColumnName = [string]$column.ColumnName
-        }
-
-        Add-Member -InputObject $field -MemberType ScriptProperty -Name Value -Value {
-            if ($this.Recordset.EOF) {
-                return $null
-            }
-
-            return $this.Recordset.Table.Rows[
-                [int]$this.Recordset.Position
-            ][$this.ColumnName]
-        }
-
-        return $field
-    }
-
-    Add-Member -InputObject $recordset -MemberType NoteProperty -Name Fields -Value $fields
-    return $recordset
-}
-
-function New-ReportDirectRecordsetDb {
-    param(
-        [Parameter(Mandatory)]
-        $Connection
-    )
-
-    $db = [pscustomobject]@{
-        Connection = $Connection
-    }
-
-    Add-Member -InputObject $db -MemberType ScriptMethod -Name GetRecordset -Value {
-        param([string]$Query)
-
-        $table = Invoke-ReportDirectTable `
-            -Connection $this.Connection `
-            -Sql $Query `
-            -Timeout 180
-
-        return New-ReportDirectRecordset -Table $table
-    }
-
-    return $db
 }
 
 function Get-ReportDatabaseMode {
@@ -1116,7 +777,7 @@ function Get-OutstandingReport {
         "SQL Server direct"
     }
     else {
-        "Access/BDS direct"
+        "Access through BUSY"
     }
 
     Write-ReportEngineLog `
@@ -1137,8 +798,8 @@ function Get-OutstandingReport {
         ) `
         -Color "Yellow"
 
-    $reportDbContext = $null
-    $reportConnection = $null
+    $sqlConnection = $null
+    $busyConnection = $null
 
     function Convert-ReportDatabaseValue {
         param($Value)
@@ -1170,43 +831,94 @@ function Get-OutstandingReport {
         $rows =
             [System.Collections.Generic.List[object]]::new()
 
-        $command = $null
-        $reader = $null
+        if ($isSql) {
+            $command = $null
+            $reader = $null
 
-        try {
-            $command = $reportConnection.CreateCommand()
-            $command.CommandText = $Query
-            try { $command.CommandTimeout = $Timeout } catch {}
-            $reader = $command.ExecuteReader()
+            try {
+                $command = $sqlConnection.CreateCommand()
+                $command.CommandText = $Query
+                $command.CommandTimeout = $Timeout
+                $reader = $command.ExecuteReader()
 
-            while ($reader.Read()) {
-                $output = [ordered]@{}
+                while ($reader.Read()) {
+                    $output = [ordered]@{}
 
-                for (
-                    $fieldIndex = 0;
-                    $fieldIndex -lt $reader.FieldCount;
-                    $fieldIndex++
-                ) {
-                    $output[
-                        $reader.GetName($fieldIndex)
-                    ] = Convert-ReportDatabaseValue (
-                        $reader.GetValue($fieldIndex)
+                    for (
+                        $fieldIndex = 0;
+                        $fieldIndex -lt $reader.FieldCount;
+                        $fieldIndex++
+                    ) {
+                        $output[
+                            $reader.GetName($fieldIndex)
+                        ] = Convert-ReportDatabaseValue (
+                            $reader.GetValue($fieldIndex)
+                        )
+                    }
+
+                    $rows.Add(
+                        [pscustomobject]$output
                     )
                 }
+            }
+            finally {
+                if ($null -ne $reader) {
+                    try { $reader.Close() } catch {}
+                    try { $reader.Dispose() } catch {}
+                }
 
-                $rows.Add(
-                    [pscustomobject]$output
-                )
+                if ($null -ne $command) {
+                    try { $command.Dispose() } catch {}
+                }
             }
         }
-        finally {
-            if ($null -ne $reader) {
-                try { $reader.Close() } catch {}
-                try { $reader.Dispose() } catch {}
-            }
+        else {
+            $recordset = $null
 
-            if ($null -ne $command) {
-                try { $command.Dispose() } catch {}
+            try {
+                $recordset =
+                    $busyConnection.GetRecordset($Query)
+
+                if (
+                    $recordset -and
+                    -not $recordset.EOF
+                ) {
+                    $recordset.MoveFirst()
+
+                    while (-not $recordset.EOF) {
+                        $output = [ordered]@{}
+
+                        for (
+                            $fieldIndex = 0;
+                            $fieldIndex -lt $recordset.Fields.Count;
+                            $fieldIndex++
+                        ) {
+                            $field =
+                                $recordset.Fields.Item(
+                                    $fieldIndex
+                                )
+
+                            $output[[string]$field.Name] =
+                                Convert-ReportDatabaseValue (
+                                    $field.Value
+                                )
+                        }
+
+                        $rows.Add(
+                            [pscustomobject]$output
+                        )
+
+                        $recordset.MoveNext()
+                    }
+                }
+            }
+            finally {
+                if ($recordset) {
+                    try {
+                        $recordset.Close()
+                    }
+                    catch {}
+                }
             }
         }
 
@@ -1384,26 +1096,45 @@ function Get-OutstandingReport {
         $stage = "connection"
         $connectionWatch = New-ReportEngineWatch
 
-        $outstandingFy = if ($asOfDate.Month -ge 4) {
-            $asOfDate.Year
+        if ($isSql) {
+            $directConnection = Get-DirectConnection `
+                -InstanceId $InstanceId `
+                -CompanyCode $CompanyCode
+
+            if (
+                $null -eq $directConnection -or
+                $null -eq $directConnection.connection
+            ) {
+                throw (
+                    "Could not build the SQL Server " +
+                    "connection for the selected company."
+                )
+            }
+
+            $sqlConnection =
+                $directConnection.connection
+
+            if (
+                $sqlConnection.State.ToString() -ne "Open"
+            ) {
+                $sqlConnection.Open()
+            }
         }
         else {
-            $asOfDate.Year - 1
+            # The BUSY connection resolves the Access database
+            # location dynamically for the selected cloud server
+            # and company. No .bds path is hardcoded.
+            $busyConnection = Connect-BUSY `
+                -InstanceId $InstanceId `
+                -CompanyCode $CompanyCode
+
+            if (-not $busyConnection) {
+                throw (
+                    "Could not connect to the selected " +
+                    "BUSY Access company."
+                )
+            }
         }
-
-        $reportDbContext = Get-ReportDirectDbContext `
-            -InstanceId $InstanceId `
-            -CompanyCode $CompanyCode `
-            -FinancialYearStart $outstandingFy
-
-        if (
-            $null -eq $reportDbContext -or
-            $null -eq $reportDbContext.connection
-        ) {
-            throw "Could not open the fiscal database for Outstanding."
-        }
-
-        $reportConnection = $reportDbContext.connection
 
         Stop-ReportEngineWatch `
             -Watch $connectionWatch `
@@ -2884,17 +2615,25 @@ GROUP BY
         }
     }
     finally {
-        if ($null -ne $reportConnection) {
+        if ($null -ne $sqlConnection) {
             try {
                 if (
-                    $reportConnection.State.ToString() -ne "Closed"
+                    $sqlConnection.State.ToString() -ne
+                    "Closed"
                 ) {
-                    $reportConnection.Close()
+                    $sqlConnection.Close()
                 }
             }
             catch {}
 
-            try { $reportConnection.Dispose() } catch {}
+            try {
+                $sqlConnection.Dispose()
+            }
+            catch {}
+        }
+
+        if ($null -ne $busyConnection) {
+            Disconnect-BUSY $busyConnection
         }
     }
 }
@@ -2915,18 +2654,25 @@ GROUP BY
 function Invoke-StockStatusDirectTable {
     param(
         [Parameter(Mandatory)]
-        $Connection,
+        [System.Data.OleDb.OleDbConnection]$Connection,
 
         [Parameter(Mandatory)]
-        [string]$Sql,
-
-        [int]$Timeout = 180
+        [string]$Sql
     )
 
-    return Invoke-ReportDirectTable `
-        -Connection $Connection `
-        -Sql $Sql `
-        -Timeout $Timeout
+    $command = $Connection.CreateCommand()
+    $command.CommandText = $Sql
+    $adapter = New-Object System.Data.OleDb.OleDbDataAdapter($command)
+    $table = New-Object System.Data.DataTable
+
+    try {
+        [void]$adapter.Fill($table)
+        return ,$table
+    }
+    finally {
+        try { $adapter.Dispose() } catch {}
+        try { $command.Dispose() } catch {}
+    }
 }
 
 function Get-StockStatusDirectAccessContext {
@@ -2936,23 +2682,72 @@ function Get-StockStatusDirectAccessContext {
         [int]$FinancialYearStart
     )
 
-    # Kept under the original function name so the rest of the large Stock
-    # Status engine does not need calculation-level changes. Despite the old
-    # name, this now returns a DIRECT fiscal connection for BOTH SQL and Access.
     try {
-        return Get-ReportDirectDbContext `
-            -InstanceId $InstanceId `
-            -CompanyCode $CompanyCode `
-            -FinancialYearStart $FinancialYearStart
-    }
-    catch {
-        Write-ReportEngineLog `
-            -Stage "STOCK-DIRECT-FAIL" `
-            -Message $_.Exception.Message `
-            -Color "Red"
+        if (
+            -not (Get-Command Get-InstanceConfig -ErrorAction SilentlyContinue) -or
+            -not (Get-Command Open-BdsConnection -ErrorAction SilentlyContinue)
+        ) {
+            return $null
+        }
 
-        return $null
+        $instance = Get-InstanceConfig -InstanceId $InstanceId
+        if ($null -eq $instance) {
+            return $null
+        }
+
+        $dbType = 0
+        try {
+            if ($null -ne $instance.dbType) {
+                $dbType = [int]$instance.dbType
+            }
+        }
+        catch {}
+
+        # Direct OLE DB optimization is for Access/BDS only.
+        if ($dbType -ne 0) {
+            return $null
+        }
+
+        $dataPath = [string]$instance.dataPath
+        if ([string]::IsNullOrWhiteSpace($dataPath)) {
+            return $null
+        }
+
+        $companyFolder =
+            Join-Path $dataPath $CompanyCode
+
+        $candidates = @(
+            (Join-Path $companyFolder ("db1{0}.bds" -f $FinancialYearStart)),
+            (Join-Path $companyFolder "db.bds")
+        )
+
+        foreach ($dbFile in $candidates) {
+            if (-not (Test-Path -LiteralPath $dbFile -PathType Leaf)) {
+                continue
+            }
+
+            try {
+                $connection = Open-BdsConnection -DbFile $dbFile
+
+                if ($null -ne $connection) {
+                    $fileInfo = Get-Item -LiteralPath $dbFile
+
+                    return [pscustomobject]@{
+                        connection = $connection
+                        path = $dbFile
+                        writeTicks = [int64]$fileInfo.LastWriteTimeUtc.Ticks
+                        length = [int64]$fileInfo.Length
+                    }
+                }
+            }
+            catch {
+                # COM remains the safe fallback.
+            }
+        }
     }
+    catch {}
+
+    return $null
 }
 
 function Get-StockStatusStableHash {
@@ -2975,7 +2770,7 @@ function Get-StockStatusStableHash {
 function Get-StockStatusMasterSignature {
     param(
         [Parameter(Mandatory)]
-        $Connection
+        [System.Data.OleDb.OleDbConnection]$Connection
     )
 
     try {
@@ -3116,21 +2911,6 @@ function Get-StockStatusReport {
         $viewMode = "balances"
     }
 
-    # ============================================================
-    # LARGE-PAGE / ALL REQUEST POLICY
-    #
-    # pageSize=0 means "All".  Do NOT convert it to 100 here.
-    #
-    # The direct SQL engine below can safely keep the FAST quantity-index +
-    # exact Method-5 path for large pages (up to 2500 requested rows).  That
-    # lets the browser request 1750 / 2000 / All in ONE HTTP request without
-    # falling back to the old full-company calculation path.
-    #
-    # Access/BDS keeps the conservative 250-row fast-page limit because a very
-    # large IN(...) expression is not safe for Jet/ACE.  Its accounting logic
-    # is unchanged.
-    # ============================================================
-
     $valueMode = ([string]$ValueBy).Trim().ToLowerInvariant()
     if ($valueMode -notin @("busy", "purchase", "sale", "mrp")) {
         $valueMode = "busy"
@@ -3199,193 +2979,220 @@ function Get-StockStatusReport {
     # ------------------------------------------------------------
     Remove-ExpiredStockStatusReportCache
 
-    # ------------------------------------------------------------
-    # CACHE FIRST: do not open any DB connection for a valid cache hit.
-    # ------------------------------------------------------------
-    $cacheSeparator = [char]31
-    $stockStatusCacheKey = (
-        @(
-            "stock-wa-v8-busy-parity-fast-cache",
-            [string]$InstanceId,
-            [string]$CompanyCode,
-            $fromDate.ToString("yyyy-MM-dd"),
-            $endDate.ToString("yyyy-MM-dd"),
-            $asOfDate.ToString("yyyy-MM-dd"),
-            [string]$viewMode,
-            ([string]$MaterialCentre).Trim().ToLowerInvariant(),
-            ([string]$MaterialCentres).Trim().ToLowerInvariant(),
-            ([string]$ItemGroup).Trim().ToLowerInvariant(),
-            ([string]$Search).Trim().ToLowerInvariant(),
-            [string]$statusFilter,
-            [string]([bool]$IncludeZero),
-            [string]([double]$LowStockLevel),
-            [string]$valueMode,
-            [string]$unitDisplay,
-            [string]([bool]$ShowValue),
-            [string]([bool]$IncludeStockTransfers),
-            [string]([bool]$ShowSalePurchaseSeparately),
-            [string]$mastersFilter,
-            [string]([bool]$ShowParentGroup)
-        ) -join $cacheSeparator
-    )
-
-    if ($script:StockStatusReportCache.ContainsKey($stockStatusCacheKey)) {
-        $cachedEntry = $script:StockStatusReportCache[$stockStatusCacheKey]
-        $cacheAgeSeconds = 0.0
-
-        try {
-            $cacheAgeSeconds = (
-                (Get-Date) - [datetime]$cachedEntry.createdAt
-            ).TotalSeconds
-        }
-        catch {
-            $cacheAgeSeconds = $script:StockStatusReportCacheSeconds + 1
-        }
-
-        if (
-            $cacheAgeSeconds -le $script:StockStatusReportCacheSeconds -and
-            $null -ne $cachedEntry.baseResult -and
-            $null -ne $cachedEntry.allRows
-        ) {
-            $cachedTotalRows = @($cachedEntry.allRows).Count
-            $cachedEntry.baseResult.pageSizeOptions = @(
-                Get-StockStatusPageSizeOptions -ItemCount $cachedTotalRows
-            )
-
-            Write-ReportEngineLog `
-                -Stage "STOCK-CACHE" `
-                -Message (
-                    "Cache hit BEFORE DB connection; age=" +
-                    [Math]::Round($cacheAgeSeconds, 1) +
-                    "s; page=" + $Page +
-                    "; pageSize=" + $PageSize
-                ) `
-                -Color "Green"
-
-            return New-StockStatusPagedResponse `
-                -BaseResult $cachedEntry.baseResult `
-                -AllRows $cachedEntry.allRows `
-                -Page $Page `
-                -PageSize $PageSize
-        }
-
-        $script:StockStatusReportCache.Remove($stockStatusCacheKey)
-    }
-
-    # This is only a cache eligibility test before the DB context is opened.
-    # The real provider-specific limit is applied later once we know whether
-    # this company is SQL or Access/BDS.
-    $fastPageModeRequested = (
-        $viewMode -eq "balances" -and
-        (
-            $PageSize -eq 0 -or
-            (
-                $PageSize -gt 0 -and
-                $PageSize -le 2500
-            )
-        )
-    )
-
-    $fastPageCacheKey = (
-        @(
-            [string]$stockStatusCacheKey,
-            "fast-page",
-            [string]$Page,
-            [string]$PageSize
-        ) -join $cacheSeparator
-    )
-
-    if (
-        $fastPageModeRequested -and
-        $script:StockStatusFastPageCache.ContainsKey($fastPageCacheKey)
-    ) {
-        $fastPageEntry = $script:StockStatusFastPageCache[$fastPageCacheKey]
-        $fastPageAge = 0.0
-
-        try {
-            $fastPageAge = (
-                (Get-Date) - [datetime]$fastPageEntry.createdAt
-            ).TotalSeconds
-        }
-        catch {
-            $fastPageAge = $script:StockStatusReportCacheSeconds + 1
-        }
-
-        if (
-            $fastPageAge -le $script:StockStatusReportCacheSeconds -and
-            $null -ne $fastPageEntry.response
-        ) {
-            $fastCachedResponse = @{}
-            foreach ($key in @($fastPageEntry.response.Keys)) {
-                $fastCachedResponse[$key] = $fastPageEntry.response[$key]
-            }
-
-            Write-ReportEngineLog `
-                -Stage "STOCK-FAST-CACHE" `
-                -Message (
-                    "Fast page cache hit BEFORE DB connection; age=" +
-                    [Math]::Round($fastPageAge, 1) +
-                    "s; page=" + $Page +
-                    "; pageSize=" + $PageSize
-                ) `
-                -Color "Green"
-
-            return $fastCachedResponse
-        }
-
-        $script:StockStatusFastPageCache.Remove($fastPageCacheKey)
+    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $fi) {
+        return @{ success = $false; error = "BUSY connection failed"; data = @() }
     }
 
     $directStockContext = $null
     $directStockConn = $null
-    $reportRecordsetDb = $null
 
     try {
-        # ------------------------------------------------------------
-        # DIRECT FISCAL DATABASE ONLY - NO BUSY COM.
-        # ------------------------------------------------------------
+        # For Access companies, use the current financial-year BDS directly
+        # for read-only aggregate/master queries. This bypasses the slow COM
+        # recordset bridge for thousands of rows.
         $directStockContext =
             Get-StockStatusDirectAccessContext `
                 -InstanceId $InstanceId `
                 -CompanyCode $CompanyCode `
                 -FinancialYearStart $fyYear
 
-        if (
-            $null -eq $directStockContext -or
-            $null -eq $directStockContext.connection
-        ) {
-            throw "Could not open the fiscal database for Stock Status."
+        if ($null -ne $directStockContext) {
+            $directStockConn = $directStockContext.connection
+
+            Write-ReportEngineLog `
+                -Stage "STOCK-DIRECT" `
+                -Message (
+                    "Direct Access read path active; db=" +
+                    [System.IO.Path]::GetFileName(
+                        [string]$directStockContext.path
+                    )
+                ) `
+                -Color "Green"
         }
 
-        $directStockConn = $directStockContext.connection
-        $reportRecordsetDb = New-ReportDirectRecordsetDb `
-            -Connection $directStockConn
-
-        Write-ReportEngineLog `
-            -Stage "STOCK-DIRECT" `
-            -Message (
-                "Direct " +
-                $(if ($directStockContext.isSql) { "SQL" } else { "Access/BDS" }) +
-                " read path active; db=" +
-                [string]$directStockContext.database
-            ) `
-            -Color "Green"
-
         # Keep the raw number of stock-item masters for diagnostics/UI only.
+        # IMPORTANT: this is NOT used to generate rows-per-page choices because
+        # the Stock Status report can exclude masters according to the current
+        # report filters / masters mode. Page-size choices are based on the
+        # final matching report-row count instead.
         $companyItemCount = 0
-        $itemCountTable =
-            Invoke-StockStatusDirectTable `
-                -Connection $directStockConn `
-                -Sql (
-                    "SELECT COUNT(*) AS ItemCount " +
-                    "FROM Master1 WHERE MasterType=6"
+
+        if ($null -ne $directStockConn) {
+            $itemCountTable =
+                Invoke-StockStatusDirectTable `
+                    -Connection $directStockConn `
+                    -Sql (
+                        "SELECT COUNT(*) AS ItemCount " +
+                        "FROM Master1 WHERE MasterType=6"
+                    )
+
+            if ($itemCountTable.Rows.Count -gt 0) {
+                $companyItemCount =
+                    ConvertTo-ReportInt (
+                        $itemCountTable.Rows[0]["ItemCount"]
+                    )
+            }
+        }
+        else {
+            $itemCountRst = $null
+
+            try {
+                $itemCountRst = $fi.GetRecordset(
+                    "SELECT COUNT(*) AS ItemCount FROM Master1 WHERE MasterType=6"
                 )
 
-        if ($itemCountTable.Rows.Count -gt 0) {
-            $companyItemCount =
-                ConvertTo-ReportInt (
-                    $itemCountTable.Rows[0]["ItemCount"]
+                if ($itemCountRst -and -not $itemCountRst.EOF) {
+                    $companyItemCount = ConvertTo-ReportInt (
+                        Get-ReportFieldValue $itemCountRst "ItemCount" 0
+                    )
+                }
+            }
+            finally {
+                Close-ReportRecordset $itemCountRst
+            }
+        }
+
+        $cacheSeparator = [char]31
+        $stockStatusCacheKey = (
+            @(
+                "stock-wa-v8-busy-parity-fast-cache",
+                [string]$InstanceId,
+                [string]$CompanyCode,
+                $fromDate.ToString("yyyy-MM-dd"),
+                $endDate.ToString("yyyy-MM-dd"),
+                $asOfDate.ToString("yyyy-MM-dd"),
+                [string]$viewMode,
+                ([string]$MaterialCentre).Trim().ToLowerInvariant(),
+                ([string]$MaterialCentres).Trim().ToLowerInvariant(),
+                ([string]$ItemGroup).Trim().ToLowerInvariant(),
+                ([string]$Search).Trim().ToLowerInvariant(),
+                [string]$statusFilter,
+                [string]([bool]$IncludeZero),
+                [string]([double]$LowStockLevel),
+                [string]$valueMode,
+                [string]$unitDisplay,
+                [string]([bool]$ShowValue),
+                [string]([bool]$IncludeStockTransfers),
+                [string]([bool]$ShowSalePurchaseSeparately),
+                [string]$mastersFilter,
+                [string]([bool]$ShowParentGroup)
+            ) -join $cacheSeparator
+        )
+
+        if ($script:StockStatusReportCache.ContainsKey($stockStatusCacheKey)) {
+            $cachedEntry = $script:StockStatusReportCache[$stockStatusCacheKey]
+            $cacheAgeSeconds = 0.0
+
+            try {
+                $cacheAgeSeconds = (
+                    (Get-Date) - [datetime]$cachedEntry.createdAt
+                ).TotalSeconds
+            }
+            catch {
+                $cacheAgeSeconds =
+                    $script:StockStatusReportCacheSeconds + 1
+            }
+
+            if (
+                $cacheAgeSeconds -le $script:StockStatusReportCacheSeconds -and
+                $null -ne $cachedEntry.baseResult -and
+                $null -ne $cachedEntry.allRows
+            ) {
+                # Refresh cheap metadata even when the heavy stock calculation
+                # is served from cache. The page-size menu must follow the ACTUAL
+                # matching report rows, not the raw Master1 item count.
+                $cachedTotalRows = @($cachedEntry.allRows).Count
+                $cachedPageSizeOptions = @(
+                    Get-StockStatusPageSizeOptions -ItemCount $cachedTotalRows
                 )
+
+                $cachedEntry.baseResult.companyItemCount = $companyItemCount
+                $cachedEntry.baseResult.pageSizeOptions = @($cachedPageSizeOptions)
+
+                Write-ReportEngineLog `
+                    -Stage "STOCK-CACHE" `
+                    -Message (
+                        "Cache hit; age=" +
+                        [Math]::Round($cacheAgeSeconds, 1) +
+                        "s; page=" + $Page +
+                        "; pageSize=" + $PageSize
+                    ) `
+                    -Color "Green"
+
+                return New-StockStatusPagedResponse `
+                    -BaseResult $cachedEntry.baseResult `
+                    -AllRows $cachedEntry.allRows `
+                    -Page $Page `
+                    -PageSize $PageSize
+            }
+
+            # Old-format or expired entries are discarded safely.
+            $script:StockStatusReportCache.Remove($stockStatusCacheKey)
+        }
+
+        # --------------------------------------------------------
+        # FAST PAGE CACHE
+        # --------------------------------------------------------
+        # The default Balances view is page-oriented. Cache each exact
+        # already-valued page independently so revisiting a page is immediate.
+        $fastPageModeRequested = (
+            $viewMode -eq "balances" -and
+            $PageSize -gt 0 -and
+            $PageSize -le 250
+        )
+
+        $fastPageCacheKey = (
+            @(
+                [string]$stockStatusCacheKey,
+                "fast-page",
+                [string]$Page,
+                [string]$PageSize
+            ) -join $cacheSeparator
+        )
+
+        if (
+            $fastPageModeRequested -and
+            $script:StockStatusFastPageCache.ContainsKey($fastPageCacheKey)
+        ) {
+            $fastPageEntry = $script:StockStatusFastPageCache[$fastPageCacheKey]
+            $fastPageAge = 0.0
+
+            try {
+                $fastPageAge = (
+                    (Get-Date) - [datetime]$fastPageEntry.createdAt
+                ).TotalSeconds
+            }
+            catch {
+                $fastPageAge =
+                    $script:StockStatusReportCacheSeconds + 1
+            }
+
+            if (
+                $fastPageAge -le $script:StockStatusReportCacheSeconds -and
+                $null -ne $fastPageEntry.response
+            ) {
+                $fastCachedResponse = @{}
+                foreach ($key in @($fastPageEntry.response.Keys)) {
+                    $fastCachedResponse[$key] = $fastPageEntry.response[$key]
+                }
+
+                $fastCachedResponse.companyItemCount = $companyItemCount
+
+                Write-ReportEngineLog `
+                    -Stage "STOCK-FAST-CACHE" `
+                    -Message (
+                        "Fast page cache hit; age=" +
+                        [Math]::Round($fastPageAge, 1) +
+                        "s; page=" + $Page +
+                        "; pageSize=" + $PageSize
+                    ) `
+                    -Color "Green"
+
+                return $fastCachedResponse
+            }
+
+            $script:StockStatusFastPageCache.Remove($fastPageCacheKey)
         }
 
         $stockTotalWatch = New-ReportEngineWatch
@@ -3528,7 +3335,7 @@ function Get-StockStatusReport {
             }
         }
         else {
-            $groupRst = $reportRecordsetDb.GetRecordset(
+            $groupRst = $fi.GetRecordset(
                 "SELECT Code, Name, Alias, ParentGrp FROM Master1 WHERE MasterType=5 ORDER BY Name"
             )
 
@@ -3647,7 +3454,7 @@ function Get-StockStatusReport {
             }
         }
         else {
-            $mcRst = $reportRecordsetDb.GetRecordset(
+            $mcRst = $fi.GetRecordset(
                 "SELECT Code, Name FROM Master1 WHERE MasterType=11 ORDER BY Name"
             )
 
@@ -3762,7 +3569,7 @@ function Get-StockStatusReport {
             }
         }
         else {
-            $masterNameRst = $reportRecordsetDb.GetRecordset(
+            $masterNameRst = $fi.GetRecordset(
                 "SELECT Code, Name FROM Master1 WHERE MasterType=8"
             )
 
@@ -3993,7 +3800,7 @@ ORDER BY M.Name, M.Code
             }
         }
         else {
-            $itemRst = $reportRecordsetDb.GetRecordset($itemQry)
+            $itemRst = $fi.GetRecordset($itemQry)
 
             if ($itemRst -and -not $itemRst.EOF) {
                 $itemRst.MoveFirst()
@@ -4145,84 +3952,17 @@ ORDER BY M.Name, M.Code
         # PageSize=0 ("All"), Grouped/Hierarchical, and very large pages keep
         # the complete calculation path because they genuinely need all rows.
         # ========================================================
-        # SQL Server can handle a much larger numeric IN(...) list and, more
-        # importantly, this keeps large requests inside the existing FAST
-        # quantity-index path instead of replaying Method-5 for every company
-        # item.  Access/BDS remains capped at 250.
-        $fastProviderPageLimit = if (
-            $null -ne $directStockContext -and
-            $directStockContext.isSql
-        ) {
-            2500
-        }
-        else {
-            250
-        }
-
         $fastPageModeActive = (
             $viewMode -eq "balances" -and
-            (
-                (
-                    $PageSize -eq 0 -and
-                    $null -ne $directStockContext -and
-                    $directStockContext.isSql
-                ) -or
-                (
-                    $PageSize -gt 0 -and
-                    $PageSize -le $fastProviderPageLimit
-                )
-            )
+            $PageSize -gt 0 -and
+            $PageSize -le 250
         )
 
         $fastTotalRows = 0
         $fastEffectivePage = $Page
-
-        # SQL "All" starts with the provider ceiling.  Once the global
-        # quantity index tells us the actual matching count, the existing
-        # logic below automatically converts this to effective pageSize=0
-        # when the ceiling covers every matching item.
-        $fastEffectivePageSize = if (
-            $PageSize -eq 0 -and
-            $null -ne $directStockContext -and
-            $directStockContext.isSql
-        ) {
-            $fastProviderPageLimit
-        }
-        else {
-            $PageSize
-        }
-
+        $fastEffectivePageSize = $PageSize
         $fastTotalPages = 1
         $fastGlobalSummary = $null
-
-        if (
-            $viewMode -eq "balances" -and
-            $PageSize -gt 250 -and
-            $fastPageModeActive
-        ) {
-            Write-ReportEngineLog `
-                -Stage "STOCK-LARGE-PAGE-FAST" `
-                -Message (
-                    "Large SQL page kept on fast exact-valuation path; requestedPageSize=" +
-                    $PageSize +
-                    "; providerLimit=" +
-                    $fastProviderPageLimit
-                ) `
-                -Color "Green"
-        }
-        elseif (
-            $viewMode -eq "balances" -and
-            $PageSize -eq 0 -and
-            $fastPageModeActive
-        ) {
-            Write-ReportEngineLog `
-                -Stage "STOCK-ALL-FAST" `
-                -Message (
-                    "All-items SQL request kept on fast exact-valuation path; providerLimit=" +
-                    $fastProviderPageLimit
-                ) `
-                -Color "Green"
-        }
 
         if ($fastPageModeActive) {
             $fastIndexWatch = New-ReportEngineWatch
@@ -4243,10 +3983,7 @@ ORDER BY M.Name, M.Code
             $fastDiskCachePath = ""
             $fastDiskDbStamp = ""
 
-            if (
-                $null -ne $directStockContext -and
-                $directStockContext.allowPersistentDiskCache
-            ) {
+            if ($null -ne $directStockContext) {
                 $fastDiskDbStamp = (
                     [string]$directStockContext.writeTicks +
                     ":" +
@@ -4490,7 +4227,7 @@ GROUP BY
                 }
                 else {
                     $fastOpenRst =
-                        $reportRecordsetDb.GetRecordset($fastOpenQry)
+                        $fi.GetRecordset($fastOpenQry)
 
                     if (
                         $fastOpenRst -and
@@ -4743,7 +4480,7 @@ GROUP BY
                 }
                 else {
                     $fastMoveRst =
-                        $reportRecordsetDb.GetRecordset($fastMovementQry)
+                        $fi.GetRecordset($fastMovementQry)
 
                     if (
                         $fastMoveRst -and
@@ -4858,7 +4595,7 @@ GROUP BY
                     }
                     else {
                         $fastPriorRst =
-                            $reportRecordsetDb.GetRecordset($fastPriorQry)
+                            $fi.GetRecordset($fastPriorQry)
 
                         if (
                             $fastPriorRst -and
@@ -4976,7 +4713,7 @@ GROUP BY
                     }
                     else {
                         $fastTransferRst =
-                            $reportRecordsetDb.GetRecordset($fastTransferQry)
+                            $fi.GetRecordset($fastTransferQry)
 
                         if (
                             $fastTransferRst -and
@@ -5484,12 +5221,9 @@ GROUP BY
                 [void]$itemOrder.Add([int]$fastCode)
             }
 
-            # Rebuild predicates after page selection.
-            #
-            # SQL can use the fast exact-valuation path for large pages
-            # (up to 2500 selected item codes). Access/BDS remains limited
-            # to 250 by $fastProviderPageLimit so Jet/ACE never receives an
-            # unsafe giant IN(...) expression.
+            # Rebuild SQL predicates after page selection. Fast-page mode is
+            # capped at 250 rows specifically so Access receives a small,
+            # safe IN(...) list and never scans unrelated item transactions.
             if ($itemOrder.Count -eq 0) {
                 $tran2ItemPredicate = "AND 1=0"
                 $tran4ItemPredicate = "AND 1=0"
@@ -5586,7 +5320,7 @@ WHERE RecType=0
 GROUP BY MasterCode1, MasterCode2
 "@
 
-        $opRst = $reportRecordsetDb.GetRecordset($opQry)
+        $opRst = $fi.GetRecordset($opQry)
         if ($opRst -and -not $opRst.EOF) {
             $opRst.MoveFirst()
             while (-not $opRst.EOF) {
@@ -6102,7 +5836,7 @@ WHERE
                 }
                 else {
                     $returnRefRst =
-                        $reportRecordsetDb.GetRecordset($returnRefQry)
+                        $fi.GetRecordset($returnRefQry)
 
                     if (
                         $returnRefRst -and
@@ -6197,7 +5931,7 @@ WHERE
                     }
                     else {
                         $parentRst =
-                            $reportRecordsetDb.GetRecordset($parentQry)
+                            $fi.GetRecordset($parentQry)
 
                         if (
                             $parentRst -and
@@ -6285,7 +6019,7 @@ WHERE
 "@
 
                 $returnLinkRst =
-                    $reportRecordsetDb.GetRecordset($returnLinkQry)
+                    $fi.GetRecordset($returnLinkQry)
 
                 if (
                     $returnLinkRst -and
@@ -6938,12 +6672,7 @@ WHERE
         $stockWaWatch = New-ReportEngineWatch
         Write-ReportEngineLog -Stage "STOCK-WA" -Message "Starting voucher-sequenced Tran2 valuation + movement scan"
 
-        function New-BusyWaTxnQuery {
-            param(
-                [string]$ItemPredicate
-            )
-
-            return @"
+        $busyWaTxnQry = @"
 SELECT
     T.MasterCode1 AS ItemCode,
     T.VchCode,
@@ -6960,7 +6689,7 @@ FROM Tran2 T
 INNER JOIN Tran1 V ON V.VchCode = T.VchCode
 WHERE
     T.RecType = 2
-    $ItemPredicate
+    $tran2ItemPredicate
     AND V.[Date] <= $endLiteral
     AND (V.Cancelled = 0 OR V.Cancelled IS NULL)
     AND (V.VchCancelled = 0 OR V.VchCancelled IS NULL)
@@ -6970,11 +6699,6 @@ ORDER BY
     T.VchCode,
     T.SrNo
 "@
-        }
-
-        $busyWaTxnQry =
-            New-BusyWaTxnQuery `
-                -ItemPredicate $tran2ItemPredicate
 
         $busyWaCursorState = [pscustomobject]@{
             itemCode = 0
@@ -7108,457 +6832,49 @@ ORDER BY
         }
 
         if ($null -ne $directStockConn) {
-            # ========================================================
-            # SQL LARGE-REQUEST SINGLE-SCAN ENGINE (V5)
-            #
-            # V4 proved that 100-item batches work, but each batch can scan/
-            # sort Tran2 again. With 1500 items that means ~15 expensive DB
-            # queries, so the request still feels stuck.
-            #
-            # For SQL Server, keep ONE HTTP request AND ONE Tran2 scan:
-            #   1) create a local #SelectedItems temp table on THIS connection
-            #   2) insert the requested item codes into it
-            #   3) join Tran2 to that indexed temp table
-            #   4) ORDER BY ItemCode only
-            #   5) stream rows directly into the EXISTING Method-5 processor
-            #
-            # Process-BusyWaItemRows already performs the exact voucher/date/
-            # SrNo ordering inside each item, so SQL does NOT need the old
-            # expensive 4-column ORDER BY for a large request.
-            #
-            # If the single-scan SQL path fails, V4-style 100-item batching is
-            # retained as a compatibility fallback.
-            # ========================================================
-            $useSqlLargeSingleScan = (
-                $null -ne $directStockContext -and
-                $directStockContext.isSql -and
-                $itemOrder.Count -gt 150
-            )
+            $busyWaTxnTable =
+                Invoke-StockStatusDirectTable `
+                    -Connection $directStockConn `
+                    -Sql $busyWaTxnQry
 
-            if ($useSqlLargeSingleScan) {
-                $waSingleScanSucceeded = $false
-                $waTempTableReady = $false
-                $waTempTableName = "#BusyCloudStockSelected"
-                $waCreateCmd = $null
-                $waInsertCmd = $null
-                $waStreamCmd = $null
-                $waStreamReader = $null
-                $waDropCmd = $null
-
-                try {
-                    $waSingleWatch = New-ReportEngineWatch
-
-                    # Local temp table lives only on this report connection.
-                    $waCreateCmd = $directStockConn.CreateCommand()
-                    $waCreateCmd.CommandTimeout = 30
-                    $waCreateCmd.CommandText = @"
-IF OBJECT_ID('tempdb..$waTempTableName') IS NOT NULL
-    DROP TABLE $waTempTableName;
-
-CREATE TABLE $waTempTableName
-(
-    ItemCode INT NOT NULL PRIMARY KEY
-);
-"@
-                    [void]$waCreateCmd.ExecuteNonQuery()
-                    $waTempTableReady = $true
-
-                    $waItemCodes = @(
-                        $itemOrder |
-                        ForEach-Object { [int]$_ } |
-                        Where-Object { $_ -gt 0 } |
-                        Select-Object -Unique
-                    )
-
-                    # SQL Server VALUES has a 1000-row constructor ceiling.
-                    # Keep inserts comfortably below it.
-                    $waInsertBatchSize = 500
-                    $waInsertBatchCount = [int][Math]::Ceiling(
-                        $waItemCodes.Count / [double]$waInsertBatchSize
-                    )
-
-                    for (
-                        $waInsertBatchIndex = 0;
-                        $waInsertBatchIndex -lt $waInsertBatchCount;
-                        $waInsertBatchIndex++
-                    ) {
-                        $waInsertCodes = @(
-                            $waItemCodes |
-                            Select-Object `
-                                -Skip ($waInsertBatchIndex * $waInsertBatchSize) `
-                                -First $waInsertBatchSize
-                        )
-
-                        if ($waInsertCodes.Count -eq 0) {
-                            continue
-                        }
-
-                        $waValues = (
-                            $waInsertCodes |
-                            ForEach-Object {
-                                "(" + [string][int]$_ + ")"
-                            }
-                        ) -join ","
-
-                        $waInsertCmd = $directStockConn.CreateCommand()
-                        $waInsertCmd.CommandTimeout = 30
-                        $waInsertCmd.CommandText = @"
-INSERT INTO $waTempTableName (ItemCode)
-VALUES $waValues;
-"@
-                        [void]$waInsertCmd.ExecuteNonQuery()
-                        try { $waInsertCmd.Dispose() } catch {}
-                        $waInsertCmd = $null
-                    }
-
-                    Write-ReportEngineLog `
-                        -Stage "STOCK-WA-SINGLE" `
-                        -Message (
-                            "Indexed SQL temp selection ready; items=" +
-                            $waItemCodes.Count +
-                            "; starting one Tran2 stream"
-                        ) `
-                        -Color "Green"
-
-                    # Important:
-                    # - join to an indexed temp table instead of giant IN(...)
-                    # - order ONLY by ItemCode
-                    # - Process-BusyWaItemRows keeps the original exact
-                    #   date/voucher/SrNo sequence internally
-                    # - OPTION(RECOMPILE) lets SQL optimize for this temp-table
-                    #   cardinality instead of reusing a bad cached plan
-                    $waStreamSql = @"
-SELECT
-    T.MasterCode1 AS ItemCode,
-    T.VchCode,
-    T.MasterCode2 AS MCCode,
-    T.SrNo,
-    T.Value1,
-    T.Value2,
-    T.Value3,
-    T.D2,
-    T.D5,
-    V.VchType,
-    V.[Date] AS VoucherDate
-FROM Tran2 T
-INNER JOIN $waTempTableName S
-    ON S.ItemCode = T.MasterCode1
-INNER JOIN Tran1 V
-    ON V.VchCode = T.VchCode
-WHERE
-    T.RecType = 2
-    AND V.[Date] <= $endLiteral
-    AND (V.Cancelled = 0 OR V.Cancelled IS NULL)
-    AND (V.VchCancelled = 0 OR V.VchCancelled IS NULL)
-ORDER BY
-    T.MasterCode1
-OPTION (RECOMPILE)
-"@
-
-                    $waStreamCmd = $directStockConn.CreateCommand()
-                    $waStreamCmd.CommandTimeout = 300
-                    $waStreamCmd.CommandText = $waStreamSql
-
-                    $waStreamReader = $waStreamCmd.ExecuteReader(
-                        [System.Data.CommandBehavior]::SequentialAccess
-                    )
-
-                    $waStreamRows = 0
-                    $waProgressWatch = [System.Diagnostics.Stopwatch]::StartNew()
-
-                    while ($waStreamReader.Read()) {
-                        & $consumeBusyWaTxnRow `
-                            -itemCode (
-                                ConvertTo-ReportInt $waStreamReader.GetValue(0)
-                            ) `
-                            -rowVchCode (
-                                ConvertTo-ReportInt $waStreamReader.GetValue(1)
-                            ) `
-                            -rowMcCode (
-                                ConvertTo-ReportInt $waStreamReader.GetValue(2)
-                            ) `
-                            -rowSrNo (
-                                ConvertTo-ReportInt $waStreamReader.GetValue(3)
-                            ) `
-                            -rowQty (
-                                ConvertTo-ReportDouble $waStreamReader.GetValue(4)
-                            ) `
-                            -rowAltQty (
-                                ConvertTo-ReportDouble $waStreamReader.GetValue(5)
-                            ) `
-                            -rowValue3 (
-                                ConvertTo-ReportDouble $waStreamReader.GetValue(6)
-                            ) `
-                            -rowD2 (
-                                ConvertTo-ReportDouble $waStreamReader.GetValue(7)
-                            ) `
-                            -rowD5 (
-                                ConvertTo-ReportDouble $waStreamReader.GetValue(8)
-                            ) `
-                            -rowVchType (
-                                ConvertTo-ReportInt $waStreamReader.GetValue(9)
-                            ) `
-                            -voucherDateRaw $waStreamReader.GetValue(10)
-
-                        $waStreamRows++
-
-                        # Progress visibility for large reports without flooding
-                        # the console.
-                        if (
-                            $waStreamRows % 5000 -eq 0 -and
-                            $waProgressWatch.Elapsed.TotalSeconds -ge 2
-                        ) {
-                            Write-ReportEngineLog `
-                                -Stage "STOCK-WA-SINGLE" `
-                                -Message (
-                                    "Streaming Tran2; rowsProcessed=" +
-                                    $waStreamRows
-                                ) `
-                                -Color "Cyan"
-
-                            $waProgressWatch.Restart()
-                        }
-                    }
-
-                    try { $waStreamReader.Close() } catch {}
-                    try { $waStreamReader.Dispose() } catch {}
-                    $waStreamReader = $null
-
-                    try { $waStreamCmd.Dispose() } catch {}
-                    $waStreamCmd = $null
-
-                    $waSingleScanSucceeded = $true
-
-                    Stop-ReportEngineWatch `
-                        -Watch $waSingleWatch `
-                        -Stage "STOCK-WA-SINGLE" `
-                        -Message (
-                            "Single SQL Tran2 stream completed; items=" +
-                            $waItemCodes.Count +
-                            "; txnRows=" +
-                            $waStreamRows
-                        )
-                }
-                catch {
-                    Write-ReportEngineLog `
-                        -Stage "STOCK-WA-SINGLE-FAIL" `
-                        -Message (
-                            "Single SQL stream failed; using safe 100-item " +
-                            "fallback. Error=" +
-                            $_.Exception.Message
-                        ) `
-                        -Color "Yellow"
-                }
-                finally {
-                    if ($waStreamReader) {
-                        try { $waStreamReader.Close() } catch {}
-                        try { $waStreamReader.Dispose() } catch {}
-                    }
-
-                    if ($waStreamCmd) {
-                        try { $waStreamCmd.Dispose() } catch {}
-                    }
-
-                    if ($waInsertCmd) {
-                        try { $waInsertCmd.Dispose() } catch {}
-                    }
-
-                    if ($waCreateCmd) {
-                        try { $waCreateCmd.Dispose() } catch {}
-                    }
-
-                    if ($waTempTableReady) {
-                        try {
-                            $waDropCmd = $directStockConn.CreateCommand()
-                            $waDropCmd.CommandTimeout = 10
-                            $waDropCmd.CommandText =
-                                "DROP TABLE $waTempTableName;"
-                            [void]$waDropCmd.ExecuteNonQuery()
-                        }
-                        catch {
-                        }
-                        finally {
-                            if ($waDropCmd) {
-                                try { $waDropCmd.Dispose() } catch {}
-                            }
-                        }
-                    }
-                }
-
-                if (-not $waSingleScanSucceeded) {
-                    # ------------------------------------------------
-                    # Compatibility fallback: V4 100-item DB batches.
-                    # Accounting logic is still the same.
-                    # ------------------------------------------------
-                    $waBatchSize = 100
-                    $waItemCodes = @(
-                        $itemOrder |
-                        ForEach-Object { [int]$_ }
-                    )
-
-                    $waBatchCount = [int][Math]::Ceiling(
-                        $waItemCodes.Count / [double]$waBatchSize
-                    )
-
-                    Write-ReportEngineLog `
-                        -Stage "STOCK-WA-BATCH-FALLBACK" `
-                        -Message (
-                            "Running " +
-                            $waBatchCount +
-                            " fallback DB batches; items=" +
-                            $waItemCodes.Count +
-                            "; batchSize=" +
-                            $waBatchSize
-                        ) `
-                        -Color "Yellow"
-
-                    for (
-                        $waBatchIndex = 0;
-                        $waBatchIndex -lt $waBatchCount;
-                        $waBatchIndex++
-                    ) {
-                        $waSkip = $waBatchIndex * $waBatchSize
-
-                        $waBatchCodes = @(
-                            $waItemCodes |
-                            Select-Object `
-                                -Skip $waSkip `
-                                -First $waBatchSize
-                        )
-
-                        if ($waBatchCodes.Count -eq 0) {
-                            continue
-                        }
-
-                        $waBatchSqlCodes = (
-                            $waBatchCodes |
-                            ForEach-Object { [string][int]$_ }
-                        ) -join ","
-
-                        $waBatchPredicate =
-                            "AND T.MasterCode1 IN ($waBatchSqlCodes)"
-
-                        $waBatchQry =
-                            New-BusyWaTxnQuery `
-                                -ItemPredicate $waBatchPredicate
-
-                        $waBatchWatch = New-ReportEngineWatch
-
-                        $waBatchTable =
-                            Invoke-StockStatusDirectTable `
-                                -Connection $directStockConn `
-                                -Sql $waBatchQry `
-                                -Timeout 120
-
-                        foreach ($txnRow in $waBatchTable.Rows) {
-                            & $consumeBusyWaTxnRow `
-                                -itemCode (
-                                    ConvertTo-ReportInt $txnRow["ItemCode"]
-                                ) `
-                                -rowVchCode (
-                                    ConvertTo-ReportInt $txnRow["VchCode"]
-                                ) `
-                                -rowMcCode (
-                                    ConvertTo-ReportInt $txnRow["MCCode"]
-                                ) `
-                                -rowSrNo (
-                                    ConvertTo-ReportInt $txnRow["SrNo"]
-                                ) `
-                                -rowQty (
-                                    ConvertTo-ReportDouble $txnRow["Value1"]
-                                ) `
-                                -rowAltQty (
-                                    ConvertTo-ReportDouble $txnRow["Value2"]
-                                ) `
-                                -rowValue3 (
-                                    ConvertTo-ReportDouble $txnRow["Value3"]
-                                ) `
-                                -rowD2 (
-                                    ConvertTo-ReportDouble $txnRow["D2"]
-                                ) `
-                                -rowD5 (
-                                    ConvertTo-ReportDouble $txnRow["D5"]
-                                ) `
-                                -rowVchType (
-                                    ConvertTo-ReportInt $txnRow["VchType"]
-                                ) `
-                                -voucherDateRaw $txnRow["VoucherDate"]
-                        }
-
-                        if (
-                            [int]$busyWaCursorState.itemCode -gt 0 -and
-                            $busyWaCursorState.rows.Count -gt 0
-                        ) {
-                            Process-BusyWaItemRows `
-                                -ItemCode ([int]$busyWaCursorState.itemCode) `
-                                -Rows $busyWaCursorState.rows
-                        }
-
-                        $busyWaCursorState.itemCode = 0
-                        $busyWaCursorState.rows =
-                            [System.Collections.ArrayList]::new()
-
-                        Stop-ReportEngineWatch `
-                            -Watch $waBatchWatch `
-                            -Stage "STOCK-WA-BATCH-FALLBACK" `
-                            -Message (
-                                "Batch " +
-                                ($waBatchIndex + 1) +
-                                "/" +
-                                $waBatchCount +
-                                " completed; items=" +
-                                $waBatchCodes.Count +
-                                "; txnRows=" +
-                                $waBatchTable.Rows.Count
-                            )
-                    }
-                }
-            }
-            else {
-                $busyWaTxnTable =
-                    Invoke-StockStatusDirectTable `
-                        -Connection $directStockConn `
-                        -Sql $busyWaTxnQry
-
-                foreach ($txnRow in $busyWaTxnTable.Rows) {
-                    & $consumeBusyWaTxnRow `
-                        -itemCode (
-                            ConvertTo-ReportInt $txnRow["ItemCode"]
-                        ) `
-                        -rowVchCode (
-                            ConvertTo-ReportInt $txnRow["VchCode"]
-                        ) `
-                        -rowMcCode (
-                            ConvertTo-ReportInt $txnRow["MCCode"]
-                        ) `
-                        -rowSrNo (
-                            ConvertTo-ReportInt $txnRow["SrNo"]
-                        ) `
-                        -rowQty (
-                            ConvertTo-ReportDouble $txnRow["Value1"]
-                        ) `
-                        -rowAltQty (
-                            ConvertTo-ReportDouble $txnRow["Value2"]
-                        ) `
-                        -rowValue3 (
-                            ConvertTo-ReportDouble $txnRow["Value3"]
-                        ) `
-                        -rowD2 (
-                            ConvertTo-ReportDouble $txnRow["D2"]
-                        ) `
-                        -rowD5 (
-                            ConvertTo-ReportDouble $txnRow["D5"]
-                        ) `
-                        -rowVchType (
-                            ConvertTo-ReportInt $txnRow["VchType"]
-                        ) `
-                        -voucherDateRaw $txnRow["VoucherDate"]
-                }
+            foreach ($txnRow in $busyWaTxnTable.Rows) {
+                & $consumeBusyWaTxnRow `
+                    -itemCode (
+                        ConvertTo-ReportInt $txnRow["ItemCode"]
+                    ) `
+                    -rowVchCode (
+                        ConvertTo-ReportInt $txnRow["VchCode"]
+                    ) `
+                    -rowMcCode (
+                        ConvertTo-ReportInt $txnRow["MCCode"]
+                    ) `
+                    -rowSrNo (
+                        ConvertTo-ReportInt $txnRow["SrNo"]
+                    ) `
+                    -rowQty (
+                        ConvertTo-ReportDouble $txnRow["Value1"]
+                    ) `
+                    -rowAltQty (
+                        ConvertTo-ReportDouble $txnRow["Value2"]
+                    ) `
+                    -rowValue3 (
+                        ConvertTo-ReportDouble $txnRow["Value3"]
+                    ) `
+                    -rowD2 (
+                        ConvertTo-ReportDouble $txnRow["D2"]
+                    ) `
+                    -rowD5 (
+                        ConvertTo-ReportDouble $txnRow["D5"]
+                    ) `
+                    -rowVchType (
+                        ConvertTo-ReportInt $txnRow["VchType"]
+                    ) `
+                    -voucherDateRaw $txnRow["VoucherDate"]
             }
         }
         else {
             $busyWaTxnRst =
-                $reportRecordsetDb.GetRecordset($busyWaTxnQry)
+                $fi.GetRecordset($busyWaTxnQry)
 
             if (
                 $busyWaTxnRst -and
@@ -8361,6 +7677,8 @@ OPTION (RECOMPILE)
             try { $directStockConn.Close() } catch {}
             try { $directStockConn.Dispose() } catch {}
         }
+
+        Disconnect-BUSY $fi
     }
 }
 

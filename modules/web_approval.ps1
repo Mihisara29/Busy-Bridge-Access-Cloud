@@ -345,6 +345,7 @@ CREATE TABLE dbo.BusyCloudSalesmanManager (
     SalesmanUserName NVARCHAR(100) NOT NULL,
     ManagerUserName NVARCHAR(100) NOT NULL,
     IsActive BIT NOT NULL CONSTRAINT DF_BCSM_IsActive DEFAULT(1),
+    CanTrackLocation BIT NOT NULL CONSTRAINT DF_BCSM_CanTrackLocation DEFAULT(0),
     AssignedBy NVARCHAR(100) NULL,
     AssignedAt DATETIME2 NOT NULL CONSTRAINT DF_BCSM_AssignedAt DEFAULT(SYSUTCDATETIME()),
     UpdatedAt DATETIME2 NOT NULL CONSTRAINT DF_BCSM_UpdatedAt DEFAULT(SYSUTCDATETIME())
@@ -358,6 +359,7 @@ CREATE TABLE [BusyCloudSalesmanManager] (
     [SalesmanUserName] TEXT(100) NOT NULL,
     [ManagerUserName] TEXT(100) NOT NULL,
     [IsActive] BYTE,
+    [CanTrackLocation] BYTE,
     [AssignedBy] TEXT(100),
     [AssignedAt] DATETIME,
     [UpdatedAt] DATETIME,
@@ -505,6 +507,21 @@ ON dbo.BusyCloudPushSubscription(UserName, IsActive)
     }
     catch {}
 
+    # Sales Tracking v1: per Salesman -> Sales Manager location-view permission.
+    if (-not (Test-WebApprovalColumnExists -Connection $conn -DbType $dbType -TableName "BusyCloudSalesmanManager" -ColumnName "CanTrackLocation")) {
+        if ($dbType -eq 1) {
+            [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql "ALTER TABLE dbo.BusyCloudSalesmanManager ADD CanTrackLocation BIT NULL")
+        }
+        else {
+            [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql "ALTER TABLE [BusyCloudSalesmanManager] ADD COLUMN [CanTrackLocation] BYTE")
+        }
+        Write-Host "  [WEB-APPROVAL MIGRATION] Added BusyCloudSalesmanManager.CanTrackLocation." -ForegroundColor Yellow
+    }
+
+    try {
+        [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql "UPDATE [BusyCloudSalesmanManager] SET [CanTrackLocation]=0 WHERE [CanTrackLocation] IS NULL")
+    } catch {}
+
     return $true
 }
 
@@ -539,6 +556,11 @@ CREATE TABLE dbo.BusyCloudWebApproval (
     RequestedVoucherNo NVARCHAR(100) NULL,
     PartyName NVARCHAR(255) NULL,
     Amount DECIMAL(19,4) NOT NULL CONSTRAINT DF_BCWA_Amount DEFAULT(0),
+    Latitude DECIMAL(10,7) NULL,
+    Longitude DECIMAL(10,7) NULL,
+    LocationAccuracy DECIMAL(10,2) NULL,
+    LocationCapturedAt DATETIME2 NULL,
+    LocationLocalDate NVARCHAR(10) NULL,
     PayloadJson NVARCHAR(MAX) NOT NULL,
     PayloadHash CHAR(64) NOT NULL,
     ApprovalStatus NVARCHAR(20) NOT NULL,
@@ -570,6 +592,11 @@ CREATE TABLE [BusyCloudWebApproval] (
     [RequestedVoucherNo] TEXT(100),
     [PartyName] TEXT(255),
     [Amount] DOUBLE,
+    [Latitude] DOUBLE,
+    [Longitude] DOUBLE,
+    [LocationAccuracy] DOUBLE,
+    [LocationCapturedAt] DATETIME,
+    [LocationLocalDate] TEXT(10),
     [PayloadJson] MEMO,
     [PayloadHash] TEXT(64) NOT NULL,
     [ApprovalStatus] TEXT(20) NOT NULL,
@@ -798,6 +825,234 @@ CREATE TABLE [BusyCloudNotificationDelivery] (
                 [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql $indexSql)
             }
         } catch {}
+    }
+
+    # Sales Tracking v1 location metadata. These columns are intentionally
+    # separate from PayloadJson so GPS never becomes part of the BUSY accounting payload.
+    $trackingColumns = @(
+        @{ Name="Latitude"; SqlType="DECIMAL(10,7) NULL"; AccessType="DOUBLE" },
+        @{ Name="Longitude"; SqlType="DECIMAL(10,7) NULL"; AccessType="DOUBLE" },
+        @{ Name="LocationAccuracy"; SqlType="DECIMAL(10,2) NULL"; AccessType="DOUBLE" },
+        @{ Name="LocationCapturedAt"; SqlType="DATETIME2 NULL"; AccessType="DATETIME" },
+        @{ Name="LocationLocalDate"; SqlType="NVARCHAR(10) NULL"; AccessType="TEXT(10)" }
+    )
+
+    foreach ($column in $trackingColumns) {
+        if (-not (Test-WebApprovalColumnExists -Connection $conn -DbType $dbType -TableName "BusyCloudWebApproval" -ColumnName $column.Name)) {
+            if ($dbType -eq 1) {
+                $sql = "ALTER TABLE dbo.BusyCloudWebApproval ADD [$($column.Name)] $($column.SqlType)"
+            }
+            else {
+                $sql = "ALTER TABLE [BusyCloudWebApproval] ADD COLUMN [$($column.Name)] $($column.AccessType)"
+            }
+            [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql $sql)
+            Write-Host "  [WEB-APPROVAL MIGRATION] Added BusyCloudWebApproval.$($column.Name)." -ForegroundColor Yellow
+        }
+    }
+
+    # Sales Tracking v2: foreground breadcrumb points. These are deliberately
+    # separate from voucher submission locations so the map can show the route
+    # travelled while BusyWeb is open without altering accounting/Web Approval data.
+    if (-not (Test-WebApprovalTableExists -Connection $conn -DbType $dbType -TableName "BusyCloudSalesmanLocationPoint")) {
+        if ($dbType -eq 1) {
+            $sql = @"
+CREATE TABLE dbo.BusyCloudSalesmanLocationPoint (
+    Id NVARCHAR(36) NOT NULL PRIMARY KEY,
+    SalesmanUserName NVARCHAR(100) NOT NULL,
+    Latitude DECIMAL(10,7) NOT NULL,
+    Longitude DECIMAL(10,7) NOT NULL,
+    Accuracy DECIMAL(10,2) NOT NULL,
+    CapturedAt DATETIME2 NOT NULL,
+    LocalDate NVARCHAR(10) NOT NULL,
+    CreatedAt DATETIME2 NOT NULL
+)
+"@
+        }
+        else {
+            $sql = @"
+CREATE TABLE [BusyCloudSalesmanLocationPoint] (
+    [Id] TEXT(36) NOT NULL,
+    [SalesmanUserName] TEXT(100) NOT NULL,
+    [Latitude] DOUBLE NOT NULL,
+    [Longitude] DOUBLE NOT NULL,
+    [Accuracy] DOUBLE NOT NULL,
+    [CapturedAt] DATETIME NOT NULL,
+    [LocalDate] TEXT(10) NOT NULL,
+    [CreatedAt] DATETIME NOT NULL,
+    CONSTRAINT [PK_BusyCloudSalesmanLocationPoint] PRIMARY KEY ([Id])
+)
+"@
+        }
+
+        [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql $sql)
+        Write-Host "  [WEB-APPROVAL MIGRATION] Created BusyCloudSalesmanLocationPoint in $($Context.database)" -ForegroundColor Yellow
+    }
+
+    try {
+        if ($dbType -eq 1) {
+            $sql = @"
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name='IX_BCSLP_SalesmanDateTime'
+      AND object_id=OBJECT_ID('dbo.BusyCloudSalesmanLocationPoint')
+)
+CREATE INDEX IX_BCSLP_SalesmanDateTime
+ON dbo.BusyCloudSalesmanLocationPoint(SalesmanUserName, LocalDate, CapturedAt)
+"@
+            [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql $sql)
+        }
+        else {
+            [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql "CREATE INDEX [IX_BCSLP_SalesmanDateTime] ON [BusyCloudSalesmanLocationPoint] ([SalesmanUserName], [LocalDate], [CapturedAt])")
+        }
+    } catch {}
+
+    # Sales Tracking v3: one generic transaction-location table for every ONLINE
+    # transaction created by a user with the SALESMAN workflow role. This is
+    # intentionally independent from BusyCloudWebApproval so NONE and BUSY
+    # transactions are tracked too, while WEB/BOTH retain their Web Approval id.
+    if (-not (Test-WebApprovalTableExists -Connection $conn -DbType $dbType -TableName "BusyCloudSalesmanTransactionLocation")) {
+        if ($dbType -eq 1) {
+            $sql = @"
+CREATE TABLE dbo.BusyCloudSalesmanTransactionLocation (
+    Id NVARCHAR(36) NOT NULL PRIMARY KEY,
+    ClientRequestId NVARCHAR(36) NULL,
+    SalesmanUserName NVARCHAR(100) NOT NULL,
+    VoucherType INT NOT NULL,
+    ApprovalMode NVARCHAR(12) NOT NULL,
+    WebApprovalId NVARCHAR(36) NULL,
+    RequestedSeries NVARCHAR(100) NULL,
+    RequestedVoucherNo NVARCHAR(100) NULL,
+    BusyVoucherNo NVARCHAR(100) NULL,
+    BusyVoucherCode NVARCHAR(50) NULL,
+    PartyName NVARCHAR(255) NULL,
+    Amount DECIMAL(19,4) NOT NULL CONSTRAINT DF_BCSTL_Amount DEFAULT(0),
+    Latitude DECIMAL(10,7) NOT NULL,
+    Longitude DECIMAL(10,7) NOT NULL,
+    LocationAccuracy DECIMAL(10,2) NOT NULL,
+    LocationCapturedAt DATETIME2 NOT NULL,
+    LocationLocalDate NVARCHAR(10) NOT NULL,
+    SubmittedAt DATETIME2 NOT NULL,
+    CreatedAt DATETIME2 NOT NULL,
+    UpdatedAt DATETIME2 NOT NULL
+)
+"@
+        }
+        else {
+            $sql = @"
+CREATE TABLE [BusyCloudSalesmanTransactionLocation] (
+    [Id] TEXT(36) NOT NULL,
+    [ClientRequestId] TEXT(36),
+    [SalesmanUserName] TEXT(100) NOT NULL,
+    [VoucherType] INTEGER NOT NULL,
+    [ApprovalMode] TEXT(12) NOT NULL,
+    [WebApprovalId] TEXT(36),
+    [RequestedSeries] TEXT(100),
+    [RequestedVoucherNo] TEXT(100),
+    [BusyVoucherNo] TEXT(100),
+    [BusyVoucherCode] TEXT(50),
+    [PartyName] TEXT(255),
+    [Amount] DOUBLE,
+    [Latitude] DOUBLE NOT NULL,
+    [Longitude] DOUBLE NOT NULL,
+    [LocationAccuracy] DOUBLE NOT NULL,
+    [LocationCapturedAt] DATETIME NOT NULL,
+    [LocationLocalDate] TEXT(10) NOT NULL,
+    [SubmittedAt] DATETIME NOT NULL,
+    [CreatedAt] DATETIME NOT NULL,
+    [UpdatedAt] DATETIME NOT NULL,
+    CONSTRAINT [PK_BusyCloudSalesmanTransactionLocation] PRIMARY KEY ([Id])
+)
+"@
+        }
+
+        [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql $sql)
+        Write-Host "  [WEB-APPROVAL MIGRATION] Created BusyCloudSalesmanTransactionLocation in $($Context.database)" -ForegroundColor Yellow
+    }
+
+    try {
+        if ($dbType -eq 1) {
+            $sql = @"
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name='IX_BCSTL_SalesmanDateTime'
+      AND object_id=OBJECT_ID('dbo.BusyCloudSalesmanTransactionLocation')
+)
+CREATE INDEX IX_BCSTL_SalesmanDateTime
+ON dbo.BusyCloudSalesmanTransactionLocation(SalesmanUserName, LocationLocalDate, SubmittedAt)
+"@
+            [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql $sql)
+
+            $sql = @"
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name='IX_BCSTL_ClientRequestId'
+      AND object_id=OBJECT_ID('dbo.BusyCloudSalesmanTransactionLocation')
+)
+CREATE INDEX IX_BCSTL_ClientRequestId
+ON dbo.BusyCloudSalesmanTransactionLocation(ClientRequestId)
+"@
+            [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql $sql)
+        }
+        else {
+            try { [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql "CREATE INDEX [IX_BCSTL_SalesmanDateTime] ON [BusyCloudSalesmanTransactionLocation] ([SalesmanUserName], [LocationLocalDate], [SubmittedAt])") } catch {}
+            try { [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql "CREATE INDEX [IX_BCSTL_ClientRequestId] ON [BusyCloudSalesmanTransactionLocation] ([ClientRequestId])") } catch {}
+        }
+    } catch {}
+
+    # Backfill pre-v3 Web Approval locations so existing map history is not lost.
+    # Older rows did not persist the original four-way approval mode. They are
+    # therefore classified as WEB for historical display; every new v3 row stores
+    # the exact backend-resolved NONE/BUSY/WEB/BOTH mode.
+    try {
+        if ($dbType -eq 1) {
+            $sql = @"
+INSERT INTO dbo.BusyCloudSalesmanTransactionLocation
+(
+    Id, ClientRequestId, SalesmanUserName, VoucherType, ApprovalMode, WebApprovalId,
+    RequestedSeries, RequestedVoucherNo, BusyVoucherNo, BusyVoucherCode,
+    PartyName, Amount, Latitude, Longitude, LocationAccuracy,
+    LocationCapturedAt, LocationLocalDate, SubmittedAt, CreatedAt, UpdatedAt
+)
+SELECT
+    w.Id, w.Id, w.SubmittedBy, w.VoucherType, 'WEB', w.Id,
+    w.RequestedSeries, w.RequestedVoucherNo, w.BusyVoucherNo, w.BusyVoucherCode,
+    w.PartyName, w.Amount, w.Latitude, w.Longitude, w.LocationAccuracy,
+    w.LocationCapturedAt, w.LocationLocalDate, w.SubmittedAt, w.SubmittedAt, w.UpdatedAt
+FROM dbo.BusyCloudWebApproval w
+WHERE w.Latitude IS NOT NULL
+  AND w.Longitude IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM dbo.BusyCloudSalesmanTransactionLocation t
+      WHERE t.WebApprovalId=w.Id OR t.ClientRequestId=w.Id
+  )
+"@
+            [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql $sql)
+        }
+        else {
+            $sql = @"
+INSERT INTO [BusyCloudSalesmanTransactionLocation]
+(
+    [Id], [ClientRequestId], [SalesmanUserName], [VoucherType], [ApprovalMode], [WebApprovalId],
+    [RequestedSeries], [RequestedVoucherNo], [BusyVoucherNo], [BusyVoucherCode],
+    [PartyName], [Amount], [Latitude], [Longitude], [LocationAccuracy],
+    [LocationCapturedAt], [LocationLocalDate], [SubmittedAt], [CreatedAt], [UpdatedAt]
+)
+SELECT
+    w.[Id], w.[Id], w.[SubmittedBy], w.[VoucherType], 'WEB', w.[Id],
+    w.[RequestedSeries], w.[RequestedVoucherNo], w.[BusyVoucherNo], w.[BusyVoucherCode],
+    w.[PartyName], w.[Amount], w.[Latitude], w.[Longitude], w.[LocationAccuracy],
+    w.[LocationCapturedAt], w.[LocationLocalDate], w.[SubmittedAt], w.[SubmittedAt], w.[UpdatedAt]
+FROM [BusyCloudWebApproval] AS w
+LEFT JOIN [BusyCloudSalesmanTransactionLocation] AS t
+  ON t.[WebApprovalId]=w.[Id] OR t.[ClientRequestId]=w.[Id]
+WHERE w.[Latitude] IS NOT NULL
+  AND w.[Longitude] IS NOT NULL
+  AND t.[Id] IS NULL
+"@
+            [void](Invoke-WebApprovalNonQuery -Connection $conn -Sql $sql)
+        }
+    } catch {
+        Write-Host "  [SALES-TRACKING] Legacy location backfill skipped: $($_.Exception.Message)" -ForegroundColor DarkYellow
     }
 
     return $true
@@ -1094,7 +1349,7 @@ function Set-WebApprovalUserRole {
             [void](Invoke-WebApprovalNonQuery `
                 -Connection $ctx.connection `
                 -Transaction $tx `
-                -Sql "UPDATE [BusyCloudSalesmanManager] SET [IsActive]=0 WHERE [SalesmanUserName]='$safeUser'")
+                -Sql "UPDATE [BusyCloudSalesmanManager] SET [IsActive]=0, [CanTrackLocation]=0 WHERE [SalesmanUserName]='$safeUser'")
         }
 
         # If the user is no longer a manager, assignments pointing to that manager
@@ -1103,7 +1358,7 @@ function Set-WebApprovalUserRole {
             [void](Invoke-WebApprovalNonQuery `
                 -Connection $ctx.connection `
                 -Transaction $tx `
-                -Sql "UPDATE [BusyCloudSalesmanManager] SET [IsActive]=0 WHERE [ManagerUserName]='$safeUser'")
+                -Sql "UPDATE [BusyCloudSalesmanManager] SET [IsActive]=0, [CanTrackLocation]=0 WHERE [ManagerUserName]='$safeUser'")
         }
 
         $tx.Commit()
@@ -1328,7 +1583,7 @@ function Set-WebApprovalManagersForSalesman {
         [void](Invoke-WebApprovalNonQuery `
             -Connection $ctx.connection `
             -Transaction $tx `
-            -Sql "UPDATE [BusyCloudSalesmanManager] SET [IsActive]=0, [UpdatedAt]=$nowSql WHERE [SalesmanUserName]='$salesmanSafe'")
+            -Sql "UPDATE [BusyCloudSalesmanManager] SET [IsActive]=0, [CanTrackLocation]=0, [UpdatedAt]=$nowSql WHERE [SalesmanUserName]='$salesmanSafe'")
 
         foreach ($managerName in $canonicalManagers) {
             $managerSafe = $managerName.Replace("'", "''")
@@ -1343,14 +1598,14 @@ function Set-WebApprovalManagersForSalesman {
                 [void](Invoke-WebApprovalNonQuery `
                     -Connection $ctx.connection `
                     -Transaction $tx `
-                    -Sql "UPDATE [BusyCloudSalesmanManager] SET [IsActive]=1, [AssignedBy]='$actionSafe', [UpdatedAt]=$nowSql WHERE [SalesmanUserName]='$salesmanSafe' AND [ManagerUserName]='$managerSafe'")
+                    -Sql "UPDATE [BusyCloudSalesmanManager] SET [IsActive]=1, [CanTrackLocation]=0, [AssignedBy]='$actionSafe', [UpdatedAt]=$nowSql WHERE [SalesmanUserName]='$salesmanSafe' AND [ManagerUserName]='$managerSafe'")
             }
             else {
                 $id = [guid]::NewGuid().ToString()
                 [void](Invoke-WebApprovalNonQuery `
                     -Connection $ctx.connection `
                     -Transaction $tx `
-                    -Sql "INSERT INTO [BusyCloudSalesmanManager] ([Id],[SalesmanUserName],[ManagerUserName],[IsActive],[AssignedBy],[AssignedAt],[UpdatedAt]) VALUES ('$id','$salesmanSafe','$managerSafe',1,'$actionSafe',$nowSql,$nowSql)")
+                    -Sql "INSERT INTO [BusyCloudSalesmanManager] ([Id],[SalesmanUserName],[ManagerUserName],[IsActive],[CanTrackLocation],[AssignedBy],[AssignedAt],[UpdatedAt]) VALUES ('$id','$salesmanSafe','$managerSafe',1,0,'$actionSafe',$nowSql,$nowSql)")
             }
         }
 
@@ -1786,7 +2041,9 @@ function Get-WebApprovalPayloadSnapshot {
     $json = $Data | ConvertTo-Json -Depth 50 -Compress
     $copy = $json | ConvertFrom-Json
 
-    foreach ($name in @("clientRequestId", "webApprovalRequestId")) {
+    # Location is workflow metadata, not accounting data. Keeping it out of
+    # PayloadJson also keeps idempotency hashes stable across a network retry.
+    foreach ($name in @("clientRequestId", "webApprovalRequestId", "location")) {
         try {
             $copy.PSObject.Properties.Remove($name)
         }
@@ -1794,6 +2051,98 @@ function Get-WebApprovalPayloadSnapshot {
     }
 
     return ($copy | ConvertTo-Json -Depth 50 -Compress)
+}
+
+function Get-WebApprovalSubmissionLocation {
+    param(
+        $Data,
+        [double]$MaximumAccuracyMetres = 100,
+        [bool]$EnforceMaximumAccuracy = $true
+    )
+
+    $location = Get-WebApprovalPropertyValue -Object $Data -Names @("location") -DefaultValue $null
+    if ($null -eq $location) {
+        return @{
+            success = $false
+            httpStatus = 400
+            errorCode = "SALESMAN_TRANSACTION_LOCATION_REQUIRED"
+            error = "Current location is required to submit an online Salesman transaction."
+        }
+    }
+
+    try {
+        $latitude = [double](Get-WebApprovalPropertyValue -Object $location -Names @("latitude", "lat") -DefaultValue ([double]::NaN))
+        $longitude = [double](Get-WebApprovalPropertyValue -Object $location -Names @("longitude", "lng", "lon") -DefaultValue ([double]::NaN))
+        $accuracy = [double](Get-WebApprovalPropertyValue -Object $location -Names @("accuracy") -DefaultValue ([double]::NaN))
+
+        if ([double]::IsNaN($latitude) -or $latitude -lt -90 -or $latitude -gt 90) {
+            throw "Latitude is invalid."
+        }
+        if ([double]::IsNaN($longitude) -or $longitude -lt -180 -or $longitude -gt 180) {
+            throw "Longitude is invalid."
+        }
+        if ([double]::IsNaN($accuracy) -or $accuracy -lt 0) {
+            throw "Location accuracy is invalid."
+        }
+        # Transaction tracking stores the browser-reported accuracy exactly as
+        # received. Accuracy is an informational quality value and must not
+        # block a Salesman voucher. Foreground route tracking can still request
+        # strict accuracy by leaving EnforceMaximumAccuracy=$true.
+        if ($EnforceMaximumAccuracy -and $accuracy -gt $MaximumAccuracyMetres) {
+            return @{
+                success = $false
+                httpStatus = 400
+                errorCode = "SALESMAN_TRANSACTION_LOCATION_ACCURACY_TOO_LOW"
+                error = "Location accuracy is $([math]::Round($accuracy,0)) m. Accuracy of $([int]$MaximumAccuracyMetres) m or better is required."
+            }
+        }
+
+        $capturedText = ([string](Get-WebApprovalPropertyValue -Object $location -Names @("capturedAt") -DefaultValue "")).Trim()
+        $capturedOffset = [datetimeoffset]::MinValue
+        if ([string]::IsNullOrWhiteSpace($capturedText) -or -not [datetimeoffset]::TryParse($capturedText, [ref]$capturedOffset)) {
+            throw "Location capture time is invalid."
+        }
+        $capturedUtc = $capturedOffset.UtcDateTime
+
+        # Reject stale/spoof-like timestamps, while allowing normal network latency.
+        $ageMinutes = ([datetime]::UtcNow - $capturedUtc).TotalMinutes
+        if ($ageMinutes -gt 10 -or $ageMinutes -lt -2) {
+            return @{
+                success = $false
+                httpStatus = 400
+                errorCode = "SALESMAN_TRANSACTION_LOCATION_STALE"
+                error = "The captured location is no longer current. Please acquire your location again."
+            }
+        }
+
+        $localDate = ([string](Get-WebApprovalPropertyValue -Object $location -Names @("localDate") -DefaultValue "")).Trim()
+        if ($localDate -notmatch '^\d{4}-\d{2}-\d{2}$') {
+            throw "Location localDate must be YYYY-MM-DD."
+        }
+        $parsedLocalDate = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact($localDate, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsedLocalDate)) {
+            throw "Location localDate is invalid."
+        }
+
+        return @{
+            success = $true
+            data = @{
+                latitude = [double]$latitude
+                longitude = [double]$longitude
+                accuracy = [double]$accuracy
+                capturedAt = $capturedUtc
+                localDate = $localDate
+            }
+        }
+    }
+    catch {
+        return @{
+            success = $false
+            httpStatus = 400
+            errorCode = "SALESMAN_TRANSACTION_LOCATION_INVALID"
+            error = $_.Exception.Message
+        }
+    }
 }
 
 function Get-WebApprovalPayloadSummary {
@@ -1876,7 +2225,7 @@ function Add-WebApprovalCommandParameter {
         [int]$DbType,
         [string]$Name,
         $Value,
-        [ValidateSet("Text", "LongText", "Int", "Decimal", "Date", "Bool")]
+        [ValidateSet("Text", "LongText", "Int", "Decimal", "GeoDecimal", "Date", "Bool")]
         [string]$Kind = "Text",
         [int]$Size = 255
     )
@@ -1895,6 +2244,11 @@ function Add-WebApprovalCommandParameter {
                 $p = $Command.Parameters.Add($Name, [System.Data.SqlDbType]::Decimal)
                 $p.Precision = 19
                 $p.Scale = 4
+            }
+            "GeoDecimal" {
+                $p = $Command.Parameters.Add($Name, [System.Data.SqlDbType]::Decimal)
+                $p.Precision = 10
+                $p.Scale = 7
             }
             "Date" {
                 $p = $Command.Parameters.Add($Name, [System.Data.SqlDbType]::DateTime2)
@@ -1918,6 +2272,7 @@ function Add-WebApprovalCommandParameter {
         "LongText" { $oleType = [System.Data.OleDb.OleDbType]::LongVarWChar }
         "Int"      { $oleType = [System.Data.OleDb.OleDbType]::Integer }
         "Decimal"  { $oleType = [System.Data.OleDb.OleDbType]::Double }
+        "GeoDecimal" { $oleType = [System.Data.OleDb.OleDbType]::Double }
         "Date"     { $oleType = [System.Data.OleDb.OleDbType]::DBTimeStamp }
         "Bool"     { $oleType = [System.Data.OleDb.OleDbType]::UnsignedTinyInt }
         default    { $oleType = [System.Data.OleDb.OleDbType]::VarWChar }
@@ -2010,6 +2365,11 @@ function Add-WebApprovalPendingRow {
         [string]$RequestedVoucherNo,
         [string]$PartyName,
         [decimal]$Amount,
+        [double]$Latitude,
+        [double]$Longitude,
+        [double]$LocationAccuracy,
+        [datetime]$LocationCapturedAt,
+        [string]$LocationLocalDate,
         [string]$PayloadJson,
         [string]$PayloadHash,
         [datetime]$NowUtc
@@ -2031,6 +2391,11 @@ INSERT INTO dbo.BusyCloudWebApproval
     RequestedVoucherNo,
     PartyName,
     Amount,
+    Latitude,
+    Longitude,
+    LocationAccuracy,
+    LocationCapturedAt,
+    LocationLocalDate,
     PayloadJson,
     PayloadHash,
     ApprovalStatus,
@@ -2050,6 +2415,11 @@ VALUES
     @requestedVoucherNo,
     @partyName,
     @amount,
+    @latitude,
+    @longitude,
+    @locationAccuracy,
+    @locationCapturedAt,
+    @locationLocalDate,
     @payloadJson,
     @payloadHash,
     @approvalStatus,
@@ -2069,6 +2439,11 @@ VALUES
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@requestedVoucherNo" -Value $RequestedVoucherNo -Kind Text -Size 100)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@partyName" -Value $PartyName -Kind Text -Size 255)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@amount" -Value $Amount -Kind Decimal)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@latitude" -Value $Latitude -Kind GeoDecimal)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@longitude" -Value $Longitude -Kind GeoDecimal)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@locationAccuracy" -Value $LocationAccuracy -Kind Decimal)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@locationCapturedAt" -Value $LocationCapturedAt -Kind Date)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@locationLocalDate" -Value $LocationLocalDate -Kind Text -Size 10)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@payloadJson" -Value $PayloadJson -Kind LongText)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@payloadHash" -Value $PayloadHash -Kind Text -Size 64)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@approvalStatus" -Value "PENDING" -Kind Text -Size 20)
@@ -2090,6 +2465,11 @@ INSERT INTO [BusyCloudWebApproval]
     [RequestedVoucherNo],
     [PartyName],
     [Amount],
+    [Latitude],
+    [Longitude],
+    [LocationAccuracy],
+    [LocationCapturedAt],
+    [LocationLocalDate],
     [PayloadJson],
     [PayloadHash],
     [ApprovalStatus],
@@ -2101,7 +2481,7 @@ INSERT INTO [BusyCloudWebApproval]
 )
 VALUES
 (
-    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
 )
 "@
 
@@ -2113,14 +2493,19 @@ VALUES
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p6" -Value $RequestedVoucherNo -Kind Text -Size 100)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p7" -Value $PartyName -Kind Text -Size 255)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p8" -Value ([double]$Amount) -Kind Decimal)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p9" -Value $PayloadJson -Kind LongText)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p10" -Value $PayloadHash -Kind Text -Size 64)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p11" -Value "PENDING" -Kind Text -Size 20)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p12" -Value "NOT_READY" -Kind Text -Size 30)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p13" -Value 0 -Kind Int)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p14" -Value $NowUtc -Kind Date)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p15" -Value $NowUtc -Kind Date)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p16" -Value 1 -Kind Int)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p9" -Value $Latitude -Kind GeoDecimal)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p10" -Value $Longitude -Kind GeoDecimal)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p11" -Value $LocationAccuracy -Kind Decimal)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p12" -Value $LocationCapturedAt -Kind Date)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p13" -Value $LocationLocalDate -Kind Text -Size 10)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p14" -Value $PayloadJson -Kind LongText)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p15" -Value $PayloadHash -Kind Text -Size 64)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p16" -Value "PENDING" -Kind Text -Size 20)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p17" -Value "NOT_READY" -Kind Text -Size 30)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p18" -Value 0 -Kind Int)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p19" -Value $NowUtc -Kind Date)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p20" -Value $NowUtc -Kind Date)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p21" -Value 1 -Kind Int)
     }
 
     [void]$cmd.ExecuteNonQuery()
@@ -2432,6 +2817,12 @@ function Submit-WebApprovalVoucher {
             }
         }
 
+        $locationResult = Get-WebApprovalSubmissionLocation -Data $Data -MaximumAccuracyMetres 150 -EnforceMaximumAccuracy $false
+        if (-not $locationResult.success) {
+            return $locationResult
+        }
+        $submissionLocation = $locationResult.data
+
         $tx = $ctx.connection.BeginTransaction()
 
         Add-WebApprovalPendingRow `
@@ -2445,6 +2836,11 @@ function Submit-WebApprovalVoucher {
             -RequestedVoucherNo $requestedVoucherNo `
             -PartyName ([string]$summary.partyName) `
             -Amount ([decimal]$summary.amount) `
+            -Latitude ([double]$submissionLocation.latitude) `
+            -Longitude ([double]$submissionLocation.longitude) `
+            -LocationAccuracy ([double]$submissionLocation.accuracy) `
+            -LocationCapturedAt ([datetime]$submissionLocation.capturedAt) `
+            -LocationLocalDate ([string]$submissionLocation.localDate) `
             -PayloadJson $payloadJson `
             -PayloadHash $payloadHash `
             -NowUtc $nowUtc
@@ -8085,6 +8481,197 @@ WHERE [SubmittedBy]=?
     }
 }
 
+# =============================================================================
+# WEB APPROVAL - NORMAL VOUCHER EDIT LOCK
+# =============================================================================
+# Web Approval workflow state overrides ordinary voucher Modify permission:
+#   SALESMAN      -> locked after manager APPROVES or after SYNCED
+#   SALES_MANAGER -> locked after SYNCED
+#   other roles   -> existing voucher permissions continue unchanged
+#
+# This guard is intentionally checked again on /busy/voucher/modify so a user
+# cannot bypass the React UI and modify a protected voucher directly.
+# =============================================================================
+function Get-WebApprovalVoucherEditLock {
+    param(
+        [int]$VchType,
+        [string]$VchNo,
+        [string]$UserName,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $voucherNo = ([string]$VchNo).Trim()
+    $user = ([string]$UserName).Trim()
+
+    if ($VchType -le 0 -or [string]::IsNullOrWhiteSpace($voucherNo)) {
+        return @{
+            success = $true
+            locked = $false
+            isWebApprovalVoucher = $false
+            reason = ""
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($user)) {
+        return @{
+            success = $false
+            httpStatus = 401
+            errorCode = "AUTH_REQUIRED"
+            error = "Authenticated BUSY user is required to validate Web Approval edit access."
+        }
+    }
+
+    $roleResult = Get-WebApprovalUserRole `
+        -UserName $user `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $roleResult.success) {
+        return @{
+            success = $false
+            httpStatus = 500
+            errorCode = "WEB_APPROVAL_ROLE_LOOKUP_FAILED"
+            error = if ($roleResult.error) { $roleResult.error } else { "Could not resolve Web Approval workflow role." }
+        }
+    }
+
+    $role = 0
+    try { $role = [int]$roleResult.data.role } catch {}
+
+    # Only SALESMAN / SALES_MANAGER receive this workflow-state override.
+    if ($role -notin @(1, 2)) {
+        return @{
+            success = $true
+            locked = $false
+            isWebApprovalVoucher = $false
+            role = $role
+            roleName = Get-WebApprovalRoleName -Role $role
+            reason = ""
+        }
+    }
+
+    $ctx = $null
+    $reader = $null
+
+    try {
+        $ctx = Get-WebApprovalFiscalDbContext `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        [void](Ensure-WebApprovalFiscalTables -Context $ctx)
+
+        $cmd = $ctx.connection.CreateCommand()
+        $dbType = [int]$ctx.dbType
+
+        if ($dbType -eq 1) {
+            $cmd.CommandText = @"
+SELECT TOP 1
+    Id,
+    SubmittedBy,
+    ApprovalStatus,
+    SyncStatus,
+    BusyVoucherNo,
+    RequestedVoucherNo
+FROM dbo.BusyCloudWebApproval
+WHERE VoucherType=@vchType
+  AND LTRIM(RTRIM(ISNULL(BusyVoucherNo,'')))=@vchNo
+ORDER BY UpdatedAt DESC, SubmittedAt DESC
+"@
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@vchType" -Value $VchType -Kind Int)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@vchNo" -Value $voucherNo -Kind Text -Size 100)
+        }
+        else {
+            $cmd.CommandText = @"
+SELECT
+    [Id],
+    [SubmittedBy],
+    [ApprovalStatus],
+    [SyncStatus],
+    [BusyVoucherNo],
+    [RequestedVoucherNo]
+FROM [BusyCloudWebApproval]
+WHERE [VoucherType]=?
+  AND TRIM(COALESCE([BusyVoucherNo],''))=?
+ORDER BY [UpdatedAt] DESC, [SubmittedAt] DESC
+LIMIT 1
+"@
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name "@p1" -Value $VchType -Kind Int)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name "@p2" -Value $voucherNo -Kind Text -Size 100)
+        }
+
+        $reader = $cmd.ExecuteReader()
+
+        if (-not $reader.Read()) {
+            return @{
+                success = $true
+                locked = $false
+                isWebApprovalVoucher = $false
+                role = $role
+                roleName = Get-WebApprovalRoleName -Role $role
+                reason = ""
+            }
+        }
+
+        $approvalStatus = ([string](Read-WebApprovalReaderValue $reader "ApprovalStatus" "")).Trim().ToUpperInvariant()
+        $syncStatus = ([string](Read-WebApprovalReaderValue $reader "SyncStatus" "")).Trim().ToUpperInvariant()
+        $webApprovalId = ([string](Read-WebApprovalReaderValue $reader "Id" "")).Trim()
+        $submittedBy = ([string](Read-WebApprovalReaderValue $reader "SubmittedBy" "")).Trim()
+
+        $locked = $false
+        $reason = ""
+        $errorCode = ""
+
+        if ($role -eq 1) {
+            if ($syncStatus -eq "SYNCED") {
+                $locked = $true
+                $errorCode = "WEB_APPROVAL_SALESMAN_EDIT_LOCKED_SYNCED"
+                $reason = "This voucher is locked because the Sales Manager already synchronized it to BUSY."
+            }
+            elseif ($approvalStatus -eq "APPROVED") {
+                $locked = $true
+                $errorCode = "WEB_APPROVAL_SALESMAN_EDIT_LOCKED_APPROVED"
+                $reason = "This voucher is locked because the Sales Manager already approved it."
+            }
+        }
+        elseif ($role -eq 2 -and $syncStatus -eq "SYNCED") {
+            $locked = $true
+            $errorCode = "WEB_APPROVAL_MANAGER_EDIT_LOCKED_SYNCED"
+            $reason = "This voucher is locked because it has already been synchronized to BUSY."
+        }
+
+        return @{
+            success = $true
+            locked = $locked
+            isWebApprovalVoucher = $true
+            errorCode = $errorCode
+            reason = $reason
+            role = $role
+            roleName = Get-WebApprovalRoleName -Role $role
+            webApprovalId = $webApprovalId
+            submittedBy = $submittedBy
+            approvalStatus = $approvalStatus
+            syncStatus = $syncStatus
+            busyVoucherNo = $voucherNo
+        }
+    }
+    catch {
+        return @{
+            success = $false
+            httpStatus = 500
+            errorCode = "WEB_APPROVAL_EDIT_LOCK_CHECK_FAILED"
+            error = $_.Exception.Message
+        }
+    }
+    finally {
+        if ($reader) {
+            try { $reader.Close() } catch {}
+            try { $reader.Dispose() } catch {}
+        }
+        Close-WebApprovalDbContext -Context $ctx
+    }
+}
+
 # ============================================================================
 # BUSYCLOUD WEB APPROVAL V6.7 - MANAGER ITEM EDIT + AUDIT EXTENSION
 # ============================================================================
@@ -8235,10 +8822,10 @@ function Set-WebApprovalUserRole {
         $tx = $ctx.connection.BeginTransaction()
         [void](Invoke-WebApprovalNonQuery -Connection $ctx.connection -Transaction $tx -Sql "UPDATE [MobileUserPreference] SET [B35]=$salesmanFlag, [B36]=$managerFlag, [B37]=$editFlagSql WHERE [Name]='$safeUser'")
         if ($roleValue -ne $script:WebApprovalRoleSalesman) {
-            [void](Invoke-WebApprovalNonQuery -Connection $ctx.connection -Transaction $tx -Sql "UPDATE [BusyCloudSalesmanManager] SET [IsActive]=0 WHERE [SalesmanUserName]='$safeUser'")
+            [void](Invoke-WebApprovalNonQuery -Connection $ctx.connection -Transaction $tx -Sql "UPDATE [BusyCloudSalesmanManager] SET [IsActive]=0, [CanTrackLocation]=0 WHERE [SalesmanUserName]='$safeUser'")
         }
         if ($roleValue -ne $script:WebApprovalRoleSalesManager) {
-            [void](Invoke-WebApprovalNonQuery -Connection $ctx.connection -Transaction $tx -Sql "UPDATE [BusyCloudSalesmanManager] SET [IsActive]=0 WHERE [ManagerUserName]='$safeUser'")
+            [void](Invoke-WebApprovalNonQuery -Connection $ctx.connection -Transaction $tx -Sql "UPDATE [BusyCloudSalesmanManager] SET [IsActive]=0, [CanTrackLocation]=0 WHERE [ManagerUserName]='$safeUser'")
         }
         $tx.Commit(); $tx=$null
 
@@ -9119,3 +9706,1532 @@ function Test-WebApprovalQueueStatusMatch {
 # ============================================================================
 $script:BusyCloudWebApprovalModuleVersion = "7.2-independent-approval-flags+utc-json"
 Write-Host "  [WEB-APPROVAL] Independent BUSY/Web approval extension $script:BusyCloudWebApprovalModuleVersion loaded." -ForegroundColor DarkCyan
+
+
+# ============================================================================
+# SALES TRACKING V1 - transaction GPS + manager-specific visibility
+# ============================================================================
+function Get-WebApprovalTrackingPermissionsForSalesman {
+    param(
+        [string]$SalesmanUserName,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SalesmanUserName)) {
+        return @{ success=$false; httpStatus=400; error="SalesmanUserName is required." }
+    }
+
+    $ctx = $null
+    $rdr = $null
+    try {
+        $ctx = Get-WebApprovalPermanentDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        [void](Ensure-WebApprovalPermanentTables -Context $ctx)
+        $safe = $SalesmanUserName.Trim().Replace("'", "''")
+
+        $cmd = $ctx.connection.CreateCommand()
+        $cmd.CommandText = @"
+SELECT [ManagerUserName], [CanTrackLocation]
+FROM [BusyCloudSalesmanManager]
+WHERE [SalesmanUserName]='$safe' AND [IsActive]<>0
+ORDER BY [ManagerUserName]
+"@
+        $rdr = $cmd.ExecuteReader()
+        $items = @()
+        while ($rdr.Read()) {
+            $managerName = if ($rdr.IsDBNull(0)) { "" } else { ([string]$rdr.GetValue(0)).Trim() }
+            $canTrack = $false
+            if (-not $rdr.IsDBNull(1)) { try { $canTrack = ([int]$rdr.GetValue(1) -ne 0) } catch {} }
+            if ($managerName) {
+                $items += @{
+                    managerUserName = $managerName
+                    canTrackLocation = [bool]$canTrack
+                }
+            }
+        }
+
+        return @{
+            success = $true
+            data = @{
+                salesmanUserName = $SalesmanUserName.Trim()
+                managers = @($items)
+            }
+        }
+    }
+    catch { return @{ success=$false; httpStatus=500; error=$_.Exception.Message } }
+    finally {
+        if ($rdr) { try { $rdr.Close() } catch {}; try { $rdr.Dispose() } catch {} }
+        Close-WebApprovalDbContext -Context $ctx
+    }
+}
+
+function Set-WebApprovalManagerTrackingPermission {
+    param(
+        [string]$SalesmanUserName,
+        [string]$ManagerUserName,
+        [bool]$CanTrackLocation,
+        [string]$ActionBy = "",
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SalesmanUserName) -or [string]::IsNullOrWhiteSpace($ManagerUserName)) {
+        return @{ success=$false; httpStatus=400; error="SalesmanUserName and ManagerUserName are required." }
+    }
+
+    $ctx = $null
+    try {
+        $ctx = Get-WebApprovalPermanentDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        [void](Ensure-WebApprovalPermanentTables -Context $ctx)
+        $salesmanSafe = $SalesmanUserName.Trim().Replace("'", "''")
+        $managerSafe = $ManagerUserName.Trim().Replace("'", "''")
+        $actionSafe = $ActionBy.Trim().Replace("'", "''")
+
+        $cmd = $ctx.connection.CreateCommand()
+        $cmd.CommandText = "SELECT COUNT(*) FROM [BusyCloudSalesmanManager] WHERE [SalesmanUserName]='$salesmanSafe' AND [ManagerUserName]='$managerSafe' AND [IsActive]<>0"
+        if ([int]$cmd.ExecuteScalar() -le 0) {
+            return @{ success=$false; httpStatus=409; error="Location tracking can only be granted to an actively assigned Sales Manager." }
+        }
+
+        $value = if ($CanTrackLocation) { 1 } else { 0 }
+        $now = Get-Date
+        $nowSql = if ([int]$ctx.dbType -eq 1) { "'" + $now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "'" } else { "#" + $now.ToString("MM/dd/yyyy HH:mm:ss") + "#" }
+        [void](Invoke-WebApprovalNonQuery -Connection $ctx.connection -Sql "UPDATE [BusyCloudSalesmanManager] SET [CanTrackLocation]=$value, [AssignedBy]='$actionSafe', [UpdatedAt]=$nowSql WHERE [SalesmanUserName]='$salesmanSafe' AND [ManagerUserName]='$managerSafe' AND [IsActive]<>0")
+
+        return @{
+            success = $true
+            message = "Sales tracking permission updated."
+            data = @{
+                salesmanUserName = $SalesmanUserName.Trim()
+                managerUserName = $ManagerUserName.Trim()
+                canTrackLocation = [bool]$CanTrackLocation
+            }
+        }
+    }
+    catch { return @{ success=$false; httpStatus=500; error=$_.Exception.Message } }
+    finally { Close-WebApprovalDbContext -Context $ctx }
+}
+
+function Test-WebApprovalManagerTrackingAccess {
+    param(
+        [string]$SalesmanUserName,
+        [string]$ManagerUserName,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SalesmanUserName) -or [string]::IsNullOrWhiteSpace($ManagerUserName)) {
+        return @{ success=$true; allowed=$false }
+    }
+
+    $ctx = $null
+    try {
+        $ctx = Get-WebApprovalPermanentDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        [void](Ensure-WebApprovalPermanentTables -Context $ctx)
+        $salesmanSafe = $SalesmanUserName.Trim().Replace("'", "''")
+        $managerSafe = $ManagerUserName.Trim().Replace("'", "''")
+        $cmd = $ctx.connection.CreateCommand()
+        $cmd.CommandText = @"
+SELECT COUNT(*)
+FROM [BusyCloudSalesmanManager]
+WHERE [SalesmanUserName]='$salesmanSafe'
+  AND [ManagerUserName]='$managerSafe'
+  AND [IsActive]<>0
+  AND [CanTrackLocation]<>0
+"@
+        return @{ success=$true; allowed=([int]$cmd.ExecuteScalar() -gt 0) }
+    }
+    catch { return @{ success=$false; allowed=$false; error=$_.Exception.Message } }
+    finally { Close-WebApprovalDbContext -Context $ctx }
+}
+
+
+function Get-SalesTrackingApprovalMode {
+    param(
+        [int]$VchType,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $config = Get-VoucherApprovalConfig `
+        -VchType $VchType `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $config.success) {
+        return @{
+            success = $false
+            error = if ($config.error) { [string]$config.error } else { "Could not read voucher approval mode." }
+        }
+    }
+
+    $modeValue = -1
+    try {
+        $rawModeValue = Get-WebApprovalPropertyValue -Object $config.data -Names @("approval_mode_value") -DefaultValue -1
+        [void][int]::TryParse([string]$rawModeValue, [ref]$modeValue)
+    } catch { $modeValue = -1 }
+
+    if ($modeValue -notin @(0,1,2,3)) {
+        $modeName = ([string]$config.data.approval_mode).Trim().ToUpperInvariant()
+        switch ($modeName) {
+            "BUSY" { $modeValue = 1 }
+            "WEB"  { $modeValue = 2 }
+            "BOTH" { $modeValue = 3 }
+            default {
+                if ([bool]$config.data.web_approval_required -and [bool]$config.data.approval_required) { $modeValue = 3 }
+                elseif ([bool]$config.data.web_approval_required) { $modeValue = 2 }
+                elseif ([bool]$config.data.approval_required) { $modeValue = 1 }
+                else { $modeValue = 0 }
+            }
+        }
+    }
+
+    $modeName = switch ($modeValue) {
+        1 { "BUSY" }
+        2 { "WEB" }
+        3 { "BOTH" }
+        default { "NONE" }
+    }
+
+    return @{
+        success = $true
+        data = @{
+            approvalMode = $modeName
+            approvalModeValue = $modeValue
+            approvalRequired = ($modeValue -in @(1,3))
+            webApprovalRequired = ($modeValue -in @(2,3))
+        }
+    }
+}
+
+function Save-SalesmanTransactionLocation {
+    param(
+        $Data,
+        [string]$SalesmanUserName,
+        [string]$ApprovalMode,
+        [string]$WebApprovalId = "",
+        $CreateResult = $null,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if ($null -eq $Data) { return @{ success=$false; error="Voucher payload is required." } }
+    if ([string]::IsNullOrWhiteSpace($SalesmanUserName)) { return @{ success=$false; error="Salesman user is required." } }
+
+    $mode = ([string]$ApprovalMode).Trim().ToUpperInvariant()
+    if ($mode -notin @("NONE","BUSY","WEB","BOTH")) { $mode = "NONE" }
+
+    $locationResult = Get-WebApprovalSubmissionLocation -Data $Data -MaximumAccuracyMetres 150 -EnforceMaximumAccuracy $false
+    if (-not $locationResult.success) { return $locationResult }
+    $location = $locationResult.data
+
+    $vchType = 0
+    try { $vchType = [int](Get-WebApprovalPropertyValue -Object $Data -Names @("vchType") -DefaultValue 0) } catch {}
+    if ($vchType -le 0) { return @{ success=$false; error="Voucher type is required." } }
+
+    $clientRaw = ([string](Get-WebApprovalPropertyValue -Object $Data -Names @("clientRequestId", "webApprovalRequestId") -DefaultValue "")).Trim()
+    $clientGuid = [guid]::Empty
+    $clientRequestId = ""
+    if ($clientRaw -and [guid]::TryParse($clientRaw, [ref]$clientGuid)) {
+        $clientRequestId = $clientGuid.ToString()
+    }
+    elseif ($WebApprovalId) {
+        $webGuid = [guid]::Empty
+        if ([guid]::TryParse($WebApprovalId, [ref]$webGuid)) { $clientRequestId = $webGuid.ToString() }
+    }
+    if (-not $clientRequestId) { $clientRequestId = [guid]::NewGuid().ToString() }
+
+    $trackingId = $clientRequestId
+    $summary = Get-WebApprovalPayloadSummary -Data $Data
+    $requestedSeries = ([string](Get-WebApprovalPropertyValue -Object $Data -Names @("vchSeries") -DefaultValue "")).Trim()
+    $requestedVoucherNo = ([string](Get-WebApprovalPropertyValue -Object $Data -Names @("vchNo") -DefaultValue "")).Trim()
+
+    $busyVoucherNo = ""
+    $busyVoucherCode = ""
+    if ($null -ne $CreateResult) {
+        $createInfo = Get-WebApprovalCreateResultInfo -Result $CreateResult
+        $busyVoucherNo = ([string]$createInfo.vchNo).Trim()
+        if ([int]$createInfo.vchCode -gt 0) { $busyVoucherCode = [string][int]$createInfo.vchCode }
+    }
+
+    $webId = ([string]$WebApprovalId).Trim()
+    $submittedAt = [datetime]::UtcNow
+    $nowUtc = [datetime]::UtcNow
+    $ctx = $null
+    $rdr = $null
+
+    try {
+        $ctx = Get-WebApprovalFiscalDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        [void](Ensure-WebApprovalFiscalTables -Context $ctx)
+        $dbType = [int]$ctx.dbType
+
+        $existingId = ""
+        $find = $ctx.connection.CreateCommand()
+        if ($dbType -eq 1) {
+            $find.CommandText = @"
+SELECT TOP 1 Id
+FROM dbo.BusyCloudSalesmanTransactionLocation
+WHERE ClientRequestId=@clientRequestId
+   OR (@webApprovalId<>'' AND WebApprovalId=@webApprovalId)
+ORDER BY SubmittedAt DESC
+"@
+            [void](Add-WebApprovalCommandParameter -Command $find -DbType 1 -Name "@clientRequestId" -Value $clientRequestId -Kind Text -Size 36)
+            [void](Add-WebApprovalCommandParameter -Command $find -DbType 1 -Name "@webApprovalId" -Value $webId -Kind Text -Size 36)
+        }
+        else {
+            $find.CommandText = @"
+SELECT TOP 1 [Id]
+FROM [BusyCloudSalesmanTransactionLocation]
+WHERE [ClientRequestId]=?
+   OR (?<>'' AND [WebApprovalId]=?)
+ORDER BY [SubmittedAt] DESC
+"@
+            [void](Add-WebApprovalCommandParameter -Command $find -DbType 0 -Name "@p1" -Value $clientRequestId -Kind Text -Size 36)
+            [void](Add-WebApprovalCommandParameter -Command $find -DbType 0 -Name "@p2" -Value $webId -Kind Text -Size 36)
+            [void](Add-WebApprovalCommandParameter -Command $find -DbType 0 -Name "@p3" -Value $webId -Kind Text -Size 36)
+        }
+        $existingObj = $find.ExecuteScalar()
+        if ($null -ne $existingObj -and $existingObj -ne [DBNull]::Value) { $existingId = ([string]$existingObj).Trim() }
+
+        if ($existingId) {
+            $trackingId = $existingId
+            $cmd = $ctx.connection.CreateCommand()
+            if ($dbType -eq 1) {
+                $cmd.CommandText = @"
+UPDATE dbo.BusyCloudSalesmanTransactionLocation
+SET SalesmanUserName=@salesman,
+    VoucherType=@voucherType,
+    ApprovalMode=@approvalMode,
+    WebApprovalId=@webApprovalId,
+    RequestedSeries=@requestedSeries,
+    RequestedVoucherNo=@requestedVoucherNo,
+    BusyVoucherNo=CASE WHEN @busyVoucherNo<>'' THEN @busyVoucherNo ELSE BusyVoucherNo END,
+    BusyVoucherCode=CASE WHEN @busyVoucherCode<>'' THEN @busyVoucherCode ELSE BusyVoucherCode END,
+    PartyName=@partyName,
+    Amount=@amount,
+    UpdatedAt=@updatedAt
+WHERE Id=@id
+"@
+                $params = @(
+                    @("@salesman",$SalesmanUserName.Trim(),"Text",100), @("@voucherType",$vchType,"Int",0),
+                    @("@approvalMode",$mode,"Text",12), @("@webApprovalId",$webId,"Text",36),
+                    @("@requestedSeries",$requestedSeries,"Text",100), @("@requestedVoucherNo",$requestedVoucherNo,"Text",100),
+                    @("@busyVoucherNo",$busyVoucherNo,"Text",100), @("@busyVoucherCode",$busyVoucherCode,"Text",50),
+                    @("@partyName",([string]$summary.partyName),"Text",255), @("@amount",([decimal]$summary.amount),"Decimal",0),
+                    @("@updatedAt",$nowUtc,"Date",0), @("@id",$trackingId,"Text",36)
+                )
+                foreach ($p in $params) { [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name $p[0] -Value $p[1] -Kind $p[2] -Size $p[3]) }
+            }
+            else {
+                $cmd.CommandText = @"
+UPDATE [BusyCloudSalesmanTransactionLocation]
+SET [SalesmanUserName]=?, [VoucherType]=?, [ApprovalMode]=?, [WebApprovalId]=?,
+    [RequestedSeries]=?, [RequestedVoucherNo]=?,
+    [BusyVoucherNo]=IIF(?<>'', ?, [BusyVoucherNo]),
+    [BusyVoucherCode]=IIF(?<>'', ?, [BusyVoucherCode]),
+    [PartyName]=?, [Amount]=?, [UpdatedAt]=?
+WHERE [Id]=?
+"@
+                $vals = @(
+                    $SalesmanUserName.Trim(),$vchType,$mode,$webId,$requestedSeries,$requestedVoucherNo,
+                    $busyVoucherNo,$busyVoucherNo,$busyVoucherCode,$busyVoucherCode,
+                    [string]$summary.partyName,[double]$summary.amount,$nowUtc,$trackingId
+                )
+                $kinds = @('Text','Int','Text','Text','Text','Text','Text','Text','Text','Text','Text','Decimal','Date','Text')
+                for ($i=0; $i -lt $vals.Count; $i++) { [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name ("@p"+($i+1)) -Value $vals[$i] -Kind $kinds[$i]) }
+            }
+            [void]$cmd.ExecuteNonQuery()
+        }
+        else {
+            $cmd = $ctx.connection.CreateCommand()
+            if ($dbType -eq 1) {
+                $cmd.CommandText = @"
+INSERT INTO dbo.BusyCloudSalesmanTransactionLocation
+(
+    Id, ClientRequestId, SalesmanUserName, VoucherType, ApprovalMode, WebApprovalId,
+    RequestedSeries, RequestedVoucherNo, BusyVoucherNo, BusyVoucherCode,
+    PartyName, Amount, Latitude, Longitude, LocationAccuracy,
+    LocationCapturedAt, LocationLocalDate, SubmittedAt, CreatedAt, UpdatedAt
+)
+VALUES
+(
+    @id, @clientRequestId, @salesman, @voucherType, @approvalMode, @webApprovalId,
+    @requestedSeries, @requestedVoucherNo, @busyVoucherNo, @busyVoucherCode,
+    @partyName, @amount, @latitude, @longitude, @accuracy,
+    @capturedAt, @localDate, @submittedAt, @createdAt, @updatedAt
+)
+"@
+                $params = @(
+                    @("@id",$trackingId,"Text",36), @("@clientRequestId",$clientRequestId,"Text",36),
+                    @("@salesman",$SalesmanUserName.Trim(),"Text",100), @("@voucherType",$vchType,"Int",0),
+                    @("@approvalMode",$mode,"Text",12), @("@webApprovalId",$webId,"Text",36),
+                    @("@requestedSeries",$requestedSeries,"Text",100), @("@requestedVoucherNo",$requestedVoucherNo,"Text",100),
+                    @("@busyVoucherNo",$busyVoucherNo,"Text",100), @("@busyVoucherCode",$busyVoucherCode,"Text",50),
+                    @("@partyName",([string]$summary.partyName),"Text",255), @("@amount",([decimal]$summary.amount),"Decimal",0),
+                    @("@latitude",([double]$location.latitude),"GeoDecimal",0), @("@longitude",([double]$location.longitude),"GeoDecimal",0),
+                    @("@accuracy",([double]$location.accuracy),"Decimal",0), @("@capturedAt",([datetime]$location.capturedAt),"Date",0),
+                    @("@localDate",([string]$location.localDate),"Text",10), @("@submittedAt",$submittedAt,"Date",0),
+                    @("@createdAt",$nowUtc,"Date",0), @("@updatedAt",$nowUtc,"Date",0)
+                )
+                foreach ($p in $params) { [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name $p[0] -Value $p[1] -Kind $p[2] -Size $p[3]) }
+            }
+            else {
+                $cmd.CommandText = @"
+INSERT INTO [BusyCloudSalesmanTransactionLocation]
+(
+    [Id], [ClientRequestId], [SalesmanUserName], [VoucherType], [ApprovalMode], [WebApprovalId],
+    [RequestedSeries], [RequestedVoucherNo], [BusyVoucherNo], [BusyVoucherCode],
+    [PartyName], [Amount], [Latitude], [Longitude], [LocationAccuracy],
+    [LocationCapturedAt], [LocationLocalDate], [SubmittedAt], [CreatedAt], [UpdatedAt]
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"@
+                $vals = @(
+                    $trackingId,$clientRequestId,$SalesmanUserName.Trim(),$vchType,$mode,$webId,$requestedSeries,$requestedVoucherNo,
+                    $busyVoucherNo,$busyVoucherCode,[string]$summary.partyName,[double]$summary.amount,[double]$location.latitude,[double]$location.longitude,
+                    [double]$location.accuracy,[datetime]$location.capturedAt,[string]$location.localDate,$submittedAt,$nowUtc,$nowUtc
+                )
+                $kinds = @('Text','Text','Text','Int','Text','Text','Text','Text','Text','Text','Text','Decimal','GeoDecimal','GeoDecimal','Decimal','Date','Text','Date','Date','Date')
+                for ($i=0; $i -lt $vals.Count; $i++) { [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name ("@p"+($i+1)) -Value $vals[$i] -Kind $kinds[$i]) }
+            }
+            [void]$cmd.ExecuteNonQuery()
+        }
+
+        return @{
+            success = $true
+            data = @{
+                id = $trackingId
+                clientRequestId = $clientRequestId
+                salesmanUserName = $SalesmanUserName.Trim()
+                voucherType = $vchType
+                approvalMode = $mode
+                webApprovalId = $webId
+                busyVoucherNo = $busyVoucherNo
+                busyVoucherCode = $busyVoucherCode
+                latitude = [double]$location.latitude
+                longitude = [double]$location.longitude
+                accuracy = [double]$location.accuracy
+                capturedAt = $location.capturedAt
+                localDate = [string]$location.localDate
+                submittedAt = $submittedAt
+            }
+        }
+    }
+    catch { return @{ success=$false; error=$_.Exception.Message } }
+    finally { Close-WebApprovalDbContext -Context $ctx }
+}
+
+function Get-SalesTrackingSalesmen {
+    param(
+        [string]$RequesterUserName,
+        [bool]$IsAdmin = $false,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RequesterUserName)) {
+        return @{ success=$false; httpStatus=401; error="Authenticated user is required." }
+    }
+
+    $ctx = $null
+    $rdr = $null
+    try {
+        $ctx = Get-WebApprovalPermanentDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        [void](Ensure-WebApprovalPermanentTables -Context $ctx)
+        $items = @()
+
+        $cmd = $ctx.connection.CreateCommand()
+        if ($IsAdmin) {
+            $cmd.CommandText = "SELECT [Name] FROM [MobileUserPreference] WHERE [B35]<>0 AND ([B36]=0 OR [B36] IS NULL) ORDER BY [Name]"
+        }
+        else {
+            $managerSafe = $RequesterUserName.Trim().Replace("'", "''")
+            $cmd.CommandText = @"
+SELECT [SalesmanUserName]
+FROM [BusyCloudSalesmanManager]
+WHERE [ManagerUserName]='$managerSafe'
+  AND [IsActive]<>0
+  AND [CanTrackLocation]<>0
+ORDER BY [SalesmanUserName]
+"@
+        }
+
+        $rdr = $cmd.ExecuteReader()
+        while ($rdr.Read()) {
+            if (-not $rdr.IsDBNull(0)) {
+                $name = ([string]$rdr.GetValue(0)).Trim()
+                if ($name -and $items -notcontains $name) { $items += $name }
+            }
+        }
+
+        return @{ success=$true; data=@{ salesmen=@($items); isAdmin=[bool]$IsAdmin } }
+    }
+    catch { return @{ success=$false; httpStatus=500; error=$_.Exception.Message } }
+    finally {
+        if ($rdr) { try { $rdr.Close() } catch {}; try { $rdr.Dispose() } catch {} }
+        Close-WebApprovalDbContext -Context $ctx
+    }
+}
+
+function Get-SalesTrackingDistanceMetres {
+    param(
+        [double]$Latitude1,
+        [double]$Longitude1,
+        [double]$Latitude2,
+        [double]$Longitude2
+    )
+
+    $earthRadius = 6371000.0
+    $toRadians = [Math]::PI / 180.0
+    $lat1 = $Latitude1 * $toRadians
+    $lat2 = $Latitude2 * $toRadians
+    $dLat = ($Latitude2 - $Latitude1) * $toRadians
+    $dLon = ($Longitude2 - $Longitude1) * $toRadians
+
+    $a = [Math]::Sin($dLat / 2.0) * [Math]::Sin($dLat / 2.0) +
+         [Math]::Cos($lat1) * [Math]::Cos($lat2) *
+         [Math]::Sin($dLon / 2.0) * [Math]::Sin($dLon / 2.0)
+
+    $a = [Math]::Max(0.0, [Math]::Min(1.0, $a))
+    return 2.0 * $earthRadius * [Math]::Asin([Math]::Sqrt($a))
+}
+
+function Add-SalesTrackingForegroundPoint {
+    param(
+        [string]$SalesmanUserName,
+        $Data,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = "",
+        [double]$MaximumAccuracyMetres = 100,
+        [double]$MovementThresholdMetres = 100,
+        [int]$HeartbeatSeconds = 180
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SalesmanUserName)) {
+        return @{ success=$false; httpStatus=401; error="Authenticated Salesman is required." }
+    }
+
+    $roleResult = Get-WebApprovalUserRole `
+        -UserName $SalesmanUserName `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $roleResult.success) {
+        return @{
+            success = $false
+            httpStatus = 500
+            error = if ($roleResult.error) { [string]$roleResult.error } else { "Could not read Sales Workflow role." }
+        }
+    }
+
+    $role = 0
+    try { $role = [int]$roleResult.data.role } catch {}
+    if ($role -ne $script:WebApprovalRoleSalesman) {
+        return @{ success=$false; httpStatus=403; error="Salesman Web Approval role is required to publish route locations." }
+    }
+
+    # Reuse the same strong validation as transaction submission location:
+    # coordinates, <=100m accuracy, current timestamp, and YYYY-MM-DD local date.
+    $locationEnvelope = @{ location = $Data }
+    $locationResult = Get-WebApprovalSubmissionLocation `
+        -Data $locationEnvelope `
+        -MaximumAccuracyMetres $MaximumAccuracyMetres
+
+    if (-not $locationResult.success) {
+        return $locationResult
+    }
+
+    $point = $locationResult.data
+    $ctx = $null
+    $rdr = $null
+
+    try {
+        $ctx = Get-WebApprovalFiscalDbContext `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        [void](Ensure-WebApprovalFiscalTables -Context $ctx)
+
+        $safeUser = $SalesmanUserName.Trim().Replace("'", "''")
+        $safeDate = ([string]$point.localDate).Replace("'", "''")
+
+        # Server-side duplicate/throttle guard. The client already applies the
+        # same 100m / 3-minute policy, but the backend enforces it as well.
+        $latestCmd = $ctx.connection.CreateCommand()
+        $latestCmd.CommandText = @"
+SELECT TOP 1 [Latitude], [Longitude], [Accuracy], [CapturedAt]
+FROM [BusyCloudSalesmanLocationPoint]
+WHERE [SalesmanUserName]='$safeUser'
+  AND [LocalDate]='$safeDate'
+ORDER BY [CapturedAt] DESC
+"@
+
+        $rdr = $latestCmd.ExecuteReader()
+        $latest = $null
+        if ($rdr.Read()) {
+            $latest = @{
+                latitude = [double](Read-WebApprovalReaderValue $rdr "Latitude" 0)
+                longitude = [double](Read-WebApprovalReaderValue $rdr "Longitude" 0)
+                accuracy = [double](Read-WebApprovalReaderValue $rdr "Accuracy" 0)
+                capturedAt = Read-WebApprovalReaderValue $rdr "CapturedAt" $null
+            }
+        }
+        try { $rdr.Close() } catch {}
+        try { $rdr.Dispose() } catch {}
+        $rdr = $null
+
+        if ($null -ne $latest -and $null -ne $latest.capturedAt) {
+            $latestAt = [datetime]$latest.capturedAt
+            $newAt = [datetime]$point.capturedAt
+
+            if ($newAt -le $latestAt) {
+                return @{
+                    success = $true
+                    skipped = $true
+                    reason = "NOT_NEWER"
+                    data = @{ capturedAt = $point.capturedAt }
+                }
+            }
+
+            $distance = Get-SalesTrackingDistanceMetres `
+                -Latitude1 ([double]$latest.latitude) `
+                -Longitude1 ([double]$latest.longitude) `
+                -Latitude2 ([double]$point.latitude) `
+                -Longitude2 ([double]$point.longitude)
+
+            $elapsedSeconds = ($newAt - $latestAt).TotalSeconds
+            if ($distance -lt $MovementThresholdMetres -and $elapsedSeconds -lt $HeartbeatSeconds) {
+                return @{
+                    success = $true
+                    skipped = $true
+                    reason = "THRESHOLD_NOT_REACHED"
+                    data = @{
+                        distanceMetres = [math]::Round($distance, 1)
+                        elapsedSeconds = [math]::Round($elapsedSeconds, 0)
+                    }
+                }
+            }
+        }
+
+        $id = [guid]::NewGuid().ToString()
+        $createdAt = [datetime]::UtcNow
+        $dbType = [int]$ctx.dbType
+        $insert = $ctx.connection.CreateCommand()
+
+        if ($dbType -eq 1) {
+            $insert.CommandText = @"
+INSERT INTO dbo.BusyCloudSalesmanLocationPoint
+(
+    Id, SalesmanUserName, Latitude, Longitude, Accuracy,
+    CapturedAt, LocalDate, CreatedAt
+)
+VALUES
+(
+    @id, @salesman, @latitude, @longitude, @accuracy,
+    @capturedAt, @localDate, @createdAt
+)
+"@
+            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 1 -Name "@id" -Value $id -Kind Text -Size 36)
+            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 1 -Name "@salesman" -Value $SalesmanUserName.Trim() -Kind Text -Size 100)
+            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 1 -Name "@latitude" -Value ([double]$point.latitude) -Kind Decimal)
+            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 1 -Name "@longitude" -Value ([double]$point.longitude) -Kind Decimal)
+            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 1 -Name "@accuracy" -Value ([double]$point.accuracy) -Kind Decimal)
+            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 1 -Name "@capturedAt" -Value ([datetime]$point.capturedAt) -Kind Date)
+            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 1 -Name "@localDate" -Value ([string]$point.localDate) -Kind Text -Size 10)
+            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 1 -Name "@createdAt" -Value $createdAt -Kind Date)
+        }
+        else {
+            $insert.CommandText = @"
+INSERT INTO [BusyCloudSalesmanLocationPoint]
+(
+    [Id], [SalesmanUserName], [Latitude], [Longitude], [Accuracy],
+    [CapturedAt], [LocalDate], [CreatedAt]
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+"@
+            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p1" -Value $id -Kind Text -Size 36)
+            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p2" -Value $SalesmanUserName.Trim() -Kind Text -Size 100)
+            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p3" -Value ([double]$point.latitude) -Kind Decimal)
+            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p4" -Value ([double]$point.longitude) -Kind Decimal)
+            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p5" -Value ([double]$point.accuracy) -Kind Decimal)
+            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p6" -Value ([datetime]$point.capturedAt) -Kind Date)
+            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p7" -Value ([string]$point.localDate) -Kind Text -Size 10)
+            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p8" -Value $createdAt -Kind Date)
+        }
+
+        [void]$insert.ExecuteNonQuery()
+
+        return @{
+            success = $true
+            skipped = $false
+            data = @{
+                id = $id
+                salesmanUserName = $SalesmanUserName.Trim()
+                latitude = [double]$point.latitude
+                longitude = [double]$point.longitude
+                accuracy = [double]$point.accuracy
+                capturedAt = $point.capturedAt
+                localDate = [string]$point.localDate
+            }
+        }
+    }
+    catch {
+        return @{ success=$false; httpStatus=500; error=$_.Exception.Message }
+    }
+    finally {
+        if ($rdr) {
+            try { $rdr.Close() } catch {}
+            try { $rdr.Dispose() } catch {}
+        }
+        Close-WebApprovalDbContext -Context $ctx
+    }
+}
+
+function Get-SalesTrackingDay {
+    param(
+        [string]$RequesterUserName,
+        [string]$SalesmanUserName,
+        [string]$Date,
+        [bool]$IsAdmin = $false,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RequesterUserName)) {
+        return @{ success=$false; httpStatus=401; error="Authenticated user is required." }
+    }
+    if ([string]::IsNullOrWhiteSpace($SalesmanUserName)) {
+        return @{ success=$false; httpStatus=400; error="salesmanUserName is required." }
+    }
+    if ($Date -notmatch '^\d{4}-\d{2}-\d{2}$') {
+        return @{ success=$false; httpStatus=400; error="date must be YYYY-MM-DD." }
+    }
+    $parsedDate = [datetime]::MinValue
+    if (-not [datetime]::TryParseExact($Date, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsedDate)) {
+        return @{ success=$false; httpStatus=400; error="date is invalid." }
+    }
+
+    if (-not $IsAdmin) {
+        $access = Test-WebApprovalManagerTrackingAccess -SalesmanUserName $SalesmanUserName -ManagerUserName $RequesterUserName -InstanceId $InstanceId -CompanyCode $CompanyCode
+        if (-not $access.success) { return @{ success=$false; httpStatus=500; error=$access.error } }
+        if (-not $access.allowed) { return @{ success=$false; httpStatus=403; error="You do not have permission to track this Salesman." } }
+    }
+
+    $ctx = $null
+    $rdr = $null
+    try {
+        $ctx = Get-WebApprovalFiscalDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        [void](Ensure-WebApprovalFiscalTables -Context $ctx)
+        $salesmanSafe = $SalesmanUserName.Trim().Replace("'", "''")
+        $dateSafe = $Date.Replace("'", "''")
+
+        $cmd = $ctx.connection.CreateCommand()
+        $cmd.CommandText = @"
+SELECT
+    [Id], [SalesmanUserName], [VoucherType], [ApprovalMode], [WebApprovalId],
+    [RequestedSeries], [RequestedVoucherNo], [PartyName], [Amount],
+    [BusyVoucherNo], [BusyVoucherCode],
+    [Latitude], [Longitude], [LocationAccuracy], [LocationCapturedAt], [LocationLocalDate],
+    [SubmittedAt]
+FROM [BusyCloudSalesmanTransactionLocation]
+WHERE [SalesmanUserName]='$salesmanSafe'
+  AND [LocationLocalDate]='$dateSafe'
+  AND [Latitude] IS NOT NULL
+  AND [Longitude] IS NOT NULL
+ORDER BY [SubmittedAt], [LocationCapturedAt]
+"@
+        $rdr = $cmd.ExecuteReader()
+        $items = @()
+        $counts = @{}
+
+        while ($rdr.Read()) {
+            $id = [string](Read-WebApprovalReaderValue $rdr "Id" "")
+            $voucherType = [int](Read-WebApprovalReaderValue $rdr "VoucherType" 0)
+            $key = [string]$voucherType
+            if (-not $counts.ContainsKey($key)) { $counts[$key] = 0 }
+            $counts[$key] = [int]$counts[$key] + 1
+
+            $approvalMode = ([string](Read-WebApprovalReaderValue $rdr "ApprovalMode" "NONE")).Trim().ToUpperInvariant()
+            if ($approvalMode -notin @("NONE","BUSY","WEB","BOTH")) { $approvalMode = "NONE" }
+            $webApprovalId = ([string](Read-WebApprovalReaderValue $rdr "WebApprovalId" "")).Trim()
+            $busyVoucherNo = ([string](Read-WebApprovalReaderValue $rdr "BusyVoucherNo" "")).Trim()
+            $requestedVoucherNo = ([string](Read-WebApprovalReaderValue $rdr "RequestedVoucherNo" "")).Trim()
+
+            $items += @{
+                id = $id
+                reference = if ($webApprovalId) {
+                    if ($webApprovalId.Length -ge 8) { "WA-" + $webApprovalId.Substring(0,8).ToUpperInvariant() } else { $webApprovalId }
+                } elseif ($busyVoucherNo) { $busyVoucherNo } elseif ($requestedVoucherNo) { $requestedVoucherNo } else { $id }
+                submittedBy = ([string](Read-WebApprovalReaderValue $rdr "SalesmanUserName" "")).Trim()
+                voucherType = $voucherType
+                approvalMode = $approvalMode
+                webApprovalId = $webApprovalId
+                requestedSeries = [string](Read-WebApprovalReaderValue $rdr "RequestedSeries" "")
+                requestedVoucherNo = $requestedVoucherNo
+                partyName = [string](Read-WebApprovalReaderValue $rdr "PartyName" "")
+                amount = [double](Read-WebApprovalReaderValue $rdr "Amount" 0)
+                busyVoucherNo = $busyVoucherNo
+                busyVoucherCode = [string](Read-WebApprovalReaderValue $rdr "BusyVoucherCode" "")
+                latitude = [double](Read-WebApprovalReaderValue $rdr "Latitude" 0)
+                longitude = [double](Read-WebApprovalReaderValue $rdr "Longitude" 0)
+                accuracy = [double](Read-WebApprovalReaderValue $rdr "LocationAccuracy" 0)
+                capturedAt = Read-WebApprovalReaderValue $rdr "LocationCapturedAt" $null
+                localDate = [string](Read-WebApprovalReaderValue $rdr "LocationLocalDate" "")
+                submittedAt = Read-WebApprovalReaderValue $rdr "SubmittedAt" $null
+            }
+        }
+
+        $startAt = if ($items.Count -gt 0) {
+            if ($items[0].submittedAt) { $items[0].submittedAt } else { $items[0].capturedAt }
+        } else { $null }
+        $endAt = if ($items.Count -gt 0) {
+            $lastItem = $items[$items.Count - 1]
+            if ($lastItem.submittedAt) { $lastItem.submittedAt } else { $lastItem.capturedAt }
+        } else { $null }
+
+        if ($rdr) {
+            try { $rdr.Close() } catch {}
+            try { $rdr.Dispose() } catch {}
+            $rdr = $null
+        }
+
+        $routeCmd = $ctx.connection.CreateCommand()
+        $routeCmd.CommandText = @"
+SELECT
+    [Id], [SalesmanUserName], [Latitude], [Longitude], [Accuracy],
+    [CapturedAt], [LocalDate]
+FROM [BusyCloudSalesmanLocationPoint]
+WHERE [SalesmanUserName]='$salesmanSafe'
+  AND [LocalDate]='$dateSafe'
+ORDER BY [CapturedAt]
+"@
+
+        $rdr = $routeCmd.ExecuteReader()
+        $routePoints = @()
+        while ($rdr.Read()) {
+            $routePoints += @{
+                id = [string](Read-WebApprovalReaderValue $rdr "Id" "")
+                salesmanUserName = ([string](Read-WebApprovalReaderValue $rdr "SalesmanUserName" "")).Trim()
+                latitude = [double](Read-WebApprovalReaderValue $rdr "Latitude" 0)
+                longitude = [double](Read-WebApprovalReaderValue $rdr "Longitude" 0)
+                accuracy = [double](Read-WebApprovalReaderValue $rdr "Accuracy" 0)
+                capturedAt = Read-WebApprovalReaderValue $rdr "CapturedAt" $null
+                localDate = [string](Read-WebApprovalReaderValue $rdr "LocalDate" "")
+            }
+        }
+
+        $routeStartAt = if ($routePoints.Count -gt 0) { $routePoints[0].capturedAt } else { $null }
+        $routeEndAt = if ($routePoints.Count -gt 0) { $routePoints[$routePoints.Count - 1].capturedAt } else { $null }
+
+        return @{
+            success = $true
+            data = @{
+                salesmanUserName = $SalesmanUserName.Trim()
+                date = $Date
+                totalTransactions = $items.Count
+                voucherCounts = $counts
+                startAt = $startAt
+                endAt = $endAt
+                transactions = @($items)
+                routePointCount = $routePoints.Count
+                routeStartAt = $routeStartAt
+                routeEndAt = $routeEndAt
+                routePoints = @($routePoints)
+            }
+        }
+    }
+    catch { return @{ success=$false; httpStatus=500; error=$_.Exception.Message } }
+    finally {
+        if ($rdr) { try { $rdr.Close() } catch {}; try { $rdr.Dispose() } catch {} }
+        Close-WebApprovalDbContext -Context $ctx
+    }
+}
+
+# =============================================================================
+# BUSYCLOUD WEB APPROVAL - ROLE-AWARE VOUCHER LIST + SALESMAN PENDING EDIT
+# =============================================================================
+function Get-WebApprovalWorkflowStatusLabel {
+    param($Record)
+    $approval = ([string]$Record.approvalStatus).Trim().ToUpperInvariant()
+    $sync = ([string]$Record.syncStatus).Trim().ToUpperInvariant()
+
+    if ($sync -eq "SYNCED") { return "SYNCED" }
+    if ($sync -eq "REVIEW_REQUIRED") { return "NEEDS_REVIEW" }
+    if ($sync -eq "FAILED") { return "FAILED" }
+    if ($approval -eq "APPROVED") { return "APPROVED" }
+    if ($approval -eq "REJECTED") { return "REJECTED" }
+    return "PENDING"
+}
+
+function Convert-WebApprovalToVoucherListItem {
+    param(
+        $Record,
+        [int]$Role,
+        [bool]$NormalModifyAllowed,
+        [bool]$ManagerEditAllowed
+    )
+
+    $workflowStatus = Get-WebApprovalWorkflowStatusLabel -Record $Record
+    $syncStatus = ([string]$Record.syncStatus).Trim().ToUpperInvariant()
+    $approvalStatus = ([string]$Record.approvalStatus).Trim().ToUpperInvariant()
+    $requestedNo = ([string]$Record.requestedVoucherNo).Trim()
+    $busyNo = ([string]$Record.busyVoucherNo).Trim()
+
+    $displayNo = $requestedNo
+    if ($syncStatus -eq "SYNCED" -and -not [string]::IsNullOrWhiteSpace($busyNo)) {
+        $displayNo = $busyNo
+    }
+
+    $dateText = ""
+    try {
+        if ($null -ne $Record.voucherDate -and -not [string]::IsNullOrWhiteSpace([string]$Record.voucherDate)) {
+            $dateText = ([datetime]$Record.voucherDate).ToString("dd-MM-yyyy")
+        }
+    }
+    catch {
+        $dateText = [string]$Record.voucherDate
+    }
+
+    $salesmanCanEdit = $false
+    if (
+        $Role -eq $script:WebApprovalRoleSalesman -and
+        $NormalModifyAllowed -and
+        $approvalStatus -eq "PENDING" -and
+        $syncStatus -eq "NOT_READY"
+    ) {
+        $salesmanCanEdit = $true
+    }
+
+    $managerCanEdit = $false
+    if (
+        $Role -eq $script:WebApprovalRoleSalesManager -and
+        $ManagerEditAllowed -and
+        $approvalStatus -eq "PENDING" -and
+        $syncStatus -eq "NOT_READY"
+    ) {
+        $managerCanEdit = $true
+    }
+
+    $canEdit = ($salesmanCanEdit -or $managerCanEdit)
+    $canManage = ($Role -eq $script:WebApprovalRoleSalesManager)
+
+    $canPrint = $false
+    if ($syncStatus -eq "SYNCED" -and -not [string]::IsNullOrWhiteSpace($busyNo)) {
+        $canPrint = $true
+    }
+
+    $locked = $false
+    if ($Role -eq $script:WebApprovalRoleSalesman -and -not $salesmanCanEdit) {
+        $locked = $true
+    }
+    elseif ($Role -eq $script:WebApprovalRoleSalesManager -and -not $managerCanEdit) {
+        $locked = $true
+    }
+
+    $debitAccount = ""
+    $creditAccount = ""
+    if ([int]$Record.voucherType -eq 14) {
+        $debitAccount = "-"
+        $creditAccount = [string]$Record.partyName
+    }
+
+    return @{
+        id = [string]$Record.id
+        webApprovalId = [string]$Record.id
+        source = "WEB_APPROVAL"
+        workflowStatus = $workflowStatus
+        approvalStatus = $approvalStatus
+        syncStatus = $syncStatus
+        submittedBy = [string]$Record.submittedBy
+        vchNo = $displayNo
+        requestedVoucherNo = $requestedNo
+        busyVoucherNo = $busyNo
+        vchSeries = [string]$Record.requestedSeries
+        date = $dateText
+        party = [string]$Record.partyName
+        party2 = ""
+        debitAccount = $debitAccount
+        creditAccount = $creditAccount
+        amount = [double]$Record.amount
+        voucherType = [int]$Record.voucherType
+        canEdit = $canEdit
+        canManage = $canManage
+        canPrint = $canPrint
+        locked = $locked
+    }
+}
+
+function Get-WebApprovalVoucherListForUser {
+    param(
+        [string]$UserName,[int]$VchType,[string]$FromDate="",[string]$ToDate="",
+        [string]$InstanceId="",[string]$CompanyCode=""
+    )
+
+    $user=([string]$UserName).Trim()
+    if(-not $user){return @{success=$false;httpStatus=401;errorCode="AUTH_REQUIRED";error="Authenticated BUSY user is required."}}
+    if($VchType -le 0){return @{success=$false;httpStatus=400;errorCode="VOUCHER_TYPE_REQUIRED";error="vchType is required."}}
+
+    $modeResult=Get-SalesTrackingApprovalMode -VchType $VchType -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if(-not $modeResult.success){return @{success=$false;httpStatus=500;error=$modeResult.error}}
+
+    $approvalMode=[string]$modeResult.data.approvalMode
+    if(-not [bool]$modeResult.data.webApprovalRequired){
+        return @{success=$true;data=@{active=$false;approvalMode=$approvalMode;role=0;roleName="NONE";items=@();count=0}}
+    }
+
+    $roleResult=Get-WebApprovalUserRole -UserName $user -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if (-not $roleResult.success) {
+        $roleError = "Could not resolve Sales Workflow role."
+        if ($roleResult.error) {
+            $roleError = [string]$roleResult.error
+        }
+
+        return @{
+            success = $false
+            httpStatus = 500
+            error = $roleError
+        }
+    }
+    $role=[int]$roleResult.data.role
+
+    if($role -notin @($script:WebApprovalRoleSalesman,$script:WebApprovalRoleSalesManager)){
+        return @{success=$true;data=@{active=$false;approvalMode=$approvalMode;role=$role;roleName=(Get-WebApprovalRoleName -Role $role);items=@();count=0}}
+    }
+
+    $normalModifyAllowed=$false
+    $modify=Test-VoucherModifyPermissionForUser -UserName $user -VchType $VchType -IsAdmin:$false -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if($modify.success){$normalModifyAllowed=[bool]$modify.allowed}
+
+    # B37 / canEditItems is the dedicated Web Approval manager edit permission.
+    # It applies only while the workflow row is still PENDING + NOT_READY.
+    $managerEditAllowed=$false
+    if($role -eq $script:WebApprovalRoleSalesManager){
+        try { $managerEditAllowed=[bool]$roleResult.data.canEditItems } catch {}
+    }
+
+    if($role -eq $script:WebApprovalRoleSalesman){
+        $queue=Get-WebApprovalMySubmissions -UserName $user -Status "ALL" -Search "" -VchType $VchType -FromDate $FromDate -ToDate $ToDate -Page 1 -PageSize 2000 -InstanceId $InstanceId -CompanyCode $CompanyCode
+    }else{
+        $queue=Get-WebApprovalAssignedQueue -ManagerUserName $user -Status "ALL" -Search "" -VchType $VchType -Salesman "" -FromDate $FromDate -ToDate $ToDate -Page 1 -PageSize 2000 -InstanceId $InstanceId -CompanyCode $CompanyCode
+    }
+
+    if(-not $queue.success){return $queue}
+
+    $items = @()
+    foreach ($row in @($queue.data.items)) {
+        $items += Convert-WebApprovalToVoucherListItem `
+            -Record $row `
+            -Role $role `
+            -NormalModifyAllowed:$normalModifyAllowed `
+            -ManagerEditAllowed:$managerEditAllowed
+    }
+
+    $assignedSalesmen = @()
+    if ($role -eq $script:WebApprovalRoleSalesManager) {
+        $assignedSalesmen = @($queue.data.assignedSalesmen)
+    }
+
+    return @{success=$true;data=@{
+        active=$true
+        approvalMode=$approvalMode
+        role=$role
+        roleName=(Get-WebApprovalRoleName -Role $role)
+        items=@($items)
+        count=@($items).Count
+        assignedSalesmen = $assignedSalesmen
+    }}
+}
+
+function Update-WebApprovalPendingSubmissionBySalesman {
+    param(
+        [string]$Id,[string]$SalesmanUserName,$Payload,
+        [string]$InstanceId="",[string]$CompanyCode=""
+    )
+
+    $idText=([string]$Id).Trim()
+    $user=([string]$SalesmanUserName).Trim()
+    if(-not $idText -or $null -eq $Payload){return @{success=$false;httpStatus=400;errorCode="INVALID_REQUEST";error="Web Approval id and payload are required."}}
+
+    $roleResult=Get-WebApprovalUserRole -UserName $user -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if(-not $roleResult.success){return @{success=$false;httpStatus=500;error="Could not resolve workflow role."}}
+    if([int]$roleResult.data.role -ne $script:WebApprovalRoleSalesman){
+        return @{success=$false;httpStatus=403;errorCode="SALESMAN_REQUIRED";error="Only the submitting Salesman can edit a pending Web Approval voucher."}
+    }
+
+    $ctx=$null;$tx=$null
+    try{
+        $ctx=Get-WebApprovalFiscalDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        [void](Ensure-WebApprovalManagerEditFiscalSchema -Context $ctx)
+        $record=Get-WebApprovalRecordByIdInternal -Context $ctx -Id $idText
+
+        if($null -eq $record){return @{success=$false;httpStatus=404;errorCode="WEB_APPROVAL_NOT_FOUND";error="Web Approval transaction was not found."}}
+        if(-not ([string]$record.SubmittedBy).Trim().Equals($user,[System.StringComparison]::OrdinalIgnoreCase)){
+            return @{success=$false;httpStatus=403;errorCode="NOT_SUBMITTER";error="You can only edit Web Approval transactions submitted by your user."}
+        }
+
+        $approvalStatus=([string]$record.ApprovalStatus).Trim().ToUpperInvariant()
+        $syncStatus=([string]$record.SyncStatus).Trim().ToUpperInvariant()
+        if ($approvalStatus -ne "PENDING" -or $syncStatus -ne "NOT_READY") {
+            $lockMessage = "This voucher is locked because the Sales Manager has already acted on it."
+            if ($syncStatus -eq "SYNCED") {
+                $lockMessage = "This voucher is locked because it has already been synchronized to BUSY."
+            }
+
+            return @{
+                success = $false
+                httpStatus = 409
+                errorCode = "WEB_APPROVAL_EDIT_LOCKED"
+                error = $lockMessage
+            }
+        }
+
+        $vchType=[int]$record.VoucherType
+        $modify=Test-VoucherModifyPermissionForUser -UserName $user -VchType $vchType -IsAdmin:$false -InstanceId $InstanceId -CompanyCode $CompanyCode
+        if(-not $modify.success){return @{success=$false;httpStatus=500;error="Could not validate voucher Modify permission."}}
+        if(-not $modify.allowed){return @{success=$false;httpStatus=403;errorCode="MODIFY_PERMISSION_REQUIRED";error="You do not have Modify permission for this voucher type."}}
+
+        try{$Payload.vchType=$vchType}catch{}
+        try{$Payload.vchNo=([string]$record.RequestedVoucherNo).Trim()}catch{}
+        try{$Payload.vchSeries=([string]$record.RequestedSeries).Trim()}catch{}
+        foreach($name in @("clientRequestId","webApprovalRequestId","location")){
+            try{$Payload.PSObject.Properties.Remove($name)}catch{}
+        }
+
+        $newJson=Get-WebApprovalPayloadSnapshot -Data $Payload
+        $newHash=Get-WebApprovalSha256 -Text $newJson
+        $newAmount = Get-WebApprovalPendingPayloadAmount -Payload ($newJson | ConvertFrom-Json)
+
+        if ($newAmount -le 0 -and [double]$record.Amount -gt 0) {
+            $newAmount = [double]$record.Amount
+        }
+
+        $newParty =[string](Get-WebApprovalPropertyValue -Object $Payload -Names @("party","partyName") -DefaultValue ([string]$record.PartyName))
+        $now=[datetime]::UtcNow
+
+        $tx=$ctx.connection.BeginTransaction()
+        $cmd=$ctx.connection.CreateCommand();$cmd.Transaction=$tx
+        if([int]$ctx.dbType -eq 1){
+            $cmd.CommandText=@"
+UPDATE dbo.BusyCloudWebApproval
+SET PayloadJson=@payloadJson,PayloadHash=@payloadHash,
+    OriginalPayloadJson=@payloadJson,OriginalPayloadHash=@payloadHash,
+    PartyName=@partyName,Amount=@amount,
+    HasManagerChanges=0,ModifiedBy=NULL,ModifiedAt=NULL,
+    UpdatedAt=@updatedAt,Version=Version+1
+WHERE Id=@id AND SubmittedBy=@submittedBy
+  AND ApprovalStatus='PENDING' AND SyncStatus='NOT_READY'
+"@
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@payloadJson" -Value $newJson -Kind LongText)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@payloadHash" -Value $newHash -Kind Text -Size 64)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@partyName" -Value $newParty -Kind Text -Size 250)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@amount" -Value $newAmount -Kind Decimal)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@updatedAt" -Value $now -Kind Date)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@id" -Value $idText -Kind Text -Size 36)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@submittedBy" -Value $user -Kind Text -Size 100)
+        }else{
+            $cmd.CommandText=@"
+UPDATE [BusyCloudWebApproval]
+SET [PayloadJson]=?,[PayloadHash]=?,
+    [OriginalPayloadJson]=?,[OriginalPayloadHash]=?,
+    [PartyName]=?,[Amount]=?,
+    [HasManagerChanges]=0,[ModifiedBy]=NULL,[ModifiedAt]=NULL,
+    [UpdatedAt]=?,[Version]=[Version]+1
+WHERE [Id]=? AND [SubmittedBy]=?
+  AND [ApprovalStatus]='PENDING' AND [SyncStatus]='NOT_READY'
+"@
+            $vals=@(
+                @{v=$newJson;k='LongText';z=0},@{v=$newHash;k='Text';z=64},
+                @{v=$newJson;k='LongText';z=0},@{v=$newHash;k='Text';z=64},
+                @{v=$newParty;k='Text';z=250},@{v=$newAmount;k='Decimal';z=0},
+                @{v=$now;k='Date';z=0},@{v=$idText;k='Text';z=36},@{v=$user;k='Text';z=100}
+            )
+            for($i=0;$i -lt $vals.Count;$i++){
+                [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name ("@p"+($i+1)) -Value $vals[$i].v -Kind $vals[$i].k -Size $vals[$i].z)
+            }
+        }
+
+        if([int]$cmd.ExecuteNonQuery() -ne 1){
+            try{$tx.Rollback()}catch{};$tx=$null
+            return @{success=$false;httpStatus=409;errorCode="WEB_APPROVAL_EDIT_CONFLICT";error="This voucher changed while you were editing it. Refresh and try again."}
+        }
+
+        Add-WebApprovalActionRow -Context $ctx -Transaction $tx -WebApprovalId $idText -Action "SALESMAN_UPDATED" -ActionBy $user -Remarks "Salesman updated the pending Web Approval voucher before manager approval." -MetadataJson "" -ActionTime $now
+
+        $tx.Commit();$tx=$null
+        $updated=Get-WebApprovalRecordByIdInternal -Context $ctx -Id $idText
+        return @{success=$true;message="Pending Web Approval voucher updated.";data=@{transaction=(Convert-WebApprovalRecordToPublic -Record $updated -IncludePayload $true)}}
+    }catch{
+        if($tx){try{$tx.Rollback()}catch{}}
+        return @{success=$false;httpStatus=500;error=$_.Exception.Message}
+    }finally{
+        Close-WebApprovalDbContext -Context $ctx
+    }
+}
+
+# =============================================================================
+# SALES MANAGER FULL-FORM EDIT FOR PENDING WEB APPROVAL VOUCHERS
+# =============================================================================
+function Get-WebApprovalPendingPayloadAmount {
+    param($Payload)
+
+    if ($null -eq $Payload) {
+        return 0.0
+    }
+
+    # Inventory-style vouchers: amount is derived from item totals and sundries.
+    $items = @()
+    try {
+        if ($null -ne $Payload.items) {
+            $items = @($Payload.items)
+        }
+    }
+    catch {}
+
+    if ($items.Count -gt 0) {
+        return Get-WebApprovalRecalculatedAmount -Payload $Payload
+    }
+
+    # Account vouchers (Receipt / Payment / Contra / Journal):
+    # each posting contains { dc, amount }. The voucher amount is one balanced
+    # side of the journal, NOT zero and NOT the sum of both sides.
+    $accounts = @()
+    try {
+        if ($null -ne $Payload.accounts) {
+            $accounts = @($Payload.accounts)
+        }
+    }
+    catch {}
+
+    if ($accounts.Count -gt 0) {
+        $debitTotal = 0.0
+        $creditTotal = 0.0
+        $absoluteTotal = 0.0
+
+        foreach ($account in $accounts) {
+            $amount = 0.0
+            $dc = ""
+
+            # Use direct PSObject properties first. This is intentionally kept
+            # PowerShell 5.1-safe and avoids relying on helper behavior for the
+            # JSON-deserialized Receipt account rows.
+            try {
+                if ($null -ne $account.amount) {
+                    $amount = [Math]::Abs([double]$account.amount)
+                }
+            }
+            catch {
+                $amount = 0.0
+            }
+
+            try {
+                if ($null -ne $account.dc) {
+                    $dc = ([string]$account.dc).Trim().ToUpperInvariant()
+                }
+            }
+            catch {
+                $dc = ""
+            }
+
+            $absoluteTotal += $amount
+
+            if ($dc -eq "D") {
+                $debitTotal += $amount
+            }
+            elseif ($dc -eq "C") {
+                $creditTotal += $amount
+            }
+        }
+
+        # Normal balanced account voucher.
+        if ($debitTotal -gt 0 -or $creditTotal -gt 0) {
+            $sideTotal = [Math]::Max($debitTotal, $creditTotal)
+            return [Math]::Round($sideTotal, 2)
+        }
+
+        # Defensive fallback for a legacy/stored account payload where dc was
+        # absent but account amounts were retained. A balanced voucher stores
+        # the same economic amount on both sides, so half of absolute postings
+        # is the correct voucher total.
+        if ($absoluteTotal -gt 0) {
+            return [Math]::Round(($absoluteTotal / 2.0), 2)
+        }
+    }
+
+    # Last-resort scalar fields for legacy payloads.
+    $scalarAmount = 0.0
+    try {
+        if ($null -ne $Payload.amount) {
+            $scalarAmount = [double]$Payload.amount
+        }
+        elseif ($null -ne $Payload.netAmount) {
+            $scalarAmount = [double]$Payload.netAmount
+        }
+        elseif ($null -ne $Payload.totalAmount) {
+            $scalarAmount = [double]$Payload.totalAmount
+        }
+    }
+    catch {
+        $scalarAmount = 0.0
+    }
+
+    return [Math]::Round($scalarAmount, 2)
+}
+
+function Update-WebApprovalPendingSubmissionByManager {
+    param(
+        [string]$Id,
+        [string]$ManagerUserName,
+        $Payload,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $idText = ([string]$Id).Trim()
+    $manager = ([string]$ManagerUserName).Trim()
+
+    if ([string]::IsNullOrWhiteSpace($idText) -or $null -eq $Payload) {
+        return @{
+            success = $false
+            httpStatus = 400
+            errorCode = "INVALID_REQUEST"
+            error = "Web Approval id and payload are required."
+        }
+    }
+
+    # Dedicated manager edit permission (B37) is required.
+    $editPermission = Get-WebApprovalManagerEditPermission `
+        -ManagerUserName $manager `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $editPermission.success -or -not $editPermission.allowed) {
+        return @{
+            success = $false
+            allowed = $false
+            httpStatus = if ($editPermission.httpStatus) { [int]$editPermission.httpStatus } else { 403 }
+            errorCode = "MANAGER_EDIT_PERMISSION_REQUIRED"
+            error = if ($editPermission.error) { [string]$editPermission.error } else { "Sales Manager edit permission is required." }
+        }
+    }
+
+    # This also verifies that the voucher belongs to a Salesman assigned to
+    # the signed-in Sales Manager.
+    $detail = Get-WebApprovalDetailForManager `
+        -Id $idText `
+        -ManagerUserName $manager `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $detail.success -or $detail.allowed -eq $false) {
+        return $detail
+    }
+
+    $detailTransaction = $detail.data.transaction
+    $approvalStatus = ([string]$detailTransaction.approvalStatus).Trim().ToUpperInvariant()
+    $syncStatus = ([string]$detailTransaction.syncStatus).Trim().ToUpperInvariant()
+
+    if ($approvalStatus -ne "PENDING" -or $syncStatus -ne "NOT_READY") {
+        return @{
+            success = $false
+            allowed = $false
+            httpStatus = 409
+            errorCode = "WEB_APPROVAL_EDIT_LOCKED"
+            error = if ($approvalStatus -eq "APPROVED") {
+                "This voucher is locked because it has already been approved."
+            }
+            elseif ($syncStatus -eq "SYNCED") {
+                "This voucher is locked because it has already been synchronized to BUSY."
+            }
+            else {
+                "Only Pending Web Approval vouchers can be edited."
+            }
+        }
+    }
+
+    $ctx = $null
+    $tx = $null
+
+    try {
+        $ctx = Get-WebApprovalFiscalDbContext `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        [void](Ensure-WebApprovalManagerEditFiscalSchema -Context $ctx)
+
+        $record = Get-WebApprovalRecordByIdInternal -Context $ctx -Id $idText
+        if ($null -eq $record) {
+            return @{
+                success = $false
+                httpStatus = 404
+                errorCode = "WEB_APPROVAL_NOT_FOUND"
+                error = "Web Approval transaction was not found."
+            }
+        }
+
+        # Re-check state immediately before the write to prevent approval/edit races.
+        $approvalStatus = ([string]$record.ApprovalStatus).Trim().ToUpperInvariant()
+        $syncStatus = ([string]$record.SyncStatus).Trim().ToUpperInvariant()
+
+        if ($approvalStatus -ne "PENDING" -or $syncStatus -ne "NOT_READY") {
+            return @{
+                success = $false
+                httpStatus = 409
+                errorCode = "WEB_APPROVAL_EDIT_LOCKED"
+                error = if ($approvalStatus -eq "APPROVED") {
+                    "This voucher is locked because it has already been approved."
+                }
+                elseif ($syncStatus -eq "SYNCED") {
+                    "This voucher is locked because it has already been synchronized to BUSY."
+                }
+                else {
+                    "Only Pending Web Approval vouchers can be edited."
+                }
+            }
+        }
+
+        $vchType = [int]$record.VoucherType
+
+        # Workflow identity is immutable. The manager edits voucher content in
+        # the original voucher form, but cannot convert it into another voucher.
+        try { $Payload.vchType = $vchType } catch {}
+        try { $Payload.vchNo = ([string]$record.RequestedVoucherNo).Trim() } catch {}
+        try { $Payload.vchSeries = ([string]$record.RequestedSeries).Trim() } catch {}
+
+        foreach ($name in @("clientRequestId","webApprovalRequestId")) {
+            try { $Payload.PSObject.Properties.Remove($name) } catch {}
+        }
+
+        $newJson = Get-WebApprovalPayloadSnapshot -Data $Payload
+        $newHash = Get-WebApprovalSha256 -Text $newJson
+        $payloadObject = $newJson | ConvertFrom-Json
+        $newAmount = Get-WebApprovalPendingPayloadAmount -Payload $payloadObject
+
+        if ($newAmount -le 0 -and [double]$record.Amount -gt 0) {
+            $newAmount = [double]$record.Amount
+        }
+
+        $newParty = [string](
+            Get-WebApprovalPropertyValue `
+                -Object $Payload `
+                -Names @("party","partyName") `
+                -DefaultValue ([string]$record.PartyName)
+        )
+        $now = [datetime]::UtcNow
+
+        $tx = $ctx.connection.BeginTransaction()
+        $cmd = $ctx.connection.CreateCommand()
+        $cmd.Transaction = $tx
+
+        if ([int]$ctx.dbType -eq 1) {
+            $cmd.CommandText = @"
+UPDATE dbo.BusyCloudWebApproval
+SET PayloadJson=@payloadJson,
+    PayloadHash=@payloadHash,
+    PartyName=@partyName,
+    Amount=@amount,
+    HasManagerChanges=1,
+    ModifiedBy=@modifiedBy,
+    ModifiedAt=@modifiedAt,
+    UpdatedAt=@updatedAt,
+    Version=Version+1
+WHERE Id=@id
+  AND ApprovalStatus='PENDING'
+  AND SyncStatus='NOT_READY'
+"@
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@payloadJson" -Value $newJson -Kind LongText)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@payloadHash" -Value $newHash -Kind Text -Size 64)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@partyName" -Value $newParty -Kind Text -Size 250)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@amount" -Value $newAmount -Kind Decimal)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@modifiedBy" -Value $manager -Kind Text -Size 100)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@modifiedAt" -Value $now -Kind Date)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@updatedAt" -Value $now -Kind Date)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@id" -Value $idText -Kind Text -Size 36)
+        }
+        else {
+            $cmd.CommandText = @"
+UPDATE [BusyCloudWebApproval]
+SET [PayloadJson]=?,
+    [PayloadHash]=?,
+    [PartyName]=?,
+    [Amount]=?,
+    [HasManagerChanges]=1,
+    [ModifiedBy]=?,
+    [ModifiedAt]=?,
+    [UpdatedAt]=?,
+    [Version]=[Version]+1
+WHERE [Id]=?
+  AND [ApprovalStatus]='PENDING'
+  AND [SyncStatus]='NOT_READY'
+"@
+            $vals = @(
+                @{v=$newJson;k='LongText';z=0},
+                @{v=$newHash;k='Text';z=64},
+                @{v=$newParty;k='Text';z=250},
+                @{v=$newAmount;k='Decimal';z=0},
+                @{v=$manager;k='Text';z=100},
+                @{v=$now;k='Date';z=0},
+                @{v=$now;k='Date';z=0},
+                @{v=$idText;k='Text';z=36}
+            )
+            for ($i=0; $i -lt $vals.Count; $i++) {
+                [void](Add-WebApprovalCommandParameter `
+                    -Command $cmd `
+                    -DbType 0 `
+                    -Name ("@p"+($i+1)) `
+                    -Value $vals[$i].v `
+                    -Kind $vals[$i].k `
+                    -Size $vals[$i].z)
+            }
+        }
+
+        $affected = [int]$cmd.ExecuteNonQuery()
+        if ($affected -ne 1) {
+            try { $tx.Rollback() } catch {}
+            $tx = $null
+
+            return @{
+                success = $false
+                httpStatus = 409
+                errorCode = "WEB_APPROVAL_EDIT_CONFLICT"
+                error = "This voucher changed while you were editing it. Refresh the list and try again."
+            }
+        }
+
+        Add-WebApprovalActionRow `
+            -Context $ctx `
+            -Transaction $tx `
+            -WebApprovalId $idText `
+            -Action "MANAGER_UPDATED_FORM" `
+            -ActionBy $manager `
+            -Remarks "Sales Manager updated the pending voucher in the original voucher form." `
+            -MetadataJson "" `
+            -ActionTime $now
+
+        $tx.Commit()
+        $tx = $null
+
+        $updated = Get-WebApprovalRecordByIdInternal -Context $ctx -Id $idText
+
+        return @{
+            success = $true
+            message = "Pending Web Approval voucher updated by Sales Manager."
+            data = @{
+                transaction = Convert-WebApprovalRecordToPublic `
+                    -Record $updated `
+                    -IncludePayload $true
+            }
+        }
+    }
+    catch {
+        if ($tx) { try { $tx.Rollback() } catch {} }
+
+        return @{
+            success = $false
+            httpStatus = 500
+            error = $_.Exception.Message
+        }
+    }
+    finally {
+        Close-WebApprovalDbContext -Context $ctx
+    }
+}

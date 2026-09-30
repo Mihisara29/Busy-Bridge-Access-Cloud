@@ -707,7 +707,7 @@ ORDER BY Master1.Name
 function Get-AccountLookup {
     param(
         [string]$Search      = "",
-        [int]$Limit          = 50,
+        [int]$Limit          = 100,
         [string]$InstanceId  = "",
         [string]$CompanyCode = ""
     )
