@@ -2641,37 +2641,59 @@ GROUP BY
 
 
 # ============================================================
-# STOCK STATUS DIRECT ACCESS FAST PATH
+# STOCK STATUS DIRECT DATABASE FAST PATH
 # ============================================================
 # BUSY COM recordsets are reliable but expensive for company-wide
-# aggregate/index work.  auth_native.ps1 is loaded before reports.ps1
-# and already exposes Open-BdsConnection for Access companies.
+# aggregate/index work. auth_native.ps1/connection helpers are loaded
+# before reports.ps1 and expose direct SQL Server / Access connections.
 #
-# Use direct OLE DB only for READ-ONLY report queries. Voucher writes
-# remain on the existing BUSY APIs.
+# Use direct DB connections only for READ-ONLY report queries. Voucher
+# writes remain on the existing BUSY APIs.
 # ============================================================
 
 function Invoke-StockStatusDirectTable {
     param(
         [Parameter(Mandatory)]
-        [System.Data.OleDb.OleDbConnection]$Connection,
+        [System.Data.Common.DbConnection]$Connection,
 
         [Parameter(Mandatory)]
-        [string]$Sql
+        [string]$Sql,
+
+        [int]$Timeout = 180
     )
 
-    $command = $Connection.CreateCommand()
-    $command.CommandText = $Sql
-    $adapter = New-Object System.Data.OleDb.OleDbDataAdapter($command)
+    # IMPORTANT:
+    # Use a generic DbConnection reader instead of OleDbDataAdapter.
+    # Both System.Data.SqlClient.SqlConnection and OleDbConnection derive
+    # from DbConnection, so the same fast read path now works for:
+    #   * SQL Server companies
+    #   * Access/BDS companies
+    #
+    # This avoids routing large Stock Status GROUP BY queries through
+    # BUSY's COM GetRecordset bridge.
+    $command = $null
+    $reader = $null
     $table = New-Object System.Data.DataTable
 
     try {
-        [void]$adapter.Fill($table)
+        $command = $Connection.CreateCommand()
+        $command.CommandText = $Sql
+        $command.CommandTimeout = $Timeout
+
+        $reader = $command.ExecuteReader()
+        $table.Load($reader)
+
         return ,$table
     }
     finally {
-        try { $adapter.Dispose() } catch {}
-        try { $command.Dispose() } catch {}
+        if ($null -ne $reader) {
+            try { $reader.Close() } catch {}
+            try { $reader.Dispose() } catch {}
+        }
+
+        if ($null -ne $command) {
+            try { $command.Dispose() } catch {}
+        }
     }
 }
 
@@ -2770,7 +2792,7 @@ function Get-StockStatusStableHash {
 function Get-StockStatusMasterSignature {
     param(
         [Parameter(Mandatory)]
-        [System.Data.OleDb.OleDbConnection]$Connection
+        [System.Data.Common.DbConnection]$Connection
     )
 
     try {
@@ -2832,7 +2854,7 @@ function Get-StockStatusMasterSnapshotPath {
         $hash =
             Get-StockStatusStableHash `
                 -Text (
-                    "master-snapshot-v8|" +
+                    "master-snapshot-v11-single-snapshot|" +
                     $InstanceId +
                     "|" +
                     $CompanyCode
@@ -2867,15 +2889,23 @@ function Get-StockStatusReport {
         [bool]$ShowParentGroup         = $true,
         [int]$Page                     = 1,
         [int]$PageSize                 = 100,
+        [bool]$FastSnapshot            = $false,
         [string]$InstanceId            = "",
         [string]$CompanyCode           = ""
     )
 
     # ============================================================
-    # BUSY-LIKE SINGLE-PAGE STOCK STATUS ENGINE
+    # BUSY-LIKE LAZY VIEW STOCK STATUS ENGINE
     #
-    # One response powers the web app's Balances, Detailed,
-    # Columnar (MC-wise), Grouped and Hierarchical views.
+    # The frontend now requests only the ACTIVE report view.
+    #
+    #   balances      -> lazy request
+    #   detailed      -> lazy request
+    #   columnar      -> lazy request
+    #   grouped       -> lazy request
+    #   hierarchical  -> lazy request
+    #
+    # This avoids doing report work for views the user has not opened.
     #
     # Quantity source of truth:
     #   Opening stock : Tran4.D1
@@ -2988,27 +3018,107 @@ function Get-StockStatusReport {
     $directStockConn = $null
 
     try {
-        # For Access companies, use the current financial-year BDS directly
-        # for read-only aggregate/master queries. This bypasses the slow COM
-        # recordset bridge for thousands of rows.
-        $directStockContext =
-            Get-StockStatusDirectAccessContext `
-                -InstanceId $InstanceId `
-                -CompanyCode $CompanyCode `
-                -FinancialYearStart $fyYear
+        # --------------------------------------------------------
+        # DIRECT STOCK READ CONNECTION
+        # --------------------------------------------------------
+        # Stock Status previously used the direct path only for Access/BDS.
+        # SQL Server companies still executed large aggregate queries through
+        # BUSY COM GetRecordset, which was the main cold-load bottleneck.
+        #
+        # Use Get-DirectConnection for SQL Server and keep the existing
+        # direct BDS path for Access. Voucher writes still use the existing
+        # BUSY APIs; this connection is READ-ONLY report work.
+        # --------------------------------------------------------
+        $stockInstance =
+            Get-InstanceConfig -InstanceId $InstanceId
 
-        if ($null -ne $directStockContext) {
-            $directStockConn = $directStockContext.connection
+        $stockDbType = 0
+        try {
+            if (
+                $null -ne $stockInstance -and
+                $null -ne $stockInstance.dbType
+            ) {
+                $stockDbType = [int]$stockInstance.dbType
+            }
+        }
+        catch {}
 
-            Write-ReportEngineLog `
-                -Stage "STOCK-DIRECT" `
-                -Message (
-                    "Direct Access read path active; db=" +
-                    [System.IO.Path]::GetFileName(
-                        [string]$directStockContext.path
-                    )
-                ) `
-                -Color "Green"
+        if ($stockDbType -eq 1) {
+            try {
+                if (
+                    Get-Command Get-DirectConnection `
+                        -ErrorAction SilentlyContinue
+                ) {
+                    $sqlDirectStockContext =
+                        Get-DirectConnection `
+                            -InstanceId $InstanceId `
+                            -CompanyCode $CompanyCode
+
+                    if (
+                        $null -ne $sqlDirectStockContext -and
+                        $null -ne $sqlDirectStockContext.connection
+                    ) {
+                        $directStockConn =
+                            $sqlDirectStockContext.connection
+
+                        if (
+                            $directStockConn.State.ToString() -ne
+                            "Open"
+                        ) {
+                            $directStockConn.Open()
+                        }
+
+                        Write-ReportEngineLog `
+                            -Stage "STOCK-DIRECT" `
+                            -Message (
+                                "Direct SQL Server read path active; " +
+                                "large stock aggregates bypass BUSY COM"
+                            ) `
+                            -Color "Green"
+                    }
+                }
+            }
+            catch {
+                $directStockConn = $null
+
+                Write-ReportEngineLog `
+                    -Stage "STOCK-DIRECT" `
+                    -Message (
+                        "Direct SQL Server read path unavailable; " +
+                        "falling back to BUSY COM. " +
+                        $_.Exception.Message
+                    ) `
+                    -Color "Yellow"
+            }
+        }
+        else {
+            $directStockContext =
+                Get-StockStatusDirectAccessContext `
+                    -InstanceId $InstanceId `
+                    -CompanyCode $CompanyCode `
+                    -FinancialYearStart $fyYear
+
+            if ($null -ne $directStockContext) {
+                $directStockConn =
+                    $directStockContext.connection
+
+                if (
+                    $directStockConn.State.ToString() -ne
+                    "Open"
+                ) {
+                    $directStockConn.Open()
+                }
+
+                Write-ReportEngineLog `
+                    -Stage "STOCK-DIRECT" `
+                    -Message (
+                        "Direct Access read path active; db=" +
+                        [System.IO.Path]::GetFileName(
+                            [string]$directStockContext.path
+                        )
+                    ) `
+                    -Color "Green"
+            }
         }
 
         # Keep the raw number of stock-item masters for diagnostics/UI only.
@@ -3056,7 +3166,7 @@ function Get-StockStatusReport {
         $cacheSeparator = [char]31
         $stockStatusCacheKey = (
             @(
-                "stock-wa-v8-busy-parity-fast-cache",
+                "stock-wa-v11-single-snapshot",
                 [string]$InstanceId,
                 [string]$CompanyCode,
                 $fromDate.ToString("yyyy-MM-dd"),
@@ -3137,7 +3247,7 @@ function Get-StockStatusReport {
         # The default Balances view is page-oriented. Cache each exact
         # already-valued page independently so revisiting a page is immediate.
         $fastPageModeRequested = (
-            $viewMode -eq "balances" -and
+            $viewMode -in @("balances", "detailed", "columnar") -and
             $PageSize -gt 0 -and
             $PageSize -le 250
         )
@@ -3259,7 +3369,7 @@ function Get-StockStatusReport {
 
                     if (
                         [string]$candidateSnapshot.engine -eq
-                            "stock-master-snapshot-v8" -and
+                            "stock-master-snapshot-v11-single-snapshot" -and
                         [string]$candidateSnapshot.signature -eq
                             $stockMasterSignature -and
                         $null -ne $candidateSnapshot.groups -and
@@ -3655,28 +3765,53 @@ ORDER BY M.Name, M.Code
                 -not [string]::IsNullOrWhiteSpace($ItemGroup) -and
                 $ItemGroup.Trim().ToLowerInvariant() -ne "all"
             ) {
+                # Hierarchical group filtering:
+                # selecting a parent/subgroup must include all descendants.
                 $groupNeedle =
-                    $ItemGroup.Trim().ToLowerInvariant()
-
-                $pathLabel =
-                    ($groupPath -join " > ").
+                    $ItemGroup.
                         Trim().
+                        Replace([char]0x203A, ">").
                         ToLowerInvariant()
 
-                $matchesGroup =
-                    ($pathLabel -eq $groupNeedle)
+                $needleSegments = @(
+                    $groupNeedle.
+                        Split(
+                            [string[]]@(">"),
+                            [System.StringSplitOptions]::RemoveEmptyEntries
+                        ) |
+                    ForEach-Object {
+                        ([string]$_).Trim()
+                    }
+                )
+
+                $normalizedGroupNeedle =
+                    ($needleSegments -join " > ")
+
+                $normalizedPathSegments = @(
+                    $groupPath |
+                    ForEach-Object {
+                        ([string]$_).
+                            Trim().
+                            ToLowerInvariant()
+                    }
+                )
+
+                $pathLabel =
+                    ($normalizedPathSegments -join " > ")
+
+                $matchesGroup = (
+                    $pathLabel -eq $normalizedGroupNeedle -or
+                    $pathLabel.StartsWith(
+                        $normalizedGroupNeedle + " > "
+                    )
+                )
 
                 if (
                     -not $matchesGroup -and
-                    -not $groupNeedle.Contains(" > ")
+                    $needleSegments.Count -eq 1
                 ) {
-                    foreach ($segment in $groupPath) {
-                        if (
-                            ([string]$segment).
-                                Trim().
-                                ToLowerInvariant() -eq
-                            $groupNeedle
-                        ) {
+                    foreach ($segment in $normalizedPathSegments) {
+                        if ($segment -eq $normalizedGroupNeedle) {
                             $matchesGroup = $true
                             break
                         }
@@ -3872,7 +4007,7 @@ ORDER BY M.Name, M.Code
         ) {
             try {
                 $snapshotPayload = [ordered]@{
-                    engine = "stock-master-snapshot-v8"
+                    engine = "stock-master-snapshot-v11-single-snapshot"
                     signature = $stockMasterSignature
                     groups = @($stockMasterSnapshotBuild.groups)
                     materialCentres =
@@ -3896,6 +4031,939 @@ ORDER BY M.Name, M.Code
                     -Color "Green"
             }
             catch {}
+        }
+
+
+        # ========================================================
+        # V14 FAST SQL SNAPSHOT
+        # ========================================================
+        #
+        # Architecture:
+        #
+        #      AS ON DATE
+        #          |
+        #          v
+        #   ONE FAST SNAPSHOT REQUEST
+        #          |
+        #          +--> Direct SQL aggregate (Tran4 + Tran2)
+        #          +--> Master data already loaded above
+        #          |
+        #          v
+        #   Complete lightweight frontend snapshot
+        #
+        # IMPORTANT:
+        # This path intentionally DOES NOT run STOCK-WA / chronological
+        # method-5 replay across all stock masters. That exact replay is ideal
+        # for a small requested page, but it is the wrong algorithm for a full
+        # 3,000+ item snapshot.
+        #
+        # For the snapshot's "BUSY Posted Value" we use BUSY's posted opening
+        # value (Tran4.D3) plus posted movement values (Tran2.Value3).
+        # Purchase / Sale / MRP alternatives are item-master prices and are
+        # recalculated instantly in the frontend.
+        # ========================================================
+        if ($FastSnapshot -and $null -ne $directStockConn) {
+            $snapshotWatch = New-ReportEngineWatch
+
+            Write-ReportEngineLog `
+                -Stage "STOCK-SNAPSHOT-FAST" `
+                -Message (
+                    "Starting set-based snapshot; asOf=" +
+                    $asOfDate.ToString("yyyy-MM-dd") +
+                    "; masters=" +
+                    $itemOrder.Count
+                ) `
+                -Color "Cyan"
+
+            $snapshotStatesByItem = @{}
+
+            function Get-StockSnapshotState {
+                param(
+                    [int]$ItemCode,
+                    [int]$McCode
+                )
+
+                $itemKey = [string]$ItemCode
+                $mcKey = [string]$McCode
+
+                if (-not $snapshotStatesByItem.ContainsKey($itemKey)) {
+                    $snapshotStatesByItem[$itemKey] = @{}
+                }
+
+                $states = $snapshotStatesByItem[$itemKey]
+
+                if (-not $states.ContainsKey($mcKey)) {
+                    $states[$mcKey] = [pscustomobject]@{
+                        openingMain = 0.0
+                        openingAlt = 0.0
+                        openingValue = 0.0
+
+                        inwardMain = 0.0
+                        inwardAlt = 0.0
+                        inwardValue = 0.0
+
+                        outwardMain = 0.0
+                        outwardAlt = 0.0
+                        outwardValue = 0.0
+
+                        purchaseQty = 0.0
+                        saleQty = 0.0
+                        saleReturnQty = 0.0
+                        purchaseReturnQty = 0.0
+
+                        transferInQty = 0.0
+                        transferOutQty = 0.0
+                        transferInAltQty = 0.0
+                        transferOutAltQty = 0.0
+
+                        productionGeneratedQty = 0.0
+                        productionConsumedQty = 0.0
+                        stockJournalGeneratedQty = 0.0
+                        stockJournalConsumedQty = 0.0
+                        materialReceiptQty = 0.0
+                        materialIssueQty = 0.0
+                        otherInQty = 0.0
+                        otherOutQty = 0.0
+                    }
+                }
+
+                return $states[$mcKey]
+            }
+
+            # Material Centre is a backend filter in V15. Item Group and
+            # Search have already reduced $itemOrder/$items above. For MC we
+            # additionally restrict Tran4/Tran2 at SQL level so SQL Server does
+            # not aggregate centres that the user did not request.
+            $snapshotMcSqlClause = ""
+
+            if (-not $useAllMc -and $selectedMcCodes.Count -gt 0) {
+                $snapshotMcCodes = @(
+                    $selectedMcCodes.Keys |
+                    ForEach-Object { [int]$_ } |
+                    Sort-Object
+                )
+
+                if ($snapshotMcCodes.Count -gt 0) {
+                    $snapshotMcSqlClause =
+                        " AND MasterCode2 IN (" +
+                        (($snapshotMcCodes | ForEach-Object { [string]$_ }) -join ",") +
+                        ")"
+                }
+            }
+
+            # FY opening stock/value is already stored compactly in Tran4.
+            $snapshotOpeningSql = @"
+SELECT
+    MasterCode1 AS ItemCode,
+    MasterCode2 AS MCCode,
+    SUM(D1) AS OpeningQty,
+    SUM(D2) AS OpeningAltQty,
+    SUM(D3) AS OpeningValue
+FROM Tran4
+WHERE RecType = 0$snapshotMcSqlClause
+GROUP BY MasterCode1, MasterCode2
+"@
+
+            $snapshotOpeningTable =
+                Invoke-StockStatusDirectTable `
+                    -Connection $directStockConn `
+                    -Timeout 180 `
+                    -Sql $snapshotOpeningSql
+
+            foreach ($row in $snapshotOpeningTable.Rows) {
+                $itemCode =
+                    ConvertTo-ReportInt $row["ItemCode"]
+
+                if (-not $items.ContainsKey($itemCode)) {
+                    continue
+                }
+
+                $mcCode =
+                    ConvertTo-ReportInt $row["MCCode"]
+
+                $state =
+                    Get-StockSnapshotState `
+                        -ItemCode $itemCode `
+                        -McCode $mcCode
+
+                $state.openingMain +=
+                    ConvertTo-ReportDouble $row["OpeningQty"]
+
+                $state.openingAlt +=
+                    ConvertTo-ReportDouble $row["OpeningAltQty"]
+
+                $state.openingValue +=
+                    ConvertTo-ReportDouble $row["OpeningValue"]
+            }
+
+            $snapshotMovementMcSqlClause = ""
+            if (-not $useAllMc -and $selectedMcCodes.Count -gt 0) {
+                $snapshotMcCodes = @(
+                    $selectedMcCodes.Keys |
+                    ForEach-Object { [int]$_ } |
+                    Sort-Object
+                )
+                if ($snapshotMcCodes.Count -gt 0) {
+                    $snapshotMovementMcSqlClause =
+                        " AND T.MasterCode2 IN (" +
+                        (($snapshotMcCodes | ForEach-Object { [string]$_ }) -join ",") +
+                        ")"
+                }
+            }
+
+            # Current-period movement is one set-based SQL GROUP BY. It gives
+            # all five frontend views their quantity/movement breakdown without
+            # replaying each transaction in PowerShell.
+            if ($mode.isSql) {
+                $snapshotMovementSql = @"
+SELECT
+    T.MasterCode1 AS ItemCode,
+    T.MasterCode2 AS MCCode,
+
+    SUM(CASE WHEN T.Value1 > 0 THEN T.Value1 ELSE 0 END) AS InwardQty,
+    SUM(CASE WHEN T.Value1 < 0 THEN -T.Value1 ELSE 0 END) AS OutwardQty,
+
+    SUM(CASE WHEN T.Value2 > 0 THEN T.Value2 ELSE 0 END) AS InwardAltQty,
+    SUM(CASE WHEN T.Value2 < 0 THEN -T.Value2 ELSE 0 END) AS OutwardAltQty,
+
+    SUM(CASE WHEN T.Value1 > 0 THEN ABS(T.Value3) ELSE 0 END) AS InwardValue,
+    SUM(CASE WHEN T.Value1 < 0 THEN ABS(T.Value3) ELSE 0 END) AS OutwardValue,
+
+    SUM(CASE WHEN T.Value1 > 0 AND V.VchType = 2 THEN T.Value1 ELSE 0 END) AS PurchaseQty,
+    SUM(CASE WHEN T.Value1 < 0 AND V.VchType = 9 THEN -T.Value1 ELSE 0 END) AS SaleQty,
+    SUM(CASE WHEN T.Value1 > 0 AND V.VchType = 3 THEN T.Value1 ELSE 0 END) AS SaleReturnQty,
+    SUM(CASE WHEN T.Value1 < 0 AND V.VchType = 10 THEN -T.Value1 ELSE 0 END) AS PurchaseReturnQty,
+
+    SUM(CASE WHEN T.Value1 > 0 AND V.VchType = 5 THEN T.Value1 ELSE 0 END) AS TransferInQty,
+    SUM(CASE WHEN T.Value1 < 0 AND V.VchType = 5 THEN -T.Value1 ELSE 0 END) AS TransferOutQty,
+    SUM(CASE WHEN T.Value2 > 0 AND V.VchType = 5 THEN T.Value2 ELSE 0 END) AS TransferInAltQty,
+    SUM(CASE WHEN T.Value2 < 0 AND V.VchType = 5 THEN -T.Value2 ELSE 0 END) AS TransferOutAltQty,
+
+    SUM(CASE WHEN T.Value1 > 0 AND V.VchType = 6 THEN T.Value1 ELSE 0 END) AS ProductionGeneratedQty,
+    SUM(CASE WHEN T.Value1 < 0 AND V.VchType = 6 THEN -T.Value1 ELSE 0 END) AS ProductionConsumedQty,
+
+    SUM(CASE WHEN T.Value1 > 0 AND V.VchType = 8 THEN T.Value1 ELSE 0 END) AS StockJournalGeneratedQty,
+    SUM(CASE WHEN T.Value1 < 0 AND V.VchType = 8 THEN -T.Value1 ELSE 0 END) AS StockJournalConsumedQty,
+
+    SUM(CASE WHEN T.Value1 > 0 AND V.VchType = 4 THEN T.Value1 ELSE 0 END) AS MaterialReceiptQty,
+    SUM(CASE WHEN T.Value1 < 0 AND V.VchType = 11 THEN -T.Value1 ELSE 0 END) AS MaterialIssueQty,
+
+    SUM(
+        CASE
+            WHEN T.Value1 > 0
+             AND V.VchType NOT IN (2, 3, 4, 5, 6, 8)
+            THEN T.Value1
+            ELSE 0
+        END
+    ) AS OtherInQty,
+
+    SUM(
+        CASE
+            WHEN T.Value1 < 0
+             AND V.VchType NOT IN (5, 6, 8, 9, 10, 11)
+            THEN -T.Value1
+            ELSE 0
+        END
+    ) AS OtherOutQty
+
+FROM Tran2 T
+INNER JOIN Tran1 V
+    ON V.VchCode = T.VchCode
+WHERE
+    T.RecType = 2
+    AND V.[Date] >= $fromLiteral
+    AND V.[Date] <= $endLiteral
+    AND (V.Cancelled = 0 OR V.Cancelled IS NULL)
+    AND (V.VchCancelled = 0 OR V.VchCancelled IS NULL)$snapshotMovementMcSqlClause
+GROUP BY
+    T.MasterCode1,
+    T.MasterCode2
+"@
+            }
+            else {
+                # Access/BDS equivalent. The project is currently SQL Server
+                # in the user's main deployment, but keep a compatible direct
+                # aggregate instead of falling through to full STOCK-WA.
+                $snapshotMovementSql = @"
+SELECT
+    T.MasterCode1 AS ItemCode,
+    T.MasterCode2 AS MCCode,
+
+    SUM(IIF(T.Value1 > 0, T.Value1, 0)) AS InwardQty,
+    SUM(IIF(T.Value1 < 0, -T.Value1, 0)) AS OutwardQty,
+
+    SUM(IIF(T.Value2 > 0, T.Value2, 0)) AS InwardAltQty,
+    SUM(IIF(T.Value2 < 0, -T.Value2, 0)) AS OutwardAltQty,
+
+    SUM(IIF(T.Value1 > 0, ABS(T.Value3), 0)) AS InwardValue,
+    SUM(IIF(T.Value1 < 0, ABS(T.Value3), 0)) AS OutwardValue,
+
+    SUM(IIF(T.Value1 > 0 AND V.VchType = 2, T.Value1, 0)) AS PurchaseQty,
+    SUM(IIF(T.Value1 < 0 AND V.VchType = 9, -T.Value1, 0)) AS SaleQty,
+    SUM(IIF(T.Value1 > 0 AND V.VchType = 3, T.Value1, 0)) AS SaleReturnQty,
+    SUM(IIF(T.Value1 < 0 AND V.VchType = 10, -T.Value1, 0)) AS PurchaseReturnQty,
+
+    SUM(IIF(T.Value1 > 0 AND V.VchType = 5, T.Value1, 0)) AS TransferInQty,
+    SUM(IIF(T.Value1 < 0 AND V.VchType = 5, -T.Value1, 0)) AS TransferOutQty,
+    SUM(IIF(T.Value2 > 0 AND V.VchType = 5, T.Value2, 0)) AS TransferInAltQty,
+    SUM(IIF(T.Value2 < 0 AND V.VchType = 5, -T.Value2, 0)) AS TransferOutAltQty,
+
+    SUM(IIF(T.Value1 > 0 AND V.VchType = 6, T.Value1, 0)) AS ProductionGeneratedQty,
+    SUM(IIF(T.Value1 < 0 AND V.VchType = 6, -T.Value1, 0)) AS ProductionConsumedQty,
+
+    SUM(IIF(T.Value1 > 0 AND V.VchType = 8, T.Value1, 0)) AS StockJournalGeneratedQty,
+    SUM(IIF(T.Value1 < 0 AND V.VchType = 8, -T.Value1, 0)) AS StockJournalConsumedQty,
+
+    SUM(IIF(T.Value1 > 0 AND V.VchType = 4, T.Value1, 0)) AS MaterialReceiptQty,
+    SUM(IIF(T.Value1 < 0 AND V.VchType = 11, -T.Value1, 0)) AS MaterialIssueQty,
+
+    SUM(IIF(T.Value1 > 0 AND V.VchType NOT IN (2,3,4,5,6,8), T.Value1, 0)) AS OtherInQty,
+    SUM(IIF(T.Value1 < 0 AND V.VchType NOT IN (5,6,8,9,10,11), -T.Value1, 0)) AS OtherOutQty
+
+FROM Tran2 T
+INNER JOIN Tran1 V
+    ON V.VchCode = T.VchCode
+WHERE
+    T.RecType = 2
+    AND V.[Date] >= $fromLiteral
+    AND V.[Date] <= $endLiteral
+    AND (V.Cancelled = 0 OR V.Cancelled IS NULL)
+    AND (V.VchCancelled = 0 OR V.VchCancelled IS NULL)$snapshotMovementMcSqlClause
+GROUP BY
+    T.MasterCode1,
+    T.MasterCode2
+"@
+            }
+
+            $snapshotMovementTable =
+                Invoke-StockStatusDirectTable `
+                    -Connection $directStockConn `
+                    -Timeout 240 `
+                    -Sql $snapshotMovementSql
+
+            foreach ($row in $snapshotMovementTable.Rows) {
+                $itemCode =
+                    ConvertTo-ReportInt $row["ItemCode"]
+
+                if (-not $items.ContainsKey($itemCode)) {
+                    continue
+                }
+
+                $mcCode =
+                    ConvertTo-ReportInt $row["MCCode"]
+
+                $state =
+                    Get-StockSnapshotState `
+                        -ItemCode $itemCode `
+                        -McCode $mcCode
+
+                $state.inwardMain += ConvertTo-ReportDouble $row["InwardQty"]
+                $state.outwardMain += ConvertTo-ReportDouble $row["OutwardQty"]
+                $state.inwardAlt += ConvertTo-ReportDouble $row["InwardAltQty"]
+                $state.outwardAlt += ConvertTo-ReportDouble $row["OutwardAltQty"]
+                $state.inwardValue += ConvertTo-ReportDouble $row["InwardValue"]
+                $state.outwardValue += ConvertTo-ReportDouble $row["OutwardValue"]
+
+                $state.purchaseQty += ConvertTo-ReportDouble $row["PurchaseQty"]
+                $state.saleQty += ConvertTo-ReportDouble $row["SaleQty"]
+                $state.saleReturnQty += ConvertTo-ReportDouble $row["SaleReturnQty"]
+                $state.purchaseReturnQty += ConvertTo-ReportDouble $row["PurchaseReturnQty"]
+
+                $state.transferInQty += ConvertTo-ReportDouble $row["TransferInQty"]
+                $state.transferOutQty += ConvertTo-ReportDouble $row["TransferOutQty"]
+                $state.transferInAltQty += ConvertTo-ReportDouble $row["TransferInAltQty"]
+                $state.transferOutAltQty += ConvertTo-ReportDouble $row["TransferOutAltQty"]
+
+                $state.productionGeneratedQty += ConvertTo-ReportDouble $row["ProductionGeneratedQty"]
+                $state.productionConsumedQty += ConvertTo-ReportDouble $row["ProductionConsumedQty"]
+                $state.stockJournalGeneratedQty += ConvertTo-ReportDouble $row["StockJournalGeneratedQty"]
+                $state.stockJournalConsumedQty += ConvertTo-ReportDouble $row["StockJournalConsumedQty"]
+                $state.materialReceiptQty += ConvertTo-ReportDouble $row["MaterialReceiptQty"]
+                $state.materialIssueQty += ConvertTo-ReportDouble $row["MaterialIssueQty"]
+                $state.otherInQty += ConvertTo-ReportDouble $row["OtherInQty"]
+                $state.otherOutQty += ConvertTo-ReportDouble $row["OtherOutQty"]
+            }
+
+            $snapshotRows =
+                [System.Collections.Generic.List[object]]::new()
+
+            foreach ($itemCode in @($itemOrder)) {
+                $item = $items[[int]$itemCode]
+                $itemStates = @{}
+
+                if (
+                    $snapshotStatesByItem.ContainsKey(
+                        [string]$itemCode
+                    )
+                ) {
+                    $itemStates =
+                        $snapshotStatesByItem[
+                            [string]$itemCode
+                        ]
+                }
+
+                # When a Material Centre backend filter is active, an item
+                # must have opening or movement state in that selected centre.
+                # Search/group can legitimately include masters with zero stock,
+                # so this extra test is MC-specific only.
+                if (-not $useAllMc -and $itemStates.Count -eq 0) {
+                    continue
+                }
+
+                $centres =
+                    [System.Collections.Generic.List[object]]::new()
+
+                $openingMain = 0.0
+                $openingAlt = 0.0
+                $openingValue = 0.0
+                $inwardMain = 0.0
+                $inwardAlt = 0.0
+                $inwardValue = 0.0
+                $outwardMain = 0.0
+                $outwardAlt = 0.0
+                $outwardValue = 0.0
+
+                $purchaseQty = 0.0
+                $saleQty = 0.0
+                $saleReturnQty = 0.0
+                $purchaseReturnQty = 0.0
+                $transferInQty = 0.0
+                $transferOutQty = 0.0
+                $transferInAltQty = 0.0
+                $transferOutAltQty = 0.0
+                $productionGeneratedQty = 0.0
+                $productionConsumedQty = 0.0
+                $stockJournalGeneratedQty = 0.0
+                $stockJournalConsumedQty = 0.0
+                $materialReceiptQty = 0.0
+                $materialIssueQty = 0.0
+                $otherInQty = 0.0
+                $otherOutQty = 0.0
+
+                foreach (
+                    $mcKey in
+                    @($itemStates.Keys | Sort-Object)
+                ) {
+                    $mcCode = 0
+
+                    if (
+                        -not [int]::TryParse(
+                            [string]$mcKey,
+                            [ref]$mcCode
+                        )
+                    ) {
+                        continue
+                    }
+
+                    $state = $itemStates[$mcKey]
+
+                    $mcOpeningMain = [double]$state.openingMain
+                    $mcOpeningAlt = [double]$state.openingAlt
+                    $mcOpeningValue = [double]$state.openingValue
+
+                    $mcInwardMain = [double]$state.inwardMain
+                    $mcInwardAlt = [double]$state.inwardAlt
+                    $mcInwardValue = [double]$state.inwardValue
+
+                    $mcOutwardMain = [double]$state.outwardMain
+                    $mcOutwardAlt = [double]$state.outwardAlt
+                    $mcOutwardValue = [double]$state.outwardValue
+
+                    $mcClosingMain =
+                        $mcOpeningMain +
+                        $mcInwardMain -
+                        $mcOutwardMain
+
+                    $mcClosingAlt =
+                        $mcOpeningAlt +
+                        $mcInwardAlt -
+                        $mcOutwardAlt
+
+                    $mcPostedValue =
+                        $mcOpeningValue +
+                        $mcInwardValue -
+                        $mcOutwardValue
+
+                    $mcRate =
+                        if (
+                            [Math]::Abs($mcClosingMain) -gt $eps
+                        ) {
+                            $mcPostedValue / $mcClosingMain
+                        }
+                        else {
+                            0.0
+                        }
+
+                    $mcName =
+                        if ($mcMap.ContainsKey($mcCode)) {
+                            [string]$mcMap[$mcCode]
+                        }
+                        else {
+                            "Default"
+                        }
+
+                    $centres.Add([pscustomobject]@{
+                        code = $mcCode
+                        name = $mcName
+
+                        openingQuantity = [Math]::Round($mcOpeningMain, 3)
+                        openingAltQuantity = [Math]::Round($mcOpeningAlt, 3)
+                        inwardQuantity = [Math]::Round($mcInwardMain, 3)
+                        inwardAltQuantity = [Math]::Round($mcInwardAlt, 3)
+                        outwardQuantity = [Math]::Round($mcOutwardMain, 3)
+                        outwardAltQuantity = [Math]::Round($mcOutwardAlt, 3)
+                        closingQuantity = [Math]::Round($mcClosingMain, 3)
+                        closingAltQuantity = [Math]::Round($mcClosingAlt, 3)
+                        quantity = [Math]::Round($mcClosingMain, 3)
+
+                        stockValue = [Math]::Round($mcPostedValue, 2)
+                        postedLedgerValue = [Math]::Round($mcPostedValue, 2)
+                        valuationRate = [Math]::Round($mcRate, 6)
+
+                        purchaseQuantity = [Math]::Round([double]$state.purchaseQty, 3)
+                        saleQuantity = [Math]::Round([double]$state.saleQty, 3)
+                        saleReturnQuantity = [Math]::Round([double]$state.saleReturnQty, 3)
+                        purchaseReturnQuantity = [Math]::Round([double]$state.purchaseReturnQty, 3)
+
+                        transferInQuantity = [Math]::Round([double]$state.transferInQty, 3)
+                        transferOutQuantity = [Math]::Round([double]$state.transferOutQty, 3)
+                        transferInAltQuantity = [Math]::Round([double]$state.transferInAltQty, 3)
+                        transferOutAltQuantity = [Math]::Round([double]$state.transferOutAltQty, 3)
+
+                        productionGeneratedQuantity = [Math]::Round([double]$state.productionGeneratedQty, 3)
+                        productionConsumedQuantity = [Math]::Round([double]$state.productionConsumedQty, 3)
+                        stockJournalGeneratedQuantity = [Math]::Round([double]$state.stockJournalGeneratedQty, 3)
+                        stockJournalConsumedQuantity = [Math]::Round([double]$state.stockJournalConsumedQty, 3)
+                        materialReceiptQuantity = [Math]::Round([double]$state.materialReceiptQty, 3)
+                        materialIssueQuantity = [Math]::Round([double]$state.materialIssueQty, 3)
+                        otherInQuantity = [Math]::Round([double]$state.otherInQty, 3)
+                        otherOutQuantity = [Math]::Round([double]$state.otherOutQty, 3)
+                    })
+
+                    $openingMain += $mcOpeningMain
+                    $openingAlt += $mcOpeningAlt
+                    $openingValue += $mcOpeningValue
+
+                    $inwardMain += $mcInwardMain
+                    $inwardAlt += $mcInwardAlt
+                    $inwardValue += $mcInwardValue
+
+                    $outwardMain += $mcOutwardMain
+                    $outwardAlt += $mcOutwardAlt
+                    $outwardValue += $mcOutwardValue
+
+                    $purchaseQty += [double]$state.purchaseQty
+                    $saleQty += [double]$state.saleQty
+                    $saleReturnQty += [double]$state.saleReturnQty
+                    $purchaseReturnQty += [double]$state.purchaseReturnQty
+                    $transferInQty += [double]$state.transferInQty
+                    $transferOutQty += [double]$state.transferOutQty
+                    $transferInAltQty += [double]$state.transferInAltQty
+                    $transferOutAltQty += [double]$state.transferOutAltQty
+                    $productionGeneratedQty += [double]$state.productionGeneratedQty
+                    $productionConsumedQty += [double]$state.productionConsumedQty
+                    $stockJournalGeneratedQty += [double]$state.stockJournalGeneratedQty
+                    $stockJournalConsumedQty += [double]$state.stockJournalConsumedQty
+                    $materialReceiptQty += [double]$state.materialReceiptQty
+                    $materialIssueQty += [double]$state.materialIssueQty
+                    $otherInQty += [double]$state.otherInQty
+                    $otherOutQty += [double]$state.otherOutQty
+                }
+
+                $closingMain =
+                    $openingMain +
+                    $inwardMain -
+                    $outwardMain
+
+                $closingAlt =
+                    $openingAlt +
+                    $inwardAlt -
+                    $outwardAlt
+
+                $postedValue =
+                    $openingValue +
+                    $inwardValue -
+                    $outwardValue
+
+                $postedRate =
+                    if (
+                        [Math]::Abs($closingMain) -gt $eps
+                    ) {
+                        $postedValue / $closingMain
+                    }
+                    else {
+                        0.0
+                    }
+
+                $stockStatus =
+                    if ($closingMain -lt -$eps) {
+                        "negative"
+                    }
+                    elseif (
+                        [Math]::Abs($closingMain) -le $eps
+                    ) {
+                        "out-of-stock"
+                    }
+                    elseif ($closingMain -le 5) {
+                        "low-stock"
+                    }
+                    else {
+                        "in-stock"
+                    }
+
+                $parentGroup =
+                    if ($item.groupPath.Count -gt 0) {
+                        [string]$item.groupPath[0]
+                    }
+                    else {
+                        "General"
+                    }
+
+                $snapshotRows.Add([pscustomobject]@{
+                    itemCode = [int]$item.code
+                    itemName = [string]$item.name
+                    alias = [string]$item.alias
+                    group = [string]$item.group
+                    parentGroup = $parentGroup
+                    groupPath = @($item.groupPath)
+
+                    unit =
+                        if (
+                            [string]::IsNullOrWhiteSpace(
+                                [string]$item.mainUnit
+                            )
+                        ) {
+                            "Units"
+                        }
+                        else {
+                            [string]$item.mainUnit
+                        }
+
+                    mainUnit =
+                        if (
+                            [string]::IsNullOrWhiteSpace(
+                                [string]$item.mainUnit
+                            )
+                        ) {
+                            "Units"
+                        }
+                        else {
+                            [string]$item.mainUnit
+                        }
+
+                    altUnit = [string]$item.altUnit
+                    conversionFactor = [Math]::Round(
+                        [double]$item.conversionFactor,
+                        6
+                    )
+                    conversionType = [int]$item.conversionType
+
+                    openingQuantity = [Math]::Round($openingMain, 3)
+                    openingAltQuantity = [Math]::Round($openingAlt, 3)
+                    inwardQuantity = [Math]::Round($inwardMain, 3)
+                    inwardAltQuantity = [Math]::Round($inwardAlt, 3)
+                    outwardQuantity = [Math]::Round($outwardMain, 3)
+                    outwardAltQuantity = [Math]::Round($outwardAlt, 3)
+                    closingQuantity = [Math]::Round($closingMain, 3)
+                    closingAltQuantity = [Math]::Round($closingAlt, 3)
+
+                    quantity = [Math]::Round($closingMain, 3)
+                    availableQuantity = [Math]::Round($closingMain, 3)
+                    movementQuantity = [Math]::Round(
+                        $inwardMain + $outwardMain,
+                        3
+                    )
+
+                    lowStockLevel = 5
+                    status = $stockStatus
+
+                    purchaseQuantity = [Math]::Round($purchaseQty, 3)
+                    saleQuantity = [Math]::Round($saleQty, 3)
+                    saleReturnQuantity = [Math]::Round($saleReturnQty, 3)
+                    purchaseReturnQuantity = [Math]::Round($purchaseReturnQty, 3)
+
+                    transferInQuantity = [Math]::Round($transferInQty, 3)
+                    transferOutQuantity = [Math]::Round($transferOutQty, 3)
+                    transferInAltQuantity = [Math]::Round($transferInAltQty, 3)
+                    transferOutAltQuantity = [Math]::Round($transferOutAltQty, 3)
+
+                    productionGeneratedQuantity = [Math]::Round($productionGeneratedQty, 3)
+                    productionConsumedQuantity = [Math]::Round($productionConsumedQty, 3)
+                    stockJournalGeneratedQuantity = [Math]::Round($stockJournalGeneratedQty, 3)
+                    stockJournalConsumedQuantity = [Math]::Round($stockJournalConsumedQty, 3)
+                    materialReceiptQuantity = [Math]::Round($materialReceiptQty, 3)
+                    materialIssueQuantity = [Math]::Round($materialIssueQty, 3)
+                    otherInQuantity = [Math]::Round($otherInQty, 3)
+                    otherOutQuantity = [Math]::Round($otherOutQty, 3)
+
+                    mrp = [Math]::Round([double]$item.mrp, 2)
+                    salePrice = [Math]::Round([double]$item.salePrice, 2)
+                    purchasePrice = [Math]::Round([double]$item.purchasePrice, 2)
+
+                    # Snapshot BUSY value = posted ledger value.
+                    busyValuationRate = [Math]::Round($postedRate, 6)
+                    busyStockValue = [Math]::Round($postedValue, 2)
+                    postedLedgerClosingValue = [Math]::Round($postedValue, 2)
+
+                    valuationRate = [Math]::Round($postedRate, 6)
+                    stockValue = [Math]::Round($postedValue, 2)
+
+                    openingValue = [Math]::Round($openingValue, 2)
+                    inwardValue = [Math]::Round($inwardValue, 2)
+                    outwardValue = [Math]::Round($outwardValue, 2)
+
+                    materialCentres =
+                        @($centres | Sort-Object name)
+                })
+            }
+
+            $sortedSnapshotRows =
+                @(
+                    $snapshotRows |
+                    Sort-Object itemName, itemCode
+                )
+
+            $snapshotGroupMap = @{}
+
+            foreach ($row in $sortedSnapshotRows) {
+                $groupKey =
+                    if ($row.groupPath.Count -gt 0) {
+                        @($row.groupPath) -join " > "
+                    }
+                    else {
+                        "General"
+                    }
+
+                if (-not $snapshotGroupMap.ContainsKey($groupKey)) {
+                    $snapshotGroupMap[$groupKey] =
+                        [pscustomobject]@{
+                            group = [string]$row.group
+                            parentGroup =
+                                [string]$row.parentGroup
+                            groupPath = @($row.groupPath)
+                            itemCount = 0
+                            openingQuantity = 0.0
+                            inwardQuantity = 0.0
+                            outwardQuantity = 0.0
+                            closingQuantity = 0.0
+                            stockValue = 0.0
+                        }
+                }
+
+                $groupTotal = $snapshotGroupMap[$groupKey]
+                $groupTotal.itemCount++
+                $groupTotal.openingQuantity += [double]$row.openingQuantity
+                $groupTotal.inwardQuantity += [double]$row.inwardQuantity
+                $groupTotal.outwardQuantity += [double]$row.outwardQuantity
+                $groupTotal.closingQuantity += [double]$row.closingQuantity
+                $groupTotal.stockValue += [double]$row.stockValue
+            }
+
+            $snapshotGroupTotals = @(
+                foreach (
+                    $groupKey in
+                    @($snapshotGroupMap.Keys | Sort-Object)
+                ) {
+                    $groupTotal =
+                        $snapshotGroupMap[$groupKey]
+
+                    [pscustomobject]@{
+                        group = [string]$groupTotal.group
+                        parentGroup =
+                            [string]$groupTotal.parentGroup
+                        groupPath =
+                            @($groupTotal.groupPath)
+                        itemCount =
+                            [int]$groupTotal.itemCount
+                        openingQuantity =
+                            [Math]::Round(
+                                [double]$groupTotal.openingQuantity,
+                                3
+                            )
+                        inwardQuantity =
+                            [Math]::Round(
+                                [double]$groupTotal.inwardQuantity,
+                                3
+                            )
+                        outwardQuantity =
+                            [Math]::Round(
+                                [double]$groupTotal.outwardQuantity,
+                                3
+                            )
+                        closingQuantity =
+                            [Math]::Round(
+                                [double]$groupTotal.closingQuantity,
+                                3
+                            )
+                        stockValue =
+                            [Math]::Round(
+                                [double]$groupTotal.stockValue,
+                                2
+                            )
+                    }
+                }
+            )
+
+            $snapshotSummary = @{
+                totalItems = $sortedSnapshotRows.Count
+
+                inStockItems =
+                    @(
+                        $sortedSnapshotRows |
+                        Where-Object status -eq "in-stock"
+                    ).Count
+
+                lowStockItems =
+                    @(
+                        $sortedSnapshotRows |
+                        Where-Object status -eq "low-stock"
+                    ).Count
+
+                outOfStockItems =
+                    @(
+                        $sortedSnapshotRows |
+                        Where-Object status -eq "out-of-stock"
+                    ).Count
+
+                negativeStockItems =
+                    @(
+                        $sortedSnapshotRows |
+                        Where-Object status -eq "negative"
+                    ).Count
+
+                totalQuantity = [Math]::Round(
+                    [double]((
+                        $sortedSnapshotRows |
+                        Measure-Object -Property closingQuantity -Sum
+                    ).Sum),
+                    3
+                )
+
+                openingQuantity = [Math]::Round(
+                    [double]((
+                        $sortedSnapshotRows |
+                        Measure-Object -Property openingQuantity -Sum
+                    ).Sum),
+                    3
+                )
+
+                inwardQuantity = [Math]::Round(
+                    [double]((
+                        $sortedSnapshotRows |
+                        Measure-Object -Property inwardQuantity -Sum
+                    ).Sum),
+                    3
+                )
+
+                outwardQuantity = [Math]::Round(
+                    [double]((
+                        $sortedSnapshotRows |
+                        Measure-Object -Property outwardQuantity -Sum
+                    ).Sum),
+                    3
+                )
+
+                purchaseQuantity = [Math]::Round(
+                    [double]((
+                        $sortedSnapshotRows |
+                        Measure-Object -Property purchaseQuantity -Sum
+                    ).Sum),
+                    3
+                )
+
+                saleQuantity = [Math]::Round(
+                    [double]((
+                        $sortedSnapshotRows |
+                        Measure-Object -Property saleQuantity -Sum
+                    ).Sum),
+                    3
+                )
+
+                stockValue = [Math]::Round(
+                    [double]((
+                        $sortedSnapshotRows |
+                        Measure-Object -Property stockValue -Sum
+                    ).Sum),
+                    2
+                )
+
+                busyStockValue = [Math]::Round(
+                    [double]((
+                        $sortedSnapshotRows |
+                        Measure-Object -Property busyStockValue -Sum
+                    ).Sum),
+                    2
+                )
+            }
+
+            Stop-ReportEngineWatch `
+                -Watch $snapshotWatch `
+                -Stage "STOCK-SNAPSHOT-FAST" `
+                -Message (
+                    "Set-based snapshot ready; rows=" +
+                    $sortedSnapshotRows.Count +
+                    "; mcStates=" +
+                    $snapshotStatesByItem.Count +
+                    "; NO STOCK-WA replay"
+                )
+
+            return @{
+                success = $true
+                view = "balances"
+                fromDate = $fromDate.ToString("yyyy-MM-dd")
+                toDate = $endDate.ToString("yyyy-MM-dd")
+                asOfDate = $asOfDate.ToString("yyyy-MM-dd")
+                generatedAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss")
+
+                page = 1
+                pageSize = 0
+                total = $sortedSnapshotRows.Count
+                totalPages = 1
+                companyItemCount = $companyItemCount
+                pageSizeOptions = @(50, 100, 200, 500, 0)
+
+                summaryScope = "all"
+
+                valuationSource =
+                    "busy-posted-ledger-fast-snapshot-v17-hierarchical-group-filter"
+
+                stockValuationMethod = 0
+
+                stockValuationMode =
+                    "posted-ledger-set-based-snapshot-v17"
+
+                options = @{
+                    unitMode = "both"
+                    showValue = $true
+                    includeStockTransfers = $true
+                    showSalePurchaseSeparately = $true
+                    mastersMode = "all"
+                    showParentGroup = $true
+                    valueBy = "busy"
+                }
+
+                filterOptions = @{
+                    materialCentres = @($mcOptions)
+                    itemGroups =
+                        @(
+                            $groupOptions |
+                            Sort-Object pathLabel, name
+                        )
+                }
+
+                summary = $snapshotSummary
+                groupTotals = @($snapshotGroupTotals)
+                data = @($sortedSnapshotRows)
+            }
+        }
+        elseif ($FastSnapshot) {
+            Write-ReportEngineLog `
+                -Stage "STOCK-SNAPSHOT-FAST" `
+                -Message (
+                    "Direct DB connection unavailable; " +
+                    "falling back to legacy stock engine"
+                ) `
+                -Color "Yellow"
         }
 
         # --------------------------------------------------------
@@ -3931,7 +4999,7 @@ ORDER BY M.Name, M.Code
         }
 
         # ========================================================
-        # TRUE FAST PAGINATION FOR THE DEFAULT BALANCES VIEW
+        # TRUE FAST PAGINATION FOR PAGE-ORIENTED VIEWS
         # ========================================================
         #
         # Old cold path:
@@ -3949,11 +5017,13 @@ ORDER BY M.Name, M.Code
         # This preserves exact row Price/Amount while removing thousands of
         # unrelated transaction rows from the user-facing request.
         #
-        # PageSize=0 ("All"), Grouped/Hierarchical, and very large pages keep
-        # the complete calculation path because they genuinely need all rows.
+        # Balances, Detailed and Columnar can value only the requested page.
+        # Grouped/Hierarchical remain global views and keep the complete
+        # calculation path, but are now requested lazily only when clicked.
+        # PageSize=0 ("All") and very large pages also keep the full path.
         # ========================================================
         $fastPageModeActive = (
-            $viewMode -eq "balances" -and
+            $viewMode -in @("balances", "detailed", "columnar") -and
             $PageSize -gt 0 -and
             $PageSize -le 250
         )
@@ -3977,11 +5047,21 @@ ORDER BY M.Name, M.Code
             $fastGlobalGroupTotals = @()
             $fastIndexHit = $false
 
-            # Persistent index survives bridge restarts. It is accepted only
-            # while the underlying BDS file's write timestamp/size are
-            # unchanged, so normal voucher modifications invalidate it.
+            # Persistent quantity index survives bridge restarts.
+            #
+            # Access/BDS invalidation:
+            #   physical DB file timestamp + file size
+            #
+            # SQL Server invalidation:
+            #   cheap voucher/activity signature from Tran1 + Tran2
+            #
+            # The SQL signature intentionally avoids COUNT(*) over Tran2.
+            # MAX(VchCode) and MAX(Tran2.VchCode) are enough to invalidate on
+            # normal new-voucher activity, while the 30-minute in-memory TTL
+            # still bounds staleness for unusual in-place edits.
             $fastDiskCachePath = ""
             $fastDiskDbStamp = ""
+            $fastDiskIdentity = ""
 
             if ($null -ne $directStockContext) {
                 $fastDiskDbStamp = (
@@ -3990,6 +5070,103 @@ ORDER BY M.Name, M.Code
                     [string]$directStockContext.length
                 )
 
+                $fastDiskIdentity =
+                    [string]$directStockContext.path
+            }
+            elseif (
+                $stockDbType -eq 1 -and
+                $null -ne $directStockConn
+            ) {
+                try {
+                    $sqlStampTable =
+                        Invoke-StockStatusDirectTable `
+                            -Connection $directStockConn `
+                            -Timeout 30 `
+                            -Sql @"
+SELECT
+    ISNULL(MAX(VchCode), 0) AS MaxTran1VchCode,
+    ISNULL(MAX(CreationTime), 0) AS MaxTran1CreationTime
+FROM Tran1
+"@
+
+                    $sqlTran2StampTable =
+                        Invoke-StockStatusDirectTable `
+                            -Connection $directStockConn `
+                            -Timeout 30 `
+                            -Sql @"
+SELECT ISNULL(MAX(VchCode), 0) AS MaxTran2VchCode
+FROM Tran2
+WHERE RecType = 2
+"@
+
+                    $stampTran1Code = 0
+                    $stampTran2Code = 0
+                    $stampCreation = ""
+
+                    if ($sqlStampTable.Rows.Count -gt 0) {
+                        $stampTran1Code =
+                            ConvertTo-ReportInt (
+                                $sqlStampTable.Rows[0]["MaxTran1VchCode"]
+                            )
+
+                        try {
+                            $rawCreation =
+                                $sqlStampTable.Rows[0][
+                                    "MaxTran1CreationTime"
+                                ]
+
+                            if (
+                                $null -ne $rawCreation -and
+                                $rawCreation -ne
+                                [System.DBNull]::Value
+                            ) {
+                                $stampCreation =
+                                    [string]$rawCreation
+                            }
+                        }
+                        catch {}
+                    }
+
+                    if ($sqlTran2StampTable.Rows.Count -gt 0) {
+                        $stampTran2Code =
+                            ConvertTo-ReportInt (
+                                $sqlTran2StampTable.Rows[0][
+                                    "MaxTran2VchCode"
+                                ]
+                            )
+                    }
+
+                    $fastDiskDbStamp = (
+                        [string]$stampTran1Code +
+                        ":" +
+                        [string]$stampTran2Code +
+                        ":" +
+                        $stampCreation
+                    )
+
+                    $fastDiskIdentity = (
+                        "sql|" +
+                        [string]$InstanceId +
+                        "|" +
+                        [string]$CompanyCode
+                    )
+                }
+                catch {
+                    # Persistent cache is optional. Direct SQL aggregation still
+                    # works even if the lightweight DB signature cannot be read.
+                    $fastDiskDbStamp = ""
+                    $fastDiskIdentity = ""
+                }
+            }
+
+            if (
+                -not [string]::IsNullOrWhiteSpace(
+                    $fastDiskDbStamp
+                ) -and
+                -not [string]::IsNullOrWhiteSpace(
+                    $fastDiskIdentity
+                )
+            ) {
                 try {
                     $fastDiskCacheDir =
                         Join-Path `
@@ -4005,7 +5182,7 @@ ORDER BY M.Name, M.Code
                             -Text (
                                 $fastIndexKey +
                                 "|" +
-                                [string]$directStockContext.path
+                                $fastDiskIdentity
                             )
 
                     $fastDiskCachePath =
@@ -4087,7 +5264,7 @@ ORDER BY M.Name, M.Code
 
                     if (
                         [string]$fastDiskEntry.engine -eq
-                            "stock-fast-index-v8" -and
+                            "stock-fast-index-v11-single-snapshot" -and
                         [string]$fastDiskEntry.dbStamp -eq
                             $fastDiskDbStamp -and
                         $null -ne $fastDiskEntry.candidateCodes -and
@@ -5145,7 +6322,7 @@ GROUP BY
                 ) {
                     try {
                         $diskPayload = [ordered]@{
-                            engine = "stock-fast-index-v8"
+                            engine = "stock-fast-index-v11-single-snapshot"
                             dbStamp = $fastDiskDbStamp
                             candidateCodes =
                                 @($fastCandidateCodes)
@@ -7127,6 +8304,23 @@ ORDER BY
                     stockValue = [Math]::Round($mcClosingValue, 2)
                     valuationRate = [Math]::Round($mcRate, 6)
                     postedLedgerValue = [Math]::Round($mcPostedClosingValue, 2)
+
+                    purchaseQuantity = [Math]::Round([double]$state.purchaseQty, 3)
+                    saleQuantity = [Math]::Round([double]$state.saleQty, 3)
+                    saleReturnQuantity = [Math]::Round([double]$state.saleReturnQty, 3)
+                    purchaseReturnQuantity = [Math]::Round([double]$state.purchaseReturnQty, 3)
+                    transferInQuantity = [Math]::Round([double]$state.transferInQty, 3)
+                    transferOutQuantity = [Math]::Round([double]$state.transferOutQty, 3)
+                    transferInAltQuantity = [Math]::Round([double]$state.transferInAltQty, 3)
+                    transferOutAltQuantity = [Math]::Round([double]$state.transferOutAltQty, 3)
+                    productionGeneratedQuantity = [Math]::Round([double]$state.productionGeneratedQty, 3)
+                    productionConsumedQuantity = [Math]::Round([double]$state.productionConsumedQty, 3)
+                    stockJournalGeneratedQuantity = [Math]::Round([double]$state.stockJournalGeneratedQty, 3)
+                    stockJournalConsumedQuantity = [Math]::Round([double]$state.stockJournalConsumedQty, 3)
+                    materialReceiptQuantity = [Math]::Round([double]$state.materialReceiptQty, 3)
+                    materialIssueQuantity = [Math]::Round([double]$state.materialIssueQty, 3)
+                    otherInQuantity = [Math]::Round([double]$state.otherInQty, 3)
+                    otherOutQuantity = [Math]::Round([double]$state.otherOutQty, 3)
                 })
 
                 $openingMain += $mcOpeningMain
@@ -7255,6 +8449,20 @@ ORDER BY
                 purchaseReturnQuantity = [Math]::Round($purchaseReturnQty, 3)
                 transferInQuantity = [Math]::Round($transferInQty, 3)
                 transferOutQuantity = [Math]::Round($transferOutQty, 3)
+                transferInAltQuantity = [Math]::Round(
+                    [double]((
+                        @($centres) |
+                        Measure-Object -Property transferInAltQuantity -Sum
+                    ).Sum),
+                    3
+                )
+                transferOutAltQuantity = [Math]::Round(
+                    [double]((
+                        @($centres) |
+                        Measure-Object -Property transferOutAltQuantity -Sum
+                    ).Sum),
+                    3
+                )
                 productionGeneratedQuantity = [Math]::Round($productionGeneratedQty, 3)
                 productionConsumedQuantity = [Math]::Round($productionConsumedQty, 3)
                 stockJournalGeneratedQuantity = [Math]::Round($stockJournalGeneratedQty, 3)
@@ -7426,7 +8634,7 @@ ORDER BY
                 fastPageValuation = $true
 
                 valuationSource = if ($valueMode -eq "busy") {
-                    "busy-stockvalmethod-5-v8-busy-parity-fast-cache"
+                    "busy-stockvalmethod-5-v11-single-snapshot"
                 }
                 else {
                     "item-master-$valueMode-price"
@@ -7434,7 +8642,7 @@ ORDER BY
 
                 stockValuationMethod = 5
                 stockValuationMode =
-                    "busy-method5-v8-busy-parity-fast-cache-by-material-centre"
+                    "busy-method5-v11-single-snapshot-by-material-centre"
 
                 options = @{
                     unitMode = $unitDisplay
@@ -7584,9 +8792,9 @@ ORDER BY
             companyItemCount = $companyItemCount
             pageSizeOptions = @($pageSizeOptions)
             summaryScope = "all"
-            valuationSource = if ($valueMode -eq "busy") { "busy-stockvalmethod-5-v8-busy-parity-fast-cache" } else { "item-master-$valueMode-price" }
+            valuationSource = if ($valueMode -eq "busy") { "busy-stockvalmethod-5-v11-single-snapshot" } else { "item-master-$valueMode-price" }
             stockValuationMethod = 5
-            stockValuationMode = "busy-method5-v8-busy-parity-fast-cache-by-material-centre"
+            stockValuationMode = "busy-method5-v11-single-snapshot-by-material-centre"
             options = @{
                 unitMode = $unitDisplay
                 showValue = $ShowValue

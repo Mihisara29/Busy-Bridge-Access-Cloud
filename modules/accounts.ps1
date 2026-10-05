@@ -10,6 +10,7 @@
 Write-Host "  [PARTIES-FISCAL-DB-V2] Party/account reads use the active fiscal database." -ForegroundColor DarkCyan
 
 Write-Host "  [PARTIES-QUERY-V3] Page-first party/account query loaded." -ForegroundColor DarkCyan
+Write-Host "  [PARTIES-SEARCH-DIALECT-V4] Direct party search supports ANSI-92 (%) and Access (*) wildcards." -ForegroundColor DarkCyan
 
 Write-Host "  [PARTY-GROUPS-DIRECT-V1] Party Account Group permission tree is COM-free." -ForegroundColor DarkCyan
 
@@ -552,8 +553,10 @@ AND Master1.ParentGrp IN (
 
             $where += @"
  AND (
-    Master1.Name LIKE '$wildcard$safeSearch$wildcard'
-    OR Master1.Alias LIKE '$wildcard$safeSearch$wildcard'
+    Master1.Name LIKE '%$safeSearch%'
+    OR Master1.Name LIKE '*$safeSearch*'
+    OR Master1.Alias LIKE '%$safeSearch%'
+    OR Master1.Alias LIKE '*$safeSearch*'
  )
 "@
         }
@@ -707,7 +710,7 @@ ORDER BY Master1.Name
 function Get-AccountLookup {
     param(
         [string]$Search      = "",
-        [int]$Limit          = 100,
+        [int]$Limit          = 50,
         [string]$InstanceId  = "",
         [string]$CompanyCode = ""
     )
@@ -752,8 +755,10 @@ AND Master1.Name <> ''
             $safeSearch = $Search.Trim().Replace("'", "''")
             $where += @"
  AND (
-    Master1.Name LIKE '$wildcard$safeSearch$wildcard'
-    OR Master1.Alias LIKE '$wildcard$safeSearch$wildcard'
+    Master1.Name LIKE '%$safeSearch%'
+    OR Master1.Name LIKE '*$safeSearch*'
+    OR Master1.Alias LIKE '%$safeSearch%'
+    OR Master1.Alias LIKE '*$safeSearch*'
  )
 "@
         }
@@ -2267,18 +2272,33 @@ function Get-PartiesDirectDatabase {
             $safeSearch =
                 $Search.Trim().Replace("'", "''")
 
+            # IMPORTANT:
+            # Direct Access reads use OleDb/ADO.NET, and some BUSY .bds files
+            # are evaluated in ANSI-92 mode (%) while older Access-style
+            # queries use (*). Searching with only * caused every typed party
+            # lookup to return zero rows although the unfiltered list worked.
+            #
+            # Supporting both syntaxes is safe:
+            # - SQL Server matches the % branch.
+            # - Access ANSI-92 matches the % branch.
+            # - Access ANSI-89 matches the * branch.
             $where += @"
  AND (
-      M.Name LIKE '$wildcard$safeSearch$wildcard'
-      OR M.Alias LIKE '$wildcard$safeSearch$wildcard'
+      M.Name LIKE '%$safeSearch%'
+      OR M.Name LIKE '*$safeSearch*'
+      OR M.Alias LIKE '%$safeSearch%'
+      OR M.Alias LIKE '*$safeSearch*'
       OR EXISTS (
           SELECT 1
           FROM $addressRef
           WHERE AX.MasterCode = M.Code
             AND (
-                 AX.TelNo LIKE '$wildcard$safeSearch$wildcard'
-                 OR AX.Mobile LIKE '$wildcard$safeSearch$wildcard'
-                 OR AX.TINNo LIKE '$wildcard$safeSearch$wildcard'
+                 AX.TelNo LIKE '%$safeSearch%'
+                 OR AX.TelNo LIKE '*$safeSearch*'
+                 OR AX.Mobile LIKE '%$safeSearch%'
+                 OR AX.Mobile LIKE '*$safeSearch*'
+                 OR AX.TINNo LIKE '%$safeSearch%'
+                 OR AX.TINNo LIKE '*$safeSearch*'
             )
       )
  )
@@ -3619,32 +3639,332 @@ function Get-MaterialCenters {
 function Get-VoucherSeries {
     param(
         [int]$VchType = 0,
-        [string]$InstanceId  = "",
+        [string]$InstanceId = "",
         [string]$CompanyCode = ""
     )
-    $cacheKey = "$InstanceId|$CompanyCode|vch-series"
-    $cached = Get-Cache $cacheKey
-    if ($cached) { return $cached }
-    $fi = Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode
-    if (-not $fi) { return @{ success = $false; error = "BUSY connection failed" } }
-    try {
-        $series = @()
-        try {
-            $rst = $fi.GetRecordset("SELECT Name, Code FROM VoucherSeries ORDER BY Name")
-            $series = Read-Recordset $rst { param($r) @{ code=[int][string]$r.Fields.Item("Code").Value; name=[string]$r.Fields.Item("Name").Value } }
-        } catch { }
-        if ($series.Count -eq 0) {
-            try {
-                $rst2 = $fi.GetRecordset("SELECT Name, Code FROM Master1 WHERE MasterType = 21 ORDER BY Name")
-                $series = Read-Recordset $rst2 { param($r) $rawName = [string]$r.Fields.Item("Name").Value; @{ code=[int][string]$r.Fields.Item("Code").Value; name=($rawName -replace '^\d+', ''); originalName=$rawName } }
-            } catch { }
+
+    # IMPORTANT:
+    # Read-only voucher-series lookup must never initialize BUSY COM.
+    # A COM context switch can take tens of seconds and, because the API
+    # request loop is synchronous, can make unrelated login/API calls appear
+    # frozen. Read Master1 directly from the active fiscal database instead.
+    $requestCacheKey = (
+        "{0}|{1}|voucherseries|{2}" -f
+        $InstanceId,
+        $CompanyCode,
+        $VchType
+    ).ToLowerInvariant()
+
+    $cached = Get-Cache $requestCacheKey
+    if ($cached) {
+        Write-Host (
+            "  [SERIES-FAST-V2] cache HIT {0}/{1} type={2}" -f
+            $InstanceId,
+            $CompanyCode,
+            $VchType
+        ) -ForegroundColor DarkCyan
+
+        return $cached
+    }
+
+    # Cache the raw voucher-series master once per company. Different voucher
+    # types can then be filtered in memory without reopening the database.
+    if ($null -eq $script:BusyCloudVoucherSeriesMasterCache) {
+        $script:BusyCloudVoucherSeriesMasterCache = @{}
+    }
+
+    $masterCacheKey = (
+        "{0}|{1}|all-series" -f
+        $InstanceId,
+        $CompanyCode
+    ).ToLowerInvariant()
+
+    $allSeries = $null
+
+    if ($script:BusyCloudVoucherSeriesMasterCache.ContainsKey($masterCacheKey)) {
+        $entry = $script:BusyCloudVoucherSeriesMasterCache[$masterCacheKey]
+
+        if (
+            $entry -and
+            $entry.expires -and
+            (Get-Date) -lt $entry.expires
+        ) {
+            $allSeries = @($entry.data)
         }
-        $seen = [System.Collections.Generic.HashSet[string]]::new()
-        $series = $series | Where-Object { $seen.Add($_.name) }
-        $result = @{ success = $true; count = $series.Count; data = $series }
-        if ($series.Count -gt 0) { Set-Cache $cacheKey $result }
+        else {
+            try {
+                $script:BusyCloudVoucherSeriesMasterCache.Remove(
+                    $masterCacheKey
+                )
+            }
+            catch {}
+        }
+    }
+
+    $startedAt = [System.Diagnostics.Stopwatch]::StartNew()
+    $ctx = $null
+    $reader = $null
+    $cmd = $null
+
+    try {
+        if ($null -eq $allSeries) {
+            $ctx = Get-BusyCloudFastConfigDbContext `
+                -InstanceId $InstanceId `
+                -CompanyCode $CompanyCode
+
+            if (
+                $null -eq $ctx -or
+                $null -eq $ctx.connection
+            ) {
+                throw "Direct fiscal database connection is unavailable."
+            }
+
+            $conn = $ctx.connection
+            $dbType = [int]$ctx.dbType
+            $cmd = $conn.CreateCommand()
+
+            # This is only a hard ceiling. Normal calls should complete in
+            # milliseconds. SQL NOLOCK avoids a normal BUSY write lock turning
+            # this harmless read into a long UI/login stall.
+            try { $cmd.CommandTimeout = 10 } catch {}
+
+            if ($dbType -eq 1) {
+                $cmd.CommandText = @"
+SELECT
+    Code,
+    Name,
+    I1,
+    ParentGrp,
+    CM1,
+    CM2
+FROM Master1 WITH (NOLOCK)
+WHERE MasterType = 21
+"@
+            }
+            else {
+                $cmd.CommandText = @"
+SELECT
+    Code,
+    Name,
+    I1,
+    ParentGrp,
+    CM1,
+    CM2
+FROM Master1
+WHERE MasterType = 21
+"@
+            }
+
+            $reader = $cmd.ExecuteReader()
+            $loaded = @()
+
+            while ($reader.Read()) {
+                $code = 0
+                $name = ""
+                $i1 = 0
+                $parentGrp = 0
+                $cm1 = 0
+                $cm2 = 0
+
+                try {
+                    if (-not $reader.IsDBNull(0)) {
+                        $code = [int][string]$reader.GetValue(0)
+                    }
+                }
+                catch {}
+
+                try {
+                    if (-not $reader.IsDBNull(1)) {
+                        $name = ([string]$reader.GetValue(1)).Trim()
+                    }
+                }
+                catch {}
+
+                foreach ($pair in @(
+                    @{ index = 2; target = "i1" },
+                    @{ index = 3; target = "parentGrp" },
+                    @{ index = 4; target = "cm1" },
+                    @{ index = 5; target = "cm2" }
+                )) {
+                    $value = 0
+
+                    try {
+                        if (-not $reader.IsDBNull([int]$pair.index)) {
+                            $value = [int][string]$reader.GetValue(
+                                [int]$pair.index
+                            )
+                        }
+                    }
+                    catch {
+                        $value = 0
+                    }
+
+                    switch ([string]$pair.target) {
+                        "i1"        { $i1 = $value }
+                        "parentGrp" { $parentGrp = $value }
+                        "cm1"       { $cm1 = $value }
+                        "cm2"       { $cm2 = $value }
+                    }
+                }
+
+                if (
+                    $code -gt 0 -and
+                    -not [string]::IsNullOrWhiteSpace($name)
+                ) {
+                    $loaded += @{
+                        code      = $code
+                        rawName   = $name
+                        I1        = $i1
+                        ParentGrp = $parentGrp
+                        CM1       = $cm1
+                        CM2       = $cm2
+                    }
+                }
+            }
+
+            try { $reader.Close() } catch {}
+            try { $reader.Dispose() } catch {}
+            $reader = $null
+
+            try { $cmd.Dispose() } catch {}
+            $cmd = $null
+
+            $allSeries = @($loaded)
+
+            $script:BusyCloudVoucherSeriesMasterCache[$masterCacheKey] = @{
+                expires = (Get-Date).AddMinutes(5)
+                data    = @($allSeries)
+            }
+        }
+
+        $filtered = @()
+
+        foreach ($series in @($allSeries)) {
+            $seriesVchType = 0
+
+            foreach ($candidate in @(
+                $series.I1,
+                $series.ParentGrp,
+                $series.CM1,
+                $series.CM2
+            )) {
+                $parsed = 0
+
+                if (
+                    [int]::TryParse([string]$candidate, [ref]$parsed) -and
+                    $parsed -gt 0
+                ) {
+                    $seriesVchType = $parsed
+                    break
+                }
+            }
+
+            $cleanName = ([string]$series.rawName).Trim()
+
+            if (
+                $seriesVchType -gt 0 -and
+                $cleanName.StartsWith(
+                    ("{0:D2}" -f $seriesVchType),
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            ) {
+                $cleanName = $cleanName.Substring(2)
+            }
+
+            if ($VchType -le 0 -or $seriesVchType -eq $VchType) {
+                $filtered += @{
+                    code    = [int]$series.code
+                    name    = $cleanName
+                    vchType = $seriesVchType
+                }
+            }
+        }
+
+        # Compatibility fallback for company databases whose Master1 series
+        # rows do not expose the voucher type in I1/ParentGrp/CM1/CM2.
+        if (
+            $VchType -gt 0 -and
+            $filtered.Count -eq 0 -and
+            $allSeries.Count -gt 0
+        ) {
+            foreach ($series in @($allSeries)) {
+                $cleanName = ([string]$series.rawName).Trim()
+
+                if (
+                    $cleanName.Length -ge 2 -and
+                    $cleanName.Substring(0, 2) -match '^\d{2}$'
+                ) {
+                    $cleanName = $cleanName.Substring(2)
+                }
+
+                $filtered += @{
+                    code    = [int]$series.code
+                    name    = $cleanName
+                    vchType = 0
+                }
+            }
+        }
+
+        $filtered = @(
+            $filtered |
+            Sort-Object name
+        )
+
+        $result = @{
+            success = $true
+            count   = @($filtered).Count
+            data    = @($filtered)
+        }
+
+        Set-Cache $requestCacheKey $result
+
+        $startedAt.Stop()
+
+        Write-Host (
+            "  [SERIES-FAST-V2] {0}/{1} type={2} rows={3} elapsedMs={4}" -f
+            $InstanceId,
+            $CompanyCode,
+            $VchType,
+            @($filtered).Count,
+            [int]$startedAt.ElapsedMilliseconds
+        ) -ForegroundColor DarkCyan
+
         return $result
-    } finally { Disconnect-BUSY $fi }
+    }
+    catch {
+        if ($startedAt.IsRunning) {
+            $startedAt.Stop()
+        }
+
+        Write-Host (
+            "  [SERIES-FAST-V2 FAIL] {0}/{1} type={2} elapsedMs={3} error={4}" -f
+            $InstanceId,
+            $CompanyCode,
+            $VchType,
+            [int]$startedAt.ElapsedMilliseconds,
+            $_.Exception.Message
+        ) -ForegroundColor Red
+
+        return @{
+            success = $false
+            error = $_.Exception.Message
+        }
+    }
+    finally {
+        if ($reader) {
+            try { $reader.Close() } catch {}
+            try { $reader.Dispose() } catch {}
+        }
+
+        if ($cmd) {
+            try { $cmd.Dispose() } catch {}
+        }
+
+        if ($ctx -and $ctx.connection) {
+            try { $ctx.connection.Close() } catch {}
+            try { $ctx.connection.Dispose() } catch {}
+        }
+    }
 }
 
 function Get-VoucherTypes {
