@@ -34,6 +34,7 @@
 # BUSYCLOUD WEB APPROVAL MODULE VERSION
 # ============================================================================
 $script:BusyCloudWebApprovalModuleVersion = "6.8-direct-manager-edit-comparison"
+Write-Host "  [WEB-APPROVAL ACCESS-FIX] Jet parameter compatibility patch 2026-10-05 loaded." -ForegroundColor Green
 Write-Host "  [WEB-APPROVAL] Module version $script:BusyCloudWebApprovalModuleVersion loaded." -ForegroundColor DarkCyan
 
 $script:WebApprovalSchemaVersion = 1
@@ -288,6 +289,17 @@ function Ensure-WebApprovalRoleColumn {
         throw "MobileUserPreference table does not exist in permanent database '$($Context.database)'."
     }
 
+    # IMPORTANT:
+    # B35/B36 are BusyCloud-owned extension columns used for the Web Approval
+    # workflow role. Older BUSY company databases may not contain them.
+    #
+    # Previously this function threw when either column was missing. That made
+    # /busy/web-approval/me, push subscriptions and the push worker fail after
+    # a perfectly successful BUSY login. Fresh/older Access companies therefore
+    # looked like a login failure in the browser.
+    #
+    # Make the schema migration idempotent, exactly like the existing B37
+    # manager-item-edit migration below.
     foreach ($columnName in @("B35", "B36")) {
         if (-not (Test-WebApprovalColumnExists `
             -Connection $conn `
@@ -295,11 +307,30 @@ function Ensure-WebApprovalRoleColumn {
             -TableName "MobileUserPreference" `
             -ColumnName $columnName)) {
 
-            throw (
-                "MobileUserPreference.{0} is required for Web Approval workflow roles " +
-                "but does not exist in permanent database '{1}'."
-            ) -f $columnName, $Context.database
+            if ($dbType -eq 1) {
+                [void](Invoke-WebApprovalNonQuery `
+                    -Connection $conn `
+                    -Sql ("ALTER TABLE dbo.MobileUserPreference ADD [{0}] BIT NULL" -f $columnName))
+            }
+            else {
+                [void](Invoke-WebApprovalNonQuery `
+                    -Connection $conn `
+                    -Sql ("ALTER TABLE [MobileUserPreference] ADD COLUMN [{0}] BYTE" -f $columnName))
+            }
+
+            Write-Host (
+                "  [WEB-APPROVAL MIGRATION] Added MobileUserPreference.{0} in {1}" -f `
+                $columnName,
+                $Context.database
+            ) -ForegroundColor Yellow
         }
+
+        try {
+            [void](Invoke-WebApprovalNonQuery `
+                -Connection $conn `
+                -Sql ("UPDATE [MobileUserPreference] SET [{0}]=0 WHERE [{0}] IS NULL" -f $columnName))
+        }
+        catch {}
     }
 
     return $true
@@ -2225,7 +2256,7 @@ function Add-WebApprovalCommandParameter {
         [int]$DbType,
         [string]$Name,
         $Value,
-        [ValidateSet("Text", "LongText", "Int", "Decimal", "GeoDecimal", "Date", "Bool")]
+        [ValidateSet("Text", "LongText", "SmallInt", "Int", "Decimal", "GeoDecimal", "Date", "Bool")]
         [string]$Kind = "Text",
         [int]$Size = 255
     )
@@ -2236,6 +2267,9 @@ function Add-WebApprovalCommandParameter {
         switch ($Kind) {
             "LongText" {
                 $p = $Command.Parameters.Add($Name, [System.Data.SqlDbType]::NVarChar, -1)
+            }
+            "SmallInt" {
+                $p = $Command.Parameters.Add($Name, [System.Data.SqlDbType]::SmallInt)
             }
             "Int" {
                 $p = $Command.Parameters.Add($Name, [System.Data.SqlDbType]::Int)
@@ -2270,12 +2304,35 @@ function Add-WebApprovalCommandParameter {
 
     switch ($Kind) {
         "LongText" { $oleType = [System.Data.OleDb.OleDbType]::LongVarWChar }
+        "SmallInt" { $oleType = [System.Data.OleDb.OleDbType]::SmallInt }
         "Int"      { $oleType = [System.Data.OleDb.OleDbType]::Integer }
         "Decimal"  { $oleType = [System.Data.OleDb.OleDbType]::Double }
         "GeoDecimal" { $oleType = [System.Data.OleDb.OleDbType]::Double }
-        "Date"     { $oleType = [System.Data.OleDb.OleDbType]::DBTimeStamp }
+        # Jet/Access DATETIME columns are exposed as OLE DB DATE. DBTimeStamp
+        # can be rejected by Microsoft.Jet.OLEDB.4.0 as a criteria/type mismatch.
+        "Date"     { $oleType = [System.Data.OleDb.OleDbType]::Date }
+        # BusyCloud Access support tables deliberately store Boolean-style flags
+        # as BYTE, so keep UnsignedTinyInt here instead of OleDbType.Boolean.
         "Bool"     { $oleType = [System.Data.OleDb.OleDbType]::UnsignedTinyInt }
         default    { $oleType = [System.Data.OleDb.OleDbType]::VarWChar }
+    }
+
+    # Keep the CLR value aligned with the provider type. Jet is stricter than
+    # SqlClient and can otherwise report only "Data type mismatch in criteria expression."
+    if ($dbValue -ne [System.DBNull]::Value) {
+        switch ($Kind) {
+            "SmallInt"   { $dbValue = [int16]$Value }
+            "Int"        { $dbValue = [int]$Value }
+            "Decimal"    { $dbValue = [double]$Value }
+            "GeoDecimal" { $dbValue = [double]$Value }
+            "Date"       { $dbValue = [datetime]$Value }
+            "Bool" {
+                try { $dbValue = [byte]([int]$Value) }
+                catch { $dbValue = if ([bool]$Value) { [byte]1 } else { [byte]0 } }
+            }
+            "Text"       { $dbValue = [string]$Value }
+            "LongText"   { $dbValue = [string]$Value }
+        }
     }
 
     $p = New-Object System.Data.OleDb.OleDbParameter
@@ -2289,6 +2346,39 @@ function Add-WebApprovalCommandParameter {
     $p.Value = $dbValue
     [void]$Command.Parameters.Add($p)
     return $p
+}
+
+function Invoke-WebApprovalExecuteNonQuery {
+    param(
+        $Command,
+        [int]$DbType,
+        [string]$Stage
+    )
+
+    try {
+        return [int]$Command.ExecuteNonQuery()
+    }
+    catch {
+        $parameterTypes = @()
+        try {
+            for ($i = 0; $i -lt $Command.Parameters.Count; $i++) {
+                $p = $Command.Parameters[$i]
+                $providerType = if ($DbType -eq 1) { [string]$p.SqlDbType } else { [string]$p.OleDbType }
+                $clrType = if ($null -eq $p.Value -or $p.Value -eq [System.DBNull]::Value) {
+                    "DBNull"
+                }
+                else {
+                    $p.Value.GetType().Name
+                }
+                $parameterTypes += ("#{0}:{1}/{2}" -f ($i + 1), $providerType, $clrType)
+            }
+        }
+        catch {}
+
+        Write-Host ("  [WEB-APPROVAL DB FAIL] stage='{0}' dbType={1} params=[{2}]" -f $Stage, $DbType, ($parameterTypes -join ", ")) -ForegroundColor Red
+        Write-Host ("  [WEB-APPROVAL DB FAIL] {0}" -f $_.Exception.Message) -ForegroundColor Red
+        throw
+    }
 }
 
 function Get-WebApprovalExistingSubmission {
@@ -2398,6 +2488,9 @@ INSERT INTO dbo.BusyCloudWebApproval
     LocationLocalDate,
     PayloadJson,
     PayloadHash,
+    OriginalPayloadJson,
+    OriginalPayloadHash,
+    HasManagerChanges,
     ApprovalStatus,
     SyncStatus,
     SyncAttempts,
@@ -2422,6 +2515,9 @@ VALUES
     @locationLocalDate,
     @payloadJson,
     @payloadHash,
+    @originalPayloadJson,
+    @originalPayloadHash,
+    @hasManagerChanges,
     @approvalStatus,
     @syncStatus,
     @syncAttempts,
@@ -2433,7 +2529,7 @@ VALUES
 
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@id" -Value $Id -Kind Text -Size 36)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@submittedBy" -Value $SubmittedBy -Kind Text -Size 100)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@voucherType" -Value $VoucherType -Kind Int)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@voucherType" -Value $VoucherType -Kind SmallInt)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@voucherDate" -Value $VoucherDate -Kind Date)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@requestedSeries" -Value $RequestedSeries -Kind Text -Size 100)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@requestedVoucherNo" -Value $RequestedVoucherNo -Kind Text -Size 100)
@@ -2446,6 +2542,9 @@ VALUES
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@locationLocalDate" -Value $LocationLocalDate -Kind Text -Size 10)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@payloadJson" -Value $PayloadJson -Kind LongText)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@payloadHash" -Value $PayloadHash -Kind Text -Size 64)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@originalPayloadJson" -Value $PayloadJson -Kind LongText)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@originalPayloadHash" -Value $PayloadHash -Kind Text -Size 64)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@hasManagerChanges" -Value 0 -Kind Bool)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@approvalStatus" -Value "PENDING" -Kind Text -Size 20)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@syncStatus" -Value "NOT_READY" -Kind Text -Size 30)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@syncAttempts" -Value 0 -Kind Int)
@@ -2472,6 +2571,9 @@ INSERT INTO [BusyCloudWebApproval]
     [LocationLocalDate],
     [PayloadJson],
     [PayloadHash],
+    [OriginalPayloadJson],
+    [OriginalPayloadHash],
+    [HasManagerChanges],
     [ApprovalStatus],
     [SyncStatus],
     [SyncAttempts],
@@ -2481,13 +2583,13 @@ INSERT INTO [BusyCloudWebApproval]
 )
 VALUES
 (
-    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
 )
 "@
 
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p1" -Value $Id -Kind Text -Size 36)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p2" -Value $SubmittedBy -Kind Text -Size 100)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p3" -Value $VoucherType -Kind Int)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p3" -Value $VoucherType -Kind SmallInt)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p4" -Value $VoucherDate -Kind Date)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p5" -Value $RequestedSeries -Kind Text -Size 100)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p6" -Value $RequestedVoucherNo -Kind Text -Size 100)
@@ -2500,15 +2602,18 @@ VALUES
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p13" -Value $LocationLocalDate -Kind Text -Size 10)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p14" -Value $PayloadJson -Kind LongText)
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p15" -Value $PayloadHash -Kind Text -Size 64)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p16" -Value "PENDING" -Kind Text -Size 20)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p17" -Value "NOT_READY" -Kind Text -Size 30)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p18" -Value 0 -Kind Int)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p19" -Value $NowUtc -Kind Date)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p20" -Value $NowUtc -Kind Date)
-        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p21" -Value 1 -Kind Int)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p16" -Value $PayloadJson -Kind LongText)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p17" -Value $PayloadHash -Kind Text -Size 64)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p18" -Value 0 -Kind Bool)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p19" -Value "PENDING" -Kind Text -Size 20)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p20" -Value "NOT_READY" -Kind Text -Size 30)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p21" -Value 0 -Kind Int)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p22" -Value $NowUtc -Kind Date)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p23" -Value $NowUtc -Kind Date)
+        [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p24" -Value 1 -Kind Int)
     }
 
-    [void]$cmd.ExecuteNonQuery()
+    [void](Invoke-WebApprovalExecuteNonQuery -Command $cmd -DbType $dbType -Stage "insert-web-approval-pending")
 }
 
 function Add-WebApprovalActionRow {
@@ -2587,7 +2692,7 @@ VALUES
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p7" -Value $ActionTime -Kind Date)
     }
 
-    [void]$cmd.ExecuteNonQuery()
+    [void](Invoke-WebApprovalExecuteNonQuery -Command $cmd -DbType $dbType -Stage "insert-web-approval-action")
 }
 
 function Add-WebApprovalNotificationRow {
@@ -2684,7 +2789,7 @@ VALUES
         [void](Add-WebApprovalCommandParameter -Command $cmd -DbType $dbType -Name "@p8" -Value $CreatedAt -Kind Date)
     }
 
-    [void]$cmd.ExecuteNonQuery()
+    [void](Invoke-WebApprovalExecuteNonQuery -Command $cmd -DbType $dbType -Stage "insert-web-approval-notification")
 }
 
 function Submit-WebApprovalVoucher {
@@ -2776,7 +2881,9 @@ function Submit-WebApprovalVoucher {
             -InstanceId $InstanceId `
             -CompanyCode $CompanyCode
 
-        [void](Ensure-WebApprovalFiscalTables -Context $ctx)
+        # The initial Web Approval row must have the immutable audit snapshot
+        # columns available before it is inserted.
+        [void](Ensure-WebApprovalManagerEditFiscalSchema -Context $ctx)
 
         $existing = Get-WebApprovalExistingSubmission -Context $ctx -Id $id
 
@@ -3034,6 +3141,81 @@ function Invoke-WebApprovalVoucherCreateRouting {
                 error = "This voucher type uses Web Approval. The signed-in user must have the SALESMAN workflow role to submit a new voucher."
             }
         }
+    }
+
+    # WEB/BOTH submissions for vouchers that carry BUSY Salesman identity must
+    # come from a user who has an explicit per-voucher Salesman assignment.
+    # Never trust salesmanName/salesmanCode supplied by the browser: resolve the
+    # live assignment from MobileUserPreference.M2 and force that identity into
+    # the stored Web Approval payload.
+    if (@(26,12,9,3) -contains $vchType) {
+        $assignmentResult = Get-SalesmanAssignmentForAuthUser `
+            -AuthResult $AuthResult `
+            -VchType $vchType `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode `
+            -RequireAuth $RequireAuth
+
+        if (-not $assignmentResult.success) {
+            return @{
+                success = $false
+                handled = $true
+                result = @{
+                    success = $false
+                    httpStatus = 500
+                    errorCode = "WEB_APPROVAL_SALESMAN_ASSIGNMENT_READ_FAILED"
+                    error = if ($assignmentResult.error) { [string]$assignmentResult.error } else { "Could not read the user's BUSY Salesman assignment." }
+                }
+            }
+        }
+
+        if ($null -eq $assignmentResult.assignment) {
+            return @{
+                success = $false
+                handled = $true
+                result = @{
+                    success = $false
+                    httpStatus = 403
+                    errorCode = "WEB_APPROVAL_SALESMAN_ASSIGNMENT_REQUIRED"
+                    error = "A BUSY Salesman must be assigned to your user before you can submit this voucher for Web Approval. Please contact your administrator."
+                }
+            }
+        }
+
+        $resolvedSalesman = Resolve-LiveSalesmanMaster `
+            -Code ([int]$assignmentResult.assignment.code) `
+            -Name ([string]$assignmentResult.assignment.name) `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
+
+        if (-not $resolvedSalesman.success) {
+            return @{
+                success = $false
+                handled = $true
+                result = @{
+                    success = $false
+                    httpStatus = 500
+                    errorCode = "WEB_APPROVAL_SALESMAN_MASTER_READ_FAILED"
+                    error = if ($resolvedSalesman.error) { [string]$resolvedSalesman.error } else { "Could not validate the assigned BUSY Salesman." }
+                }
+            }
+        }
+
+        if (-not $resolvedSalesman.found) {
+            return @{
+                success = $false
+                handled = $true
+                result = @{
+                    success = $false
+                    httpStatus = 409
+                    errorCode = "WEB_APPROVAL_SALESMAN_ASSIGNMENT_INVALID"
+                    error = "The BUSY Salesman assigned to your user no longer exists. Ask an administrator to update your Salesman assignment before submitting."
+                }
+            }
+        }
+
+        $Data | Add-Member -MemberType NoteProperty -Name "salesmanCode" -Value ([int]$resolvedSalesman.data.code) -Force
+        $Data | Add-Member -MemberType NoteProperty -Name "salesmanName" -Value ([string]$resolvedSalesman.data.name) -Force
     }
 
     $managerResult = Get-WebApprovalManagersForSalesman `
@@ -5036,7 +5218,8 @@ function Sync-WebApprovalVoucher {
         [string]$ManagerUserName,
         [string]$ManualVoucherNo = "",
         [string]$InstanceId = "",
-        [string]$CompanyCode = ""
+        [string]$CompanyCode = "",
+        [bool]$AllowAdministrativeOverride = $false
     )
 
     # -----------------------------------------------------------------
@@ -5073,14 +5256,16 @@ function Sync-WebApprovalVoucher {
         }
     }
 
-    $access = Test-WebApprovalManagerCanActOnRecord `
-        -ManagerUserName $ManagerUserName `
-        -Record $record `
-        -InstanceId $InstanceId `
-        -CompanyCode $CompanyCode
+    if (-not $AllowAdministrativeOverride) {
+        $access = Test-WebApprovalManagerCanActOnRecord `
+            -ManagerUserName $ManagerUserName `
+            -Record $record `
+            -InstanceId $InstanceId `
+            -CompanyCode $CompanyCode
 
-    if (-not $access.success -or -not $access.allowed) {
-        return $access
+        if (-not $access.success -or -not $access.allowed) {
+            return $access
+        }
     }
 
     $approvalStatus = ([string]$record.ApprovalStatus).Trim().ToUpperInvariant()
@@ -5237,6 +5422,56 @@ function Sync-WebApprovalVoucher {
             -Name "bridgeUserName" `
             -Value $ManagerUserName.Trim() `
             -Force
+
+        # Defense in depth: synchronization must never post a manager-supplied
+        # Salesman. Always restore the identity from the immutable first
+        # submission snapshot for Salesman-enabled voucher types.
+        if (@(26,12,9,3) -contains $vchType) {
+            $syncOriginalJson = [string]$record.OriginalPayloadJson
+            if ([string]::IsNullOrWhiteSpace($syncOriginalJson)) {
+                # Legacy records created before immutable snapshots existed can
+                # only sync if the approved working payload still has Salesman.
+                $syncOriginalJson = [string]$record.PayloadJson
+            }
+
+            $syncOriginalPayload = $null
+            try {
+                if (-not [string]::IsNullOrWhiteSpace($syncOriginalJson)) {
+                    $syncOriginalPayload = $syncOriginalJson | ConvertFrom-Json
+                }
+            }
+            catch {}
+
+            $syncSalesmanName = ""
+            $syncSalesmanCode = 0
+
+            try {
+                $syncSalesmanName = ([string](
+                    Get-WebApprovalPropertyValue `
+                        -Object $syncOriginalPayload `
+                        -Names @("salesmanName") `
+                        -DefaultValue ""
+                )).Trim()
+            }
+            catch {}
+
+            try {
+                $syncSalesmanCode = [int](
+                    Get-WebApprovalPropertyValue `
+                        -Object $syncOriginalPayload `
+                        -Names @("salesmanCode") `
+                        -DefaultValue 0
+                )
+            }
+            catch { $syncSalesmanCode = 0 }
+
+            if ([string]::IsNullOrWhiteSpace($syncSalesmanName) -or $syncSalesmanCode -le 0) {
+                throw "The original Salesman identity is missing. BUSY synchronization is blocked to prevent creating a voucher with a blank or changed Salesman."
+            }
+
+            $postingPayload | Add-Member -MemberType NoteProperty -Name "salesmanName" -Value $syncSalesmanName -Force
+            $postingPayload | Add-Member -MemberType NoteProperty -Name "salesmanCode" -Value $syncSalesmanCode -Force
+        }
 
         $postingPayload = Update-WebApprovalSelfNumberReferences `
             -Payload $postingPayload `
@@ -5864,6 +6099,28 @@ WHERE [EndpointHash]=?
     }
 }
 
+function ConvertTo-WebApprovalAccessSqlLiteral {
+    param([AllowNull()][string]$Value)
+
+    if ($null -eq $Value) {
+        return "NULL"
+    }
+
+    # Access/Jet/ACE escapes a single quote by doubling it.
+    return "'" + ([string]$Value).Replace("'", "''") + "'"
+}
+
+function ConvertTo-WebApprovalAccessDateLiteral {
+    param([datetime]$Value)
+
+    # Access date literals are #MM/dd/yyyy HH:mm:ss#.
+    # Use invariant formatting so machine locale cannot change the SQL.
+    return "#" + $Value.ToString(
+        "MM/dd/yyyy HH:mm:ss",
+        [System.Globalization.CultureInfo]::InvariantCulture
+    ) + "#"
+}
+
 function Save-WebPushSubscription {
     param(
         [string]$UserName,
@@ -5945,6 +6202,7 @@ function Save-WebPushSubscription {
     $hash = Get-WebApprovalSha256 -Text $endpoint
     $ctx = $null
     $tx = $null
+    $failureStage = "open permanent database"
 
     try {
         $ctx = Get-WebApprovalPermanentDbContext `
@@ -5952,6 +6210,14 @@ function Save-WebPushSubscription {
             -CompanyCode $CompanyCode
 
         [void](Ensure-WebApprovalPermanentTables -Context $ctx)
+
+        $accessUserLiteral = ""
+        $accessHashLiteral = ""
+
+        if ([int]$ctx.dbType -eq 0) {
+            $accessUserLiteral = ConvertTo-WebApprovalAccessSqlLiteral -Value $user
+            $accessHashLiteral = ConvertTo-WebApprovalAccessSqlLiteral -Value $hash
+        }
 
         $existingId = ""
         $existingActive = $false
@@ -5971,18 +6237,20 @@ WHERE EndpointHash=@hash
             [void](Add-WebApprovalCommandParameter -Command $lookup -DbType 1 -Name "@userName" -Value $user -Kind Text -Size 100)
         }
         else {
+            # OLEDB/Jet can infer a parameter type that does not match BUSY's
+            # Access TEXT metadata when the parameter is used in a WHERE
+            # expression. These values are escaped before being embedded.
             $lookup.CommandText = @"
 SELECT TOP 1
     [Id], [IsActive], [CreatedAt]
 FROM [BusyCloudPushSubscription]
-WHERE [EndpointHash]=?
-  AND [UserName]=?
+WHERE [EndpointHash]=$accessHashLiteral
+  AND [UserName]=$accessUserLiteral
 "@
-            [void](Add-WebApprovalCommandParameter -Command $lookup -DbType 0 -Name "@p1" -Value $hash -Kind Text -Size 64)
-            [void](Add-WebApprovalCommandParameter -Command $lookup -DbType 0 -Name "@p2" -Value $user -Kind Text -Size 100)
         }
 
         $reader = $null
+        $failureStage = "lookup existing browser subscription"
 
         try {
             $reader = $lookup.ExecuteReader()
@@ -6028,20 +6296,20 @@ WHERE UserName=@userName
             [void](Add-WebApprovalCommandParameter -Command $deactivate -DbType 1 -Name "@endpointHash" -Value $hash -Kind Text -Size 64)
         }
         else {
+            $accessNowLiteral = ConvertTo-WebApprovalAccessDateLiteral -Value $now
+
             $deactivate.CommandText = @"
 UPDATE [BusyCloudPushSubscription]
 SET
     [IsActive]=0,
-    [UpdatedAt]=?
-WHERE [UserName]=?
-  AND [EndpointHash]<>?
+    [UpdatedAt]=$accessNowLiteral
+WHERE [UserName]=$accessUserLiteral
+  AND [EndpointHash]<>$accessHashLiteral
   AND [IsActive]<>0
 "@
-            [void](Add-WebApprovalCommandParameter -Command $deactivate -DbType 0 -Name "@p1" -Value $now -Kind Date)
-            [void](Add-WebApprovalCommandParameter -Command $deactivate -DbType 0 -Name "@p2" -Value $user -Kind Text -Size 100)
-            [void](Add-WebApprovalCommandParameter -Command $deactivate -DbType 0 -Name "@p3" -Value $hash -Kind Text -Size 64)
         }
 
+        $failureStage = "deactivate previous browser subscriptions"
         $deactivatedCount = [int]$deactivate.ExecuteNonQuery()
 
         if ($existingId) {
@@ -6081,33 +6349,35 @@ WHERE Id=@id
                 [void](Add-WebApprovalCommandParameter -Command $update -DbType 1 -Name "@id" -Value $existingId -Kind Text -Size 36)
             }
             else {
+                $accessIdLiteral = ConvertTo-WebApprovalAccessSqlLiteral -Value $existingId
+                $accessEndpointLiteral = ConvertTo-WebApprovalAccessSqlLiteral -Value $endpoint
+                $accessP256dhLiteral = ConvertTo-WebApprovalAccessSqlLiteral -Value $p256dh
+                $accessAuthLiteral = ConvertTo-WebApprovalAccessSqlLiteral -Value $authKey
+                $accessDeviceLiteral = ConvertTo-WebApprovalAccessSqlLiteral -Value $deviceName
+                $accessUserAgentLiteral = ConvertTo-WebApprovalAccessSqlLiteral -Value $userAgent
+                $accessCreatedLiteral = ConvertTo-WebApprovalAccessDateLiteral -Value $activationAt
+                $accessUpdatedLiteral = ConvertTo-WebApprovalAccessDateLiteral -Value $now
+
                 $update.CommandText = @"
 UPDATE [BusyCloudPushSubscription]
 SET
-    [Endpoint]=?,
-    [P256dh]=?,
-    [AuthKey]=?,
-    [DeviceName]=?,
-    [UserAgent]=?,
+    [Endpoint]=$accessEndpointLiteral,
+    [P256dh]=$accessP256dhLiteral,
+    [AuthKey]=$accessAuthLiteral,
+    [DeviceName]=$accessDeviceLiteral,
+    [UserAgent]=$accessUserAgentLiteral,
     [IsActive]=1,
-    [CreatedAt]=?,
-    [UpdatedAt]=?,
-    [LastSeenAt]=?
-WHERE [Id]=?
+    [CreatedAt]=$accessCreatedLiteral,
+    [UpdatedAt]=$accessUpdatedLiteral,
+    [LastSeenAt]=$accessUpdatedLiteral
+WHERE [Id]=$accessIdLiteral
 "@
-                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p1" -Value $endpoint -Kind LongText)
-                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p2" -Value $p256dh -Kind Text -Size 255)
-                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p3" -Value $authKey -Kind Text -Size 255)
-                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p4" -Value $deviceName -Kind Text -Size 150)
-                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p5" -Value $userAgent -Kind LongText)
-                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p6" -Value $activationAt -Kind Date)
-                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p7" -Value $now -Kind Date)
-                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p8" -Value $now -Kind Date)
-                [void](Add-WebApprovalCommandParameter -Command $update -DbType 0 -Name "@p9" -Value $existingId -Kind Text -Size 36)
             }
 
+            $failureStage = "refresh existing browser subscription"
             [void]$update.ExecuteNonQuery()
 
+            $failureStage = "commit refreshed browser subscription"
             $tx.Commit()
             $tx = $null
 
@@ -6155,6 +6425,18 @@ VALUES
             [void](Add-WebApprovalCommandParameter -Command $insert -DbType 1 -Name "@lastSeenAt" -Value $now -Kind Date)
         }
         else {
+            # The Access provider in BUSY .bds databases is sensitive to
+            # OleDbParameter type inference on INSERT (especially MEMO/TEXT).
+            # The previous diagnostic confirmed the failure occurs here.
+            # Use escaped Access SQL literals for this local metadata table.
+            $accessIdLiteral = ConvertTo-WebApprovalAccessSqlLiteral -Value $id
+            $accessEndpointLiteral = ConvertTo-WebApprovalAccessSqlLiteral -Value $endpoint
+            $accessP256dhLiteral = ConvertTo-WebApprovalAccessSqlLiteral -Value $p256dh
+            $accessAuthLiteral = ConvertTo-WebApprovalAccessSqlLiteral -Value $authKey
+            $accessDeviceLiteral = ConvertTo-WebApprovalAccessSqlLiteral -Value $deviceName
+            $accessUserAgentLiteral = ConvertTo-WebApprovalAccessSqlLiteral -Value $userAgent
+            $accessNowLiteral = ConvertTo-WebApprovalAccessDateLiteral -Value $now
+
             $insert.CommandText = @"
 INSERT INTO [BusyCloudPushSubscription]
 (
@@ -6164,24 +6446,26 @@ INSERT INTO [BusyCloudPushSubscription]
 )
 VALUES
 (
-    ?,?,?,?,?,?,?,?,1,?,?,?
+    $accessIdLiteral,
+    $accessUserLiteral,
+    $accessHashLiteral,
+    $accessEndpointLiteral,
+    $accessP256dhLiteral,
+    $accessAuthLiteral,
+    $accessDeviceLiteral,
+    $accessUserAgentLiteral,
+    1,
+    $accessNowLiteral,
+    $accessNowLiteral,
+    $accessNowLiteral
 )
 "@
-            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p1" -Value $id -Kind Text -Size 36)
-            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p2" -Value $user -Kind Text -Size 100)
-            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p3" -Value $hash -Kind Text -Size 64)
-            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p4" -Value $endpoint -Kind LongText)
-            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p5" -Value $p256dh -Kind Text -Size 255)
-            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p6" -Value $authKey -Kind Text -Size 255)
-            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p7" -Value $deviceName -Kind Text -Size 150)
-            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p8" -Value $userAgent -Kind LongText)
-            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p9" -Value $now -Kind Date)
-            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p10" -Value $now -Kind Date)
-            [void](Add-WebApprovalCommandParameter -Command $insert -DbType 0 -Name "@p11" -Value $now -Kind Date)
         }
 
+        $failureStage = "insert browser subscription"
         [void]$insert.ExecuteNonQuery()
 
+        $failureStage = "commit browser subscription"
         $tx.Commit()
         $tx = $null
 
@@ -6201,10 +6485,23 @@ VALUES
             try { $tx.Rollback() } catch {}
         }
 
+        $providerError = $_.Exception.Message
+        $fullError = "Push subscription failed during '$failureStage': $providerError"
+
+        Write-Host (
+            "  [PUSH-SUBSCRIBE FAIL] {0}/{1} user='{2}' stage='{3}' dbType={4} error={5}" -f
+            $InstanceId,
+            $CompanyCode,
+            $user,
+            $failureStage,
+            $(if ($ctx) { [int]$ctx.dbType } else { -1 }),
+            $providerError
+        ) -ForegroundColor Red
+
         return @{
             success = $false
             httpStatus = 500
-            error = $_.Exception.Message
+            error = $fullError
         }
     }
     finally {
@@ -6864,6 +7161,32 @@ function Get-WebPushJobsForCompany {
 function Get-WebPushPendingJobsAllCompanies {
     param([int]$Limit = 50)
 
+    # Emergency / deployment safety switch.
+    # The BUSY API is a synchronous HttpListener server. A slow/unreachable
+    # company database inside the push worker can otherwise occupy the only
+    # request loop and make login/API calls appear frozen.
+    #
+    # Set before starting the backend when troubleshooting:
+    #   $env:BUSYCLOUD_PUSH_WORKER_ENABLED = "0"
+    #
+    # Web/in-app notifications still remain stored; only background browser
+    # push delivery polling is paused.
+    $pushWorkerSetting = ([string]$env:BUSYCLOUD_PUSH_WORKER_ENABLED).Trim().ToLowerInvariant()
+    if ($pushWorkerSetting -in @("0", "false", "off", "no")) {
+        return @{
+            success = $true
+            data = @{
+                jobs = @()
+                count = 0
+                disabled = $true
+            }
+        }
+    }
+
+    if ($null -eq $script:WebPushCompanyFailureBackoff) {
+        $script:WebPushCompanyFailureBackoff = @{}
+    }
+
     $safeLimit = [Math]::Max(1, [Math]::Min(200, $Limit))
     $instancesPath = Join-Path (Split-Path -Parent $PSScriptRoot) "instances.json"
 
@@ -6881,6 +7204,17 @@ function Get-WebPushPendingJobsAllCompanies {
         foreach ($comp in @($inst.companies)) {
             if ($jobs.Count -ge $safeLimit) { break }
 
+            $companyKey = "{0}|{1}" -f ([string]$inst.id), ([string]$comp.code)
+            $backoffUntil = $null
+
+            if ($script:WebPushCompanyFailureBackoff.ContainsKey($companyKey)) {
+                try { $backoffUntil = [datetime]$script:WebPushCompanyFailureBackoff[$companyKey] } catch {}
+            }
+
+            if ($null -ne $backoffUntil -and $backoffUntil -gt [datetime]::UtcNow) {
+                continue
+            }
+
             try {
                 $remaining = $safeLimit - $jobs.Count
                 $companyJobs = @(
@@ -6891,10 +7225,19 @@ function Get-WebPushPendingJobsAllCompanies {
                 )
 
                 $jobs += $companyJobs
+
+                if ($script:WebPushCompanyFailureBackoff.ContainsKey($companyKey)) {
+                    $script:WebPushCompanyFailureBackoff.Remove($companyKey)
+                }
             }
             catch {
+                # Do not hammer an offline/slow SQL or Access company on every
+                # worker poll. One database timeout can otherwise repeatedly
+                # stall the synchronous API server and delay logins.
+                $script:WebPushCompanyFailureBackoff[$companyKey] = [datetime]::UtcNow.AddMinutes(5)
+
                 Write-Host (
-                    "  [PUSH-WORKER WARN] Could not read jobs for {0}/{1}: {2}" -f `
+                    "  [PUSH-WORKER WARN] Could not read jobs for {0}/{1}; backing off 5 minutes: {2}" -f `
                     $inst.id,
                     $comp.code,
                     $_.Exception.Message
@@ -8788,6 +9131,49 @@ function Get-WebApprovalRoleDirectory {
     }
 }
 
+# Remove all per-voucher BUSY Salesman assignments from M2. Sales Managers
+# must never carry a BUSY Salesman identity; Salesman assignment is only valid
+# for workflow roles NONE and SALESMAN.
+function Remove-WebApprovalSalesmanAssignmentsFromM2 {
+    param([string]$M2Json = "{}")
+
+    $map = $null
+    try {
+        if ([string]::IsNullOrWhiteSpace($M2Json)) {
+            $map = [pscustomobject]@{}
+        }
+        else {
+            $map = $M2Json | ConvertFrom-Json
+        }
+    }
+    catch {
+        return @{
+            success = $false
+            error = "Invalid MobileUserPreference.M2 JSON."
+        }
+    }
+
+    if ($null -eq $map) { $map = [pscustomobject]@{} }
+
+    # Remove obsolete global assignment if an old profile still contains it.
+    try { $map.PSObject.Properties.Remove("salesman") } catch {}
+
+    foreach ($vchTypeText in @("26","12","9","3")) {
+        try {
+            $voucherProp = $map.PSObject.Properties[$vchTypeText]
+            if ($null -ne $voucherProp -and $null -ne $voucherProp.Value) {
+                $voucherProp.Value.PSObject.Properties.Remove("salesman")
+            }
+        }
+        catch {}
+    }
+
+    return @{
+        success = $true
+        m2 = ($map | ConvertTo-Json -Depth 30 -Compress)
+    }
+}
+
 # Override role setter to clear B37 when a user stops being a Sales Manager.
 function Set-WebApprovalUserRole {
     param(
@@ -8819,8 +9205,41 @@ function Set-WebApprovalUserRole {
         $managerFlag = if ($roleValue -eq $script:WebApprovalRoleSalesManager) { 1 } else { 0 }
         $editFlagSql = if ($roleValue -eq $script:WebApprovalRoleSalesManager) { "[B37]" } else { "0" }
 
+        $managerCleanM2 = $null
+        if ($roleValue -eq $script:WebApprovalRoleSalesManager) {
+            $m2Read = $ctx.connection.CreateCommand()
+            $m2Read.CommandText = "SELECT [M2] FROM [MobileUserPreference] WHERE [Name]='$safeUser'"
+            $rawM2 = $m2Read.ExecuteScalar()
+            $m2Text = if ($null -eq $rawM2 -or $rawM2 -eq [System.DBNull]::Value) { "{}" } else { [string]$rawM2 }
+            $cleanM2Result = Remove-WebApprovalSalesmanAssignmentsFromM2 -M2Json $m2Text
+            if (-not $cleanM2Result.success) {
+                return @{ success=$false; httpStatus=400; error=$cleanM2Result.error }
+            }
+            $managerCleanM2 = [string]$cleanM2Result.m2
+        }
+
         $tx = $ctx.connection.BeginTransaction()
         [void](Invoke-WebApprovalNonQuery -Connection $ctx.connection -Transaction $tx -Sql "UPDATE [MobileUserPreference] SET [B35]=$salesmanFlag, [B36]=$managerFlag, [B37]=$editFlagSql WHERE [Name]='$safeUser'")
+
+        # A Sales Manager may manage Salesmen, but must never itself be mapped
+        # to a BUSY Salesman master. Clear all existing per-voucher assignments
+        # atomically with the role change.
+        if ($roleValue -eq $script:WebApprovalRoleSalesManager) {
+            $m2Write = $ctx.connection.CreateCommand()
+            $m2Write.Transaction = $tx
+            if ([int]$ctx.dbType -eq 1) {
+                $m2Write.CommandText = "UPDATE [MobileUserPreference] SET [M2]=@m2 WHERE [Name]=@userName"
+                [void](Add-WebApprovalCommandParameter -Command $m2Write -DbType 1 -Name "@m2" -Value $managerCleanM2 -Kind LongText)
+                [void](Add-WebApprovalCommandParameter -Command $m2Write -DbType 1 -Name "@userName" -Value $UserName.Trim() -Kind Text -Size 100)
+            }
+            else {
+                $m2Write.CommandText = "UPDATE [MobileUserPreference] SET [M2]=? WHERE [Name]=?"
+                [void](Add-WebApprovalCommandParameter -Command $m2Write -DbType 0 -Name "@p1" -Value $managerCleanM2 -Kind LongText)
+                [void](Add-WebApprovalCommandParameter -Command $m2Write -DbType 0 -Name "@p2" -Value $UserName.Trim() -Kind Text -Size 100)
+            }
+            [void]$m2Write.ExecuteNonQuery()
+        }
+
         if ($roleValue -ne $script:WebApprovalRoleSalesman) {
             [void](Invoke-WebApprovalNonQuery -Connection $ctx.connection -Transaction $tx -Sql "UPDATE [BusyCloudSalesmanManager] SET [IsActive]=0, [CanTrackLocation]=0 WHERE [SalesmanUserName]='$safeUser'")
         }
@@ -8976,11 +9395,11 @@ function Convert-WebApprovalRecordToPublic {
         $payload=$null; $originalPayload=$null
         try { if (-not [string]::IsNullOrWhiteSpace([string]$Record.PayloadJson)) { $payload=([string]$Record.PayloadJson)|ConvertFrom-Json } } catch {}
         $originalJson=[string]$Record.OriginalPayloadJson
-        if ([string]::IsNullOrWhiteSpace($originalJson)) { $originalJson=[string]$Record.PayloadJson }
         try { if (-not [string]::IsNullOrWhiteSpace($originalJson)) { $originalPayload=$originalJson|ConvertFrom-Json } } catch {}
-        $originalHash=([string]$Record.OriginalPayloadHash).Trim(); if (-not $originalHash) { $originalHash=([string]$Record.PayloadHash).Trim() }
+        $originalHash=([string]$Record.OriginalPayloadHash).Trim()
+        $hasOriginalSnapshot = -not [string]::IsNullOrWhiteSpace($originalJson)
         $out["payload"]=$payload; $out["payloadJson"]=[string]$Record.PayloadJson; $out["payloadHash"]=([string]$Record.PayloadHash).Trim()
-        $out["originalPayload"]=$originalPayload; $out["originalPayloadJson"]=$originalJson; $out["originalPayloadHash"]=$originalHash
+        $out["originalPayload"]=$originalPayload; $out["originalPayloadJson"]=$originalJson; $out["originalPayloadHash"]=$originalHash; $out["hasOriginalSnapshot"]=$hasOriginalSnapshot
     }
     return $out
 }
@@ -9319,6 +9738,184 @@ function Get-WebApprovalAdminOverview {
         $items=@($all|Where-Object{Test-WebApprovalQueueStatusMatch -Record $_ -Status $Status})
         return @{success=$true;data=@{status=$Status;items=$items;count=$items.Count;summary=$summary}}
     }catch{return @{success=$false;httpStatus=500;error=$_.Exception.Message}}finally{if($rdr){try{$rdr.Close()}catch{};try{$rdr.Dispose()}catch{}};Close-WebApprovalDbContext -Context $ctx}
+}
+
+function Repair-WebApprovalMissingSalesmanByAdmin {
+    param(
+        [string]$Id,
+        [int]$SalesmanCode = 0,
+        [string]$SalesmanName = "",
+        [string]$AdminUserName = "",
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $idText = ([string]$Id).Trim()
+    $admin = ([string]$AdminUserName).Trim()
+    if ([string]::IsNullOrWhiteSpace($idText)) {
+        return @{ success=$false; httpStatus=400; error="Web Approval transaction id is required." }
+    }
+    if ([string]::IsNullOrWhiteSpace($admin)) {
+        return @{ success=$false; httpStatus=401; error="Authenticated Super User is required." }
+    }
+
+    $resolved = Resolve-LiveSalesmanMaster `
+        -Code $SalesmanCode `
+        -Name $SalesmanName `
+        -InstanceId $InstanceId `
+        -CompanyCode $CompanyCode
+
+    if (-not $resolved.success) {
+        return @{ success=$false; httpStatus=500; error=if($resolved.error){$resolved.error}else{"Could not validate BUSY Salesman."} }
+    }
+    if (-not $resolved.found) {
+        return @{ success=$false; httpStatus=400; errorCode="SALESMAN_INVALID"; error="Select a valid BUSY Salesman." }
+    }
+
+    $ctx=$null; $tx=$null
+    try {
+        $ctx = Get-WebApprovalFiscalDbContext -InstanceId $InstanceId -CompanyCode $CompanyCode
+        [void](Ensure-WebApprovalManagerEditFiscalSchema -Context $ctx)
+        $record = Get-WebApprovalRecordByIdInternal -Context $ctx -Id $idText
+        if ($null -eq $record) {
+            return @{ success=$false; httpStatus=404; error="Web Approval transaction was not found." }
+        }
+
+        $vchType = [int]$record.VoucherType
+        if (@(26,12,9,3) -notcontains $vchType) {
+            return @{ success=$false; httpStatus=409; error="This voucher type does not use the protected Salesman identity." }
+        }
+
+        $approvalStatus = ([string]$record.ApprovalStatus).Trim().ToUpperInvariant()
+        $syncStatus = ([string]$record.SyncStatus).Trim().ToUpperInvariant()
+        if ($approvalStatus -eq "REJECTED" -or $syncStatus -eq "SYNCED" -or $syncStatus -eq "SYNCING" -or $syncStatus -eq "REVIEW_REQUIRED") {
+            return @{ success=$false; httpStatus=409; error="This transaction cannot be repaired in its current workflow state." }
+        }
+
+        $payload = $null
+        try { $payload = ([string]$record.PayloadJson) | ConvertFrom-Json } catch {}
+        if ($null -eq $payload) {
+            return @{ success=$false; httpStatus=409; error="The current voucher payload is unavailable or invalid." }
+        }
+
+        $originalJson = [string]$record.OriginalPayloadJson
+        if ([string]::IsNullOrWhiteSpace($originalJson)) { $originalJson = [string]$record.PayloadJson }
+        $originalPayload = $null
+        try { $originalPayload = $originalJson | ConvertFrom-Json } catch {}
+        if ($null -eq $originalPayload) {
+            return @{ success=$false; httpStatus=409; error="The original voucher snapshot is unavailable or invalid." }
+        }
+
+        $existingOriginalName = ""; $existingOriginalCode = 0
+        try { $existingOriginalName = ([string](Get-WebApprovalPropertyValue -Object $originalPayload -Names @("salesmanName") -DefaultValue "")).Trim() } catch {}
+        try { $existingOriginalCode = [int](Get-WebApprovalPropertyValue -Object $originalPayload -Names @("salesmanCode") -DefaultValue 0) } catch {}
+
+        # This is a recovery tool, not a way to replace a valid historical
+        # Salesman. Once a valid original identity exists it remains immutable.
+        if (-not [string]::IsNullOrWhiteSpace($existingOriginalName) -and $existingOriginalCode -gt 0) {
+            return @{
+                success=$false
+                httpStatus=409
+                errorCode="ORIGINAL_SALESMAN_ALREADY_PRESENT"
+                error="This voucher already has a valid original Salesman. Admin repair cannot replace it."
+            }
+        }
+
+        foreach ($target in @($payload,$originalPayload)) {
+            $target | Add-Member -MemberType NoteProperty -Name "salesmanCode" -Value ([int]$resolved.data.code) -Force
+            $target | Add-Member -MemberType NoteProperty -Name "salesmanName" -Value ([string]$resolved.data.name) -Force
+        }
+
+        $newPayloadJson = Get-WebApprovalPayloadSnapshot -Data $payload
+        $newPayloadHash = Get-WebApprovalSha256 -Text $newPayloadJson
+        $newOriginalJson = Get-WebApprovalPayloadSnapshot -Data $originalPayload
+        $newOriginalHash = Get-WebApprovalSha256 -Text $newOriginalJson
+        $now = [datetime]::UtcNow
+        $nextSyncStatus = if ($approvalStatus -eq "APPROVED" -and $syncStatus -eq "FAILED") { "READY" } else { $syncStatus }
+
+        $tx = $ctx.connection.BeginTransaction()
+        $cmd = $ctx.connection.CreateCommand(); $cmd.Transaction=$tx
+        if ([int]$ctx.dbType -eq 1) {
+            $cmd.CommandText = @"
+UPDATE dbo.BusyCloudWebApproval
+SET PayloadJson=@payloadJson,
+    PayloadHash=@payloadHash,
+    OriginalPayloadJson=@originalPayloadJson,
+    OriginalPayloadHash=@originalPayloadHash,
+    SyncStatus=@syncStatus,
+    LastSyncError=NULL,
+    HasManagerChanges=1,
+    ModifiedBy=@modifiedBy,
+    ModifiedAt=@modifiedAt,
+    UpdatedAt=@updatedAt,
+    Version=Version+1
+WHERE Id=@id
+  AND SyncStatus<>'SYNCED'
+"@
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@payloadJson" -Value $newPayloadJson -Kind LongText)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@payloadHash" -Value $newPayloadHash -Kind Text -Size 64)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@originalPayloadJson" -Value $newOriginalJson -Kind LongText)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@originalPayloadHash" -Value $newOriginalHash -Kind Text -Size 64)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@syncStatus" -Value $nextSyncStatus -Kind Text -Size 30)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@modifiedBy" -Value $admin -Kind Text -Size 100)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@modifiedAt" -Value $now -Kind Date)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@updatedAt" -Value $now -Kind Date)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@id" -Value $idText -Kind Text -Size 36)
+        }
+        else {
+            $cmd.CommandText = @"
+UPDATE [BusyCloudWebApproval]
+SET [PayloadJson]=?, [PayloadHash]=?,
+    [OriginalPayloadJson]=?, [OriginalPayloadHash]=?,
+    [SyncStatus]=?, [LastSyncError]=NULL,
+    [HasManagerChanges]=1, [ModifiedBy]=?, [ModifiedAt]=?, [UpdatedAt]=?,
+    [Version]=[Version]+1
+WHERE [Id]=? AND [SyncStatus]<>'SYNCED'
+"@
+            $vals=@(
+                @{v=$newPayloadJson;k='LongText';z=0}, @{v=$newPayloadHash;k='Text';z=64},
+                @{v=$newOriginalJson;k='LongText';z=0}, @{v=$newOriginalHash;k='Text';z=64},
+                @{v=$nextSyncStatus;k='Text';z=30}, @{v=$admin;k='Text';z=100},
+                @{v=$now;k='Date';z=0}, @{v=$now;k='Date';z=0}, @{v=$idText;k='Text';z=36}
+            )
+            for($i=0;$i -lt $vals.Count;$i++){
+                [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name ("@p"+($i+1)) -Value $vals[$i].v -Kind $vals[$i].k -Size $vals[$i].z)
+            }
+        }
+
+        $affected=[int]$cmd.ExecuteNonQuery()
+        if($affected -ne 1){ try{$tx.Rollback()}catch{}; $tx=$null; return @{success=$false;httpStatus=409;error="The transaction changed while it was being repaired. Refresh and try again."} }
+
+        Add-WebApprovalActionRow `
+            -Context $ctx `
+            -Transaction $tx `
+            -WebApprovalId $idText `
+            -Action "ADMIN_REPAIRED_SALESMAN" `
+            -ActionBy $admin `
+            -Remarks "Super User repaired a missing original BUSY Salesman identity." `
+            -MetadataJson (@{
+                previousSalesmanCode=$existingOriginalCode
+                previousSalesmanName=$existingOriginalName
+                newSalesmanCode=[int]$resolved.data.code
+                newSalesmanName=[string]$resolved.data.name
+                previousSyncStatus=$syncStatus
+                newSyncStatus=$nextSyncStatus
+            } | ConvertTo-Json -Compress) `
+            -ActionTime $now
+
+        $tx.Commit(); $tx=$null
+        $updated = Get-WebApprovalRecordByIdInternal -Context $ctx -Id $idText
+        return @{
+            success=$true
+            message="Missing Salesman identity repaired successfully."
+            data=Convert-WebApprovalRecordToPublic -Record $updated -IncludePayload $true
+        }
+    }
+    catch {
+        if($tx){try{$tx.Rollback()}catch{}}
+        return @{success=$false;httpStatus=500;error=$_.Exception.Message}
+    }
+    finally { Close-WebApprovalDbContext -Context $ctx }
 }
 
 function Get-WebApprovalDetailForAdmin {
@@ -9704,7 +10301,7 @@ function Test-WebApprovalQueueStatusMatch {
 # ============================================================================
 # BUSYCLOUD WEB APPROVAL V7.1 - BOTH MODE / ORIGINAL CREATE-VOUCHER PIPELINE
 # ============================================================================
-$script:BusyCloudWebApprovalModuleVersion = "7.2-independent-approval-flags+utc-json"
+$script:BusyCloudWebApprovalModuleVersion = "7.2-independent-approval-flags+utc-json+access-jet-param-fix"
 Write-Host "  [WEB-APPROVAL] Independent BUSY/Web approval extension $script:BusyCloudWebApprovalModuleVersion loaded." -ForegroundColor DarkCyan
 
 
@@ -10013,7 +10610,7 @@ SET SalesmanUserName=@salesman,
 WHERE Id=@id
 "@
                 $params = @(
-                    @("@salesman",$SalesmanUserName.Trim(),"Text",100), @("@voucherType",$vchType,"Int",0),
+                    @("@salesman",$SalesmanUserName.Trim(),"Text",100), @("@voucherType",$vchType,"SmallInt",0),
                     @("@approvalMode",$mode,"Text",12), @("@webApprovalId",$webId,"Text",36),
                     @("@requestedSeries",$requestedSeries,"Text",100), @("@requestedVoucherNo",$requestedVoucherNo,"Text",100),
                     @("@busyVoucherNo",$busyVoucherNo,"Text",100), @("@busyVoucherCode",$busyVoucherCode,"Text",50),
@@ -10037,10 +10634,10 @@ WHERE [Id]=?
                     $busyVoucherNo,$busyVoucherNo,$busyVoucherCode,$busyVoucherCode,
                     [string]$summary.partyName,[double]$summary.amount,$nowUtc,$trackingId
                 )
-                $kinds = @('Text','Int','Text','Text','Text','Text','Text','Text','Text','Text','Text','Decimal','Date','Text')
+                $kinds = @('Text','SmallInt','Text','Text','Text','Text','Text','Text','Text','Text','Text','Decimal','Date','Text')
                 for ($i=0; $i -lt $vals.Count; $i++) { [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name ("@p"+($i+1)) -Value $vals[$i] -Kind $kinds[$i]) }
             }
-            [void]$cmd.ExecuteNonQuery()
+            [void](Invoke-WebApprovalExecuteNonQuery -Command $cmd -DbType $dbType -Stage "update-salesman-transaction-location")
         }
         else {
             $cmd = $ctx.connection.CreateCommand()
@@ -10063,7 +10660,7 @@ VALUES
 "@
                 $params = @(
                     @("@id",$trackingId,"Text",36), @("@clientRequestId",$clientRequestId,"Text",36),
-                    @("@salesman",$SalesmanUserName.Trim(),"Text",100), @("@voucherType",$vchType,"Int",0),
+                    @("@salesman",$SalesmanUserName.Trim(),"Text",100), @("@voucherType",$vchType,"SmallInt",0),
                     @("@approvalMode",$mode,"Text",12), @("@webApprovalId",$webId,"Text",36),
                     @("@requestedSeries",$requestedSeries,"Text",100), @("@requestedVoucherNo",$requestedVoucherNo,"Text",100),
                     @("@busyVoucherNo",$busyVoucherNo,"Text",100), @("@busyVoucherCode",$busyVoucherCode,"Text",50),
@@ -10091,10 +10688,10 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     $busyVoucherNo,$busyVoucherCode,[string]$summary.partyName,[double]$summary.amount,[double]$location.latitude,[double]$location.longitude,
                     [double]$location.accuracy,[datetime]$location.capturedAt,[string]$location.localDate,$submittedAt,$nowUtc,$nowUtc
                 )
-                $kinds = @('Text','Text','Text','Int','Text','Text','Text','Text','Text','Text','Text','Decimal','GeoDecimal','GeoDecimal','Decimal','Date','Text','Date','Date','Date')
+                $kinds = @('Text','Text','Text','SmallInt','Text','Text','Text','Text','Text','Text','Text','Decimal','GeoDecimal','GeoDecimal','Decimal','Date','Text','Date','Date','Date')
                 for ($i=0; $i -lt $vals.Count; $i++) { [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 0 -Name ("@p"+($i+1)) -Value $vals[$i] -Kind $kinds[$i]) }
             }
-            [void]$cmd.ExecuteNonQuery()
+            [void](Invoke-WebApprovalExecuteNonQuery -Command $cmd -DbType $dbType -Stage "insert-salesman-transaction-location")
         }
 
         return @{
@@ -10790,6 +11387,19 @@ function Update-WebApprovalPendingSubmissionBySalesman {
         if(-not $modify.success){return @{success=$false;httpStatus=500;error="Could not validate voucher Modify permission."}}
         if(-not $modify.allowed){return @{success=$false;httpStatus=403;errorCode="MODIFY_PERMISSION_REQUIRED";error="You do not have Modify permission for this voucher type."}}
 
+        # Preserve the first submitted Salesman snapshot permanently.
+        # A Salesman may edit the still-pending working copy, but the audit
+        # baseline must remain the very first submission.
+        $originalJson = [string]$record.OriginalPayloadJson
+        if ([string]::IsNullOrWhiteSpace($originalJson)) {
+            $originalJson = [string]$record.PayloadJson
+        }
+
+        $originalHash = ([string]$record.OriginalPayloadHash).Trim()
+        if ([string]::IsNullOrWhiteSpace($originalHash)) {
+            $originalHash = ([string]$record.PayloadHash).Trim()
+        }
+
         try{$Payload.vchType=$vchType}catch{}
         try{$Payload.vchNo=([string]$record.RequestedVoucherNo).Trim()}catch{}
         try{$Payload.vchSeries=([string]$record.RequestedSeries).Trim()}catch{}
@@ -10814,7 +11424,7 @@ function Update-WebApprovalPendingSubmissionBySalesman {
             $cmd.CommandText=@"
 UPDATE dbo.BusyCloudWebApproval
 SET PayloadJson=@payloadJson,PayloadHash=@payloadHash,
-    OriginalPayloadJson=@payloadJson,OriginalPayloadHash=@payloadHash,
+    OriginalPayloadJson=@originalPayloadJson,OriginalPayloadHash=@originalPayloadHash,
     PartyName=@partyName,Amount=@amount,
     HasManagerChanges=0,ModifiedBy=NULL,ModifiedAt=NULL,
     UpdatedAt=@updatedAt,Version=Version+1
@@ -10823,6 +11433,8 @@ WHERE Id=@id AND SubmittedBy=@submittedBy
 "@
             [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@payloadJson" -Value $newJson -Kind LongText)
             [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@payloadHash" -Value $newHash -Kind Text -Size 64)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@originalPayloadJson" -Value $originalJson -Kind LongText)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@originalPayloadHash" -Value $originalHash -Kind Text -Size 64)
             [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@partyName" -Value $newParty -Kind Text -Size 250)
             [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@amount" -Value $newAmount -Kind Decimal)
             [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@updatedAt" -Value $now -Kind Date)
@@ -10841,7 +11453,7 @@ WHERE [Id]=? AND [SubmittedBy]=?
 "@
             $vals=@(
                 @{v=$newJson;k='LongText';z=0},@{v=$newHash;k='Text';z=64},
-                @{v=$newJson;k='LongText';z=0},@{v=$newHash;k='Text';z=64},
+                @{v=$originalJson;k='LongText';z=0},@{v=$originalHash;k='Text';z=64},
                 @{v=$newParty;k='Text';z=250},@{v=$newAmount;k='Decimal';z=0},
                 @{v=$now;k='Date';z=0},@{v=$idText;k='Text';z=36},@{v=$user;k='Text';z=100}
             )
@@ -11091,11 +11703,125 @@ function Update-WebApprovalPendingSubmissionByManager {
 
         $vchType = [int]$record.VoucherType
 
+        # Preserve the Salesman's first submitted voucher as the immutable
+        # comparison/audit baseline. Legacy rows fall back to the working copy
+        # that existed immediately before this manager edit.
+        $originalJson = [string]$record.OriginalPayloadJson
+        if ([string]::IsNullOrWhiteSpace($originalJson)) {
+            $originalJson = [string]$record.PayloadJson
+        }
+
+        $originalHash = ([string]$record.OriginalPayloadHash).Trim()
+        if ([string]::IsNullOrWhiteSpace($originalHash)) {
+            $originalHash = ([string]$record.PayloadHash).Trim()
+        }
+
+        $originalPayload = $null
+        $currentPayload = $null
+        try {
+            if (-not [string]::IsNullOrWhiteSpace($originalJson)) {
+                $originalPayload = $originalJson | ConvertFrom-Json
+            }
+        }
+        catch {}
+        try {
+            if (-not [string]::IsNullOrWhiteSpace([string]$record.PayloadJson)) {
+                $currentPayload = ([string]$record.PayloadJson) | ConvertFrom-Json
+            }
+        }
+        catch {}
+
+        $usesSalesman = @(26,12,9,3) -contains $vchType
+        $originalSalesmanName = ""
+        $originalSalesmanCode = 0
+
+        if ($usesSalesman) {
+            try {
+                $originalSalesmanName = ([string](
+                    Get-WebApprovalPropertyValue `
+                        -Object $originalPayload `
+                        -Names @("salesmanName") `
+                        -DefaultValue ""
+                )).Trim()
+            }
+            catch {}
+
+            try {
+                $originalSalesmanCode = [int](
+                    Get-WebApprovalPropertyValue `
+                        -Object $originalPayload `
+                        -Names @("salesmanCode") `
+                        -DefaultValue 0
+                )
+            }
+            catch { $originalSalesmanCode = 0 }
+
+            # Legacy safety: if the snapshot columns did not exist when this
+            # transaction was created, use the pre-manager working payload.
+            if ([string]::IsNullOrWhiteSpace($originalSalesmanName)) {
+                try {
+                    $originalSalesmanName = ([string](
+                        Get-WebApprovalPropertyValue `
+                            -Object $currentPayload `
+                            -Names @("salesmanName") `
+                            -DefaultValue ""
+                    )).Trim()
+                }
+                catch {}
+            }
+
+            if ($originalSalesmanCode -le 0) {
+                try {
+                    $originalSalesmanCode = [int](
+                        Get-WebApprovalPropertyValue `
+                            -Object $currentPayload `
+                            -Names @("salesmanCode") `
+                            -DefaultValue 0
+                    )
+                }
+                catch { $originalSalesmanCode = 0 }
+            }
+        }
+
         # Workflow identity is immutable. The manager edits voucher content in
-        # the original voucher form, but cannot convert it into another voucher.
+        # the original voucher form, but cannot convert it into another voucher
+        # or replace/clear the Salesman who originally submitted it.
         try { $Payload.vchType = $vchType } catch {}
         try { $Payload.vchNo = ([string]$record.RequestedVoucherNo).Trim() } catch {}
         try { $Payload.vchSeries = ([string]$record.RequestedSeries).Trim() } catch {}
+
+        if ($usesSalesman) {
+            if ([string]::IsNullOrWhiteSpace($originalSalesmanName) -or $originalSalesmanCode -le 0) {
+                return @{
+                    success = $false
+                    httpStatus = 409
+                    errorCode = "ORIGINAL_SALESMAN_MISSING"
+                    error = "The original Salesman identity is missing from this pending voucher. Refresh or repair the Web Approval record before manager editing/synchronization."
+                }
+            }
+
+            try {
+                $prop = $Payload.PSObject.Properties["salesmanName"]
+                if ($null -ne $prop) {
+                    $prop.Value = $originalSalesmanName
+                }
+                else {
+                    $Payload | Add-Member -NotePropertyName "salesmanName" -NotePropertyValue $originalSalesmanName -Force
+                }
+            }
+            catch {}
+
+            try {
+                $prop = $Payload.PSObject.Properties["salesmanCode"]
+                if ($null -ne $prop) {
+                    $prop.Value = $originalSalesmanCode
+                }
+                else {
+                    $Payload | Add-Member -NotePropertyName "salesmanCode" -NotePropertyValue $originalSalesmanCode -Force
+                }
+            }
+            catch {}
+        }
 
         foreach ($name in @("clientRequestId","webApprovalRequestId")) {
             try { $Payload.PSObject.Properties.Remove($name) } catch {}
@@ -11127,6 +11853,8 @@ function Update-WebApprovalPendingSubmissionByManager {
 UPDATE dbo.BusyCloudWebApproval
 SET PayloadJson=@payloadJson,
     PayloadHash=@payloadHash,
+    OriginalPayloadJson=@originalPayloadJson,
+    OriginalPayloadHash=@originalPayloadHash,
     PartyName=@partyName,
     Amount=@amount,
     HasManagerChanges=1,
@@ -11140,6 +11868,8 @@ WHERE Id=@id
 "@
             [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@payloadJson" -Value $newJson -Kind LongText)
             [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@payloadHash" -Value $newHash -Kind Text -Size 64)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@originalPayloadJson" -Value $originalJson -Kind LongText)
+            [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@originalPayloadHash" -Value $originalHash -Kind Text -Size 64)
             [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@partyName" -Value $newParty -Kind Text -Size 250)
             [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@amount" -Value $newAmount -Kind Decimal)
             [void](Add-WebApprovalCommandParameter -Command $cmd -DbType 1 -Name "@modifiedBy" -Value $manager -Kind Text -Size 100)
@@ -11152,6 +11882,8 @@ WHERE Id=@id
 UPDATE [BusyCloudWebApproval]
 SET [PayloadJson]=?,
     [PayloadHash]=?,
+    [OriginalPayloadJson]=?,
+    [OriginalPayloadHash]=?,
     [PartyName]=?,
     [Amount]=?,
     [HasManagerChanges]=1,
@@ -11166,6 +11898,8 @@ WHERE [Id]=?
             $vals = @(
                 @{v=$newJson;k='LongText';z=0},
                 @{v=$newHash;k='Text';z=64},
+                @{v=$originalJson;k='LongText';z=0},
+                @{v=$originalHash;k='Text';z=64},
                 @{v=$newParty;k='Text';z=250},
                 @{v=$newAmount;k='Decimal';z=0},
                 @{v=$manager;k='Text';z=100},

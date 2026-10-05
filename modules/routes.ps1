@@ -3182,6 +3182,34 @@ function Start-BUSYServer {
                 }
 
                 $data = Read-RequestBody $request | ConvertFrom-Json
+
+                # Sales Managers may manage Salesmen but may not themselves be
+                # assigned to a BUSY Salesman master. Normalize M2 server-side
+                # so this rule cannot be bypassed through DevTools/API calls.
+                $permissionRoleResult = Get-WebApprovalUserRole `
+                    -UserName ([string]$data.name) `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode
+
+                if (-not $permissionRoleResult.success) {
+                    Send-Response $response @{
+                        success=$false
+                        error="Could not validate the user's Sales Workflow role before saving permissions."
+                    } 500
+                    continue
+                }
+
+                $permissionWorkflowRole = 0
+                try { $permissionWorkflowRole = [int]$permissionRoleResult.data.role } catch {}
+                if ($permissionWorkflowRole -eq $script:WebApprovalRoleSalesManager) {
+                    $cleanM2Result = Remove-WebApprovalSalesmanAssignmentsFromM2 -M2Json ([string]$data.M2)
+                    if (-not $cleanM2Result.success) {
+                        Send-Response $response @{ success=$false; error=$cleanM2Result.error } 400
+                        continue
+                    }
+                    $data.M2 = [string]$cleanM2Result.m2
+                }
+
                 $result = Save-UserPermissions -Data $data -InstanceId $instanceId -CompanyCode $companyCode
 
                 if ($result.success -eq $false) {
@@ -3737,18 +3765,20 @@ function Start-BUSYServer {
                     $null -eq $authResult.user -or
                     [string]::IsNullOrWhiteSpace([string]$authResult.user.name)
                 ) {
-                    $result = @{ success=$false; error="Authenticated Sales Manager is required." }
+                    $result = @{ success=$false; error="Authenticated Sales Manager or Super User is required." }
                     $response.StatusCode = 401
                 }
                 else {
                     $data = Read-RequestBody $request | ConvertFrom-Json
 
+                    $adminSyncOverride = Test-IsPermissionAdminUser -User $authResult.user
                     $result = Sync-WebApprovalVoucher `
                         -Id ([string]$data.id) `
                         -ManagerUserName ([string]$authResult.user.name) `
                         -ManualVoucherNo ([string]$data.manualVoucherNo) `
                         -InstanceId $instanceId `
-                        -CompanyCode $companyCode
+                        -CompanyCode $companyCode `
+                        -AllowAdministrativeOverride $adminSyncOverride
 
                     if ($result.success -eq $false) {
                         $response.StatusCode = if ($result.httpStatus) {
@@ -3816,6 +3846,25 @@ function Start-BUSYServer {
 
                 if ($result.success -eq $false) {
                     $response.StatusCode = if ($result.httpStatus) { [int]$result.httpStatus } else { 500 }
+                }
+
+            } elseif ($path -eq "/busy/web-approval/admin/repair-salesman" -and $method -eq "POST") {
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
+                    continue
+                }
+
+                $data = Read-RequestBody $request | ConvertFrom-Json
+                $result = Repair-WebApprovalMissingSalesmanByAdmin `
+                    -Id ([string]$data.id) `
+                    -SalesmanCode ([int]$data.salesmanCode) `
+                    -SalesmanName ([string]$data.salesmanName) `
+                    -AdminUserName ([string]$authResult.user.name) `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode
+
+                if ($result.success -eq $false) {
+                    $response.StatusCode = if ($result.httpStatus) { [int]$result.httpStatus } else { 400 }
                 }
 
             } elseif ($path -eq "/busy/web-approval/admin/detail" -and $method -eq "GET") {
@@ -4416,14 +4465,57 @@ function Start-BUSYServer {
                     -InstanceId $instanceId `
                     -CompanyCode $companyCode
 
-            } elseif ($path -eq "/busy/reports/stock-status" -and $method -eq "GET") {
-                # Single-page BUSY-like Stock Status report.  Legacy query
-                # parameters remain supported; the extra parameters power the
-                # Detailed / Columnar / Grouped / Hierarchical web views.
+            } elseif (
+                (
+                    $path -eq "/busy/reports/stock-status" -or
+                    $path -eq "/busy/reports/stock-status/snapshot" -or
+                    $path -eq "/busy/reports/stock-status/balances" -or
+                    $path -eq "/busy/reports/stock-status/detailed" -or
+                    $path -eq "/busy/reports/stock-status/columnar" -or
+                    $path -eq "/busy/reports/stock-status/grouped" -or
+                    $path -eq "/busy/reports/stock-status/hierarchical"
+                ) -and
+                $method -eq "GET"
+            ) {
+                # Lazy Stock Status view endpoints.
+                #
+                # Each tab now owns its own HTTP request and React Query cache.
+                # The legacy /busy/reports/stock-status?view=... route remains
+                # supported for backward compatibility.
                 $fromVal = Get-QueryStringValue $request.QueryString "from" ""
                 $toVal = Get-QueryStringValue $request.QueryString "to" ""
                 $asOfVal = Get-QueryStringValue $request.QueryString "asOf" ""
                 $viewVal = Get-QueryStringValue $request.QueryString "view" "balances"
+
+                # Dedicated route path wins over the query-string view.
+                switch ($path) {
+                    "/busy/reports/stock-status/snapshot" {
+                        $viewVal = "balances"
+                    }
+                    "/busy/reports/stock-status/balances" {
+                        $viewVal = "balances"
+                    }
+                    "/busy/reports/stock-status/detailed" {
+                        $viewVal = "detailed"
+                    }
+                    "/busy/reports/stock-status/columnar" {
+                        $viewVal = "columnar"
+                    }
+                    "/busy/reports/stock-status/grouped" {
+                        $viewVal = "grouped"
+                    }
+                    "/busy/reports/stock-status/hierarchical" {
+                        $viewVal = "hierarchical"
+                    }
+                }
+
+                Write-Host (
+                    "  [STOCK-VIEW-ROUTE] view='" +
+                    $viewVal +
+                    "' path='" +
+                    $path +
+                    "'"
+                ) -ForegroundColor DarkCyan
 
                 $materialCentreVal = Get-QueryStringValue $request.QueryString "materialCentre" ""
                 $materialCentresVal = Get-QueryStringValue $request.QueryString "materialCentres" ""
@@ -4463,6 +4555,44 @@ function Start-BUSYServer {
                 [int]::TryParse([string]$pageSizeVal, [ref]$safePageSize) | Out-Null
                 if ($safePageSize -lt 0) { $safePageSize = 100 }
 
+                if ($path -eq "/busy/reports/stock-status/snapshot") {
+                    # Canonical full snapshot. Only AsOf changes the backend
+                    # calculation. All tabs, filters and pagination are local.
+                    $viewVal = "balances"
+                    $fromVal = ""
+                    $toVal = ""
+                    # V15 hybrid filtering:
+                    # Material Centre, Item Group and Item Search are backend
+                    # filters. They are intentionally preserved from the query
+                    # string so the fast SQL snapshot can reduce its dataset.
+                    # All remaining controls stay frontend-only.
+                    $materialCentresVal = ""
+                    $statusVal = "all"
+                    $includeZeroVal = "true"
+                    $lowStockLevelVal = "5"
+                    $valueByVal = "busy"
+                    $unitModeVal = "both"
+                    $showValueVal = "true"
+                    $includeTransfersVal = "true"
+                    $salePurchaseSeparateVal = "true"
+                    $mastersModeVal = "all"
+                    $showParentGroupVal = "true"
+                    $safePage = 1
+                    $safePageSize = 0
+
+                    Write-Host (
+                        "  [STOCK-SNAPSHOT] asOf='" +
+                        $asOfVal +
+                        "'; fast SQL snapshot; mc='" +
+                        $materialCentreVal +
+                        "'; group='" +
+                        $itemGroupVal +
+                        "'; search='" +
+                        $searchVal +
+                        "'; remaining filters local"
+                    ) -ForegroundColor Green
+                }
+
                 # Keep this log while validating server-side pagination. It proves
                 # that the browser actually sent the selected page and pageSize.
                 Write-Host (
@@ -4499,6 +4629,7 @@ function Start-BUSYServer {
                     -ShowParentGroup         (& $toBool $showParentGroupVal $true) `
                     -Page                    $safePage `
                     -PageSize                $safePageSize `
+                    -FastSnapshot            ($path -eq "/busy/reports/stock-status/snapshot") `
                     -InstanceId              $instanceId `
                     -CompanyCode             $companyCode
 
