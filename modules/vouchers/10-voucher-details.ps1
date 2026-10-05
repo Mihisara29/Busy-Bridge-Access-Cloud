@@ -573,6 +573,241 @@ WHERE MasterType = 6
             } catch {}
         }
 
+
+        # -----------------------------------------------------------------
+        # BUSY APPROVAL PENDING ITEM FALLBACK
+        #
+        # BUSY can return valid voucher XML without ItemEntries while a
+        # voucher is still in native BUSY approval state.
+        #
+        # Verified storage representations in this installation:
+        #
+        #   Sale Order (VchType 12)
+        #     RecType 15 = pending BUSY Approval item
+        #     RecType 4  = normal / approved item
+        #
+        #   Sales Quotation (VchType 26)
+        #     RecType 21 = pending BUSY Approval item
+        #     RecType 20 = normal / approved item
+        #
+        # The physical item rows remain in Tran2, so only use this direct
+        # fallback when GetVchXML returned zero items.
+        # -----------------------------------------------------------------
+        if (($VchType -eq 12 -or $VchType -eq 26) -and @($items).Count -eq 0) {
+            $pendingConn = $null
+            $pendingReader = $null
+
+            try {
+                $pendingNormalRecType = if ($VchType -eq 12) { 4 } else { 20 }
+                $pendingApprovalRecType = if ($VchType -eq 12) { 15 } else { 21 }
+
+                $direct = Get-FastVoucherDirectConnection `
+                    -InstanceId $InstanceId `
+                    -CompanyCode $CompanyCode
+
+                if ($direct) {
+                    $pendingConn = $direct.connection
+                    $pendingConn.Open()
+
+                    $pendingCmd = $pendingConn.CreateCommand()
+                    $pendingCmd.CommandText = @"
+SELECT
+    T.RecType,
+    T.SrNo,
+    T.MasterCode1,
+    T.MasterCode2,
+    T.Value1,
+    T.Value2,
+    T.Value3,
+    T.D1,
+    T.D2,
+    T.D3,
+    T.D4,
+    T.D5,
+    I.Name  AS ItemName,
+    I.Alias AS ItemAlias,
+    U.Name  AS UnitName
+FROM Tran2 T
+LEFT JOIN Master1 I ON I.Code = T.MasterCode1
+LEFT JOIN Master1 U ON U.Code = T.MasterCode2
+WHERE T.VchCode = $vchCode
+  AND T.VchType = $VchType
+  AND T.RecType IN ($pendingNormalRecType, $pendingApprovalRecType)
+ORDER BY
+    T.SrNo,
+    CASE WHEN T.RecType = $pendingApprovalRecType THEN 0 ELSE 1 END,
+    T.RecType
+"@
+
+                    $pendingReader = $pendingCmd.ExecuteReader()
+
+                    # If both representations happen to exist for one SrNo,
+                    # prefer BUSY's verified pending representation:
+                    #   Sale Order      -> RecType 15
+                    #   Sales Quotation -> RecType 21
+                    $seenPendingSrNo = @{}
+
+                    while ($pendingReader.Read()) {
+                        $rowSrNo = 0
+                        try { $rowSrNo = [int]$pendingReader["SrNo"] } catch {}
+                        if ($rowSrNo -le 0) { $rowSrNo = @($items).Count + 1 }
+
+                        if ($seenPendingSrNo.ContainsKey($rowSrNo)) {
+                            continue
+                        }
+                        $seenPendingSrNo[$rowSrNo] = $true
+
+                        $itemCode = 0
+                        $itemName = ""
+                        $itemAlias = ""
+                        $unitName = ""
+                        $qty = 0.0
+                        $altQty = 0.0
+                        $listPrice = 0.0
+                        $price = 0.0
+                        $amount = 0.0
+
+                        try {
+                            $raw = $pendingReader["MasterCode1"]
+                            if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                                $itemCode = [int]$raw
+                            }
+                        } catch {}
+
+                        try {
+                            $raw = $pendingReader["ItemName"]
+                            if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                                $itemName = ([string]$raw).Trim()
+                            }
+                        } catch {}
+
+                        try {
+                            $raw = $pendingReader["ItemAlias"]
+                            if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                                $itemAlias = ([string]$raw).Trim()
+                            }
+                        } catch {}
+
+                        try {
+                            $raw = $pendingReader["UnitName"]
+                            if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                                $unitName = ([string]$raw).Trim()
+                            }
+                        } catch {}
+
+                        try {
+                            $raw = $pendingReader["Value1"]
+                            if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                                $qty = [double]$raw
+                            }
+                        } catch {}
+
+                        try {
+                            $raw = $pendingReader["Value2"]
+                            if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                                $altQty = [double]$raw
+                            }
+                        } catch {}
+
+                        # BUSY Sale Order Tran2 mapping verified from the
+                        # controlled pending/approved comparisons:
+                        #   D2 = list/rate
+                        #   D4 = effective/net rate
+                        #   D5 = line amount
+                        try {
+                            $raw = $pendingReader["D2"]
+                            if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                                $listPrice = [double]$raw
+                            }
+                        } catch {}
+
+                        try {
+                            $raw = $pendingReader["D4"]
+                            if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                                $price = [double]$raw
+                            }
+                        } catch {}
+
+                        if ($price -eq 0 -and $listPrice -ne 0) {
+                            $price = $listPrice
+                        }
+
+                        try {
+                            $raw = $pendingReader["D5"]
+                            if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                                $amount = [double]$raw
+                            }
+                        } catch {}
+
+                        if ($amount -eq 0) {
+                            try {
+                                $raw = $pendingReader["Value3"]
+                                if ($null -ne $raw -and $raw -ne [System.DBNull]::Value) {
+                                    $amount = [double]$raw
+                                }
+                            } catch {}
+                        }
+
+                        $discVal = 0.0
+                        $discType = "U"
+                        if ($listPrice -ne 0 -and $price -ne $listPrice) {
+                            try {
+                                $discVal = [Math]::Round(
+                                    (($listPrice - $price) / $listPrice) * 100.0,
+                                    6
+                                )
+                                $discType = "%"
+                            } catch {
+                                $discVal = 0.0
+                                $discType = "U"
+                            }
+                        }
+
+                        $items += @{
+                            srNo            = $rowSrNo
+                            itemCode        = $itemCode
+                            code            = $itemCode
+                            itemName        = $itemName
+                            alias           = $itemAlias
+                            itemAlias       = $itemAlias
+                            unit            = $unitName
+                            qty             = $qty
+                            listPrice       = $listPrice
+                            discVal         = $discVal
+                            discType        = $discType
+                            price           = $price
+                            amount          = $amount
+                            itemType        = 1
+                            mc              = $matCentre
+                            altUnit         = ""
+                            conFactor       = 1.0
+                            conType         = 1
+                            altQtyConFactor = 1.0
+                            altQty          = $altQty
+                            altPrice        = 0.0
+                            mainQty         = $qty
+                            pendingQty      = $qty
+                            sourceRecType   = try { [int]$pendingReader["RecType"] } catch { 0 }
+                        }
+                    }
+                }
+            }
+            catch {
+                # Keep Get-VoucherDetail backward-compatible: if the direct
+                # fallback itself fails, return the XML-derived data rather
+                # than failing the complete voucher detail request.
+                Write-Host "[BUSY-APPROVAL-DETAIL] Pending item Tran2 fallback failed for VchType=$VchType VchCode=$vchCode. $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+            finally {
+                if ($pendingReader) {
+                    try { $pendingReader.Close() } catch {}
+                }
+                if ($pendingConn) {
+                    try { $pendingConn.Close() } catch {}
+                }
+            }
+        }
+
         $billSundries = @()
         $bsr = 1
         try {

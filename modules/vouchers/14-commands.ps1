@@ -14,18 +14,26 @@ function Create-Voucher {
     # ------------------------------------------------------------
     # VOUCHERS THAT MUST NOT GENERATE BBA
     #
+    # 12 = Sale Order
+    # 13 = Purchase Order
     # 11 = Delivery Order / Material Issue
     # 4  = Goods Received Note / Material Receipt
     # 26 = Sales Quotation
     # 27 = Purchase Quotation
     #
-    # Quotations are non-accounting documents, so they must not
-    # create Pending Bill / Bill-by-Bill Adjustment references.
+    # Orders, challans/GRNs and quotations are non-financial pending
+    # documents. They must not create Pending Bill / Bill-by-Bill
+    # Adjustment references.
     # ------------------------------------------------------------
     $isChallanType = ($vchType -eq 11 -or $vchType -eq 4)
+    $isOrderType = ($vchType -eq 12 -or $vchType -eq 13)
     $isQuotationType = ($vchType -eq 26 -or $vchType -eq 27)
 
-    $skipBBA = [bool]($isChallanType -or $isQuotationType)
+    $skipBBA = [bool](
+        $isChallanType -or
+        $isOrderType -or
+        $isQuotationType
+    )
 
     $maxAttempts = 2
     $attempt = 1
@@ -161,9 +169,14 @@ function Modify-Voucher {
     # Keep BBA behaviour consistent between Create and Modify.
     # ------------------------------------------------------------
     $isChallanType = ($vchType -eq 11 -or $vchType -eq 4)
+    $isOrderType = ($vchType -eq 12 -or $vchType -eq 13)
     $isQuotationType = ($vchType -eq 26 -or $vchType -eq 27)
 
-    $skipBBA = [bool]($isChallanType -or $isQuotationType)
+    $skipBBA = [bool](
+        $isChallanType -or
+        $isOrderType -or
+        $isQuotationType
+    )
     
     $maxAttempts = 2
     $attempt = 1
@@ -264,6 +277,21 @@ function Modify-Voucher {
 
                     if ($approvalVchCode -gt 0) {
                         $fi.ExecuteQuery("UPDATE Tran1 SET ApprovalStatus=$approvalStatusToPreserve WHERE VchCode=$approvalVchCode")
+
+                        # SaveVchFromXML can rewrite a pending Sale Order's
+                        # Tran2 item rows to the normal RecType=4 representation.
+                        # Once we restore ApprovalStatus=2, normalize the detail
+                        # rows back to the empirically verified BUSY pending
+                        # representation (Sale Order RecType 15).
+                        #
+                        # This uses the existing voucher-type-scoped helper;
+                        # currently only VchType 12 has a verified mapping.
+                        if ($approvalStatusToPreserve -eq 2) {
+                            Set-BusyPendingVoucherStructure `
+                                -fi $fi `
+                                -VchCode $approvalVchCode `
+                                -VchType $vchType
+                        }
 
                         if ($approvalStatusToPreserve -ne 1) {
                             # Pending / Not Required must not carry an approval marker.

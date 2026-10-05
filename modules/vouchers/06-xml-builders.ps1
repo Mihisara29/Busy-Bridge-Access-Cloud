@@ -40,6 +40,15 @@ function Build-VoucherXml {
     # and passed into this function explicitly.
     # ------------------------------------------------------------
     $isChallanType = ($vchType -eq 11 -or $vchType -eq 4)
+    $isOrderType = ($VchType -eq 12 -or $VchType -eq 13)
+    $isQuotationType = ($VchType -eq 26 -or $VchType -eq 27)
+
+    # Defense in depth: even if a future caller accidentally passes
+    # SkipBBA=$false, BUSY Orders, Challans/GRNs and Quotations must never
+    # generate PendingBillDetails / Bill-by-Bill reference rows.
+    if ($isChallanType -or $isOrderType -or $isQuotationType) {
+        $SkipBBA = $true
+    }
 
     $tranType = 0
     if ($isChallanType) {

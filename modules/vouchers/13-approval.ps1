@@ -126,13 +126,21 @@ function Set-BusyPendingVoucherStructure {
     #
     # VERIFIED CURRENTLY:
     #   12 = Sale Order
+    #   26 = Sales Quotation
     #
-    # Controlled test:
-    #   BusyWeb Sale Order item row : Tran2.RecType = 4
-    #   Native BUSY pending row      : Tran2.RecType = 15
+    # Controlled tests:
     #
-    # Changing only 4 -> 15 made the item, quantity, price and amount visible
-    # in BUSY while Tran1.ApprovalStatus remained 2 (To be Approved).
+    # Sale Order
+    #   BusyWeb / normal item row : Tran2.RecType = 4
+    #   Native BUSY pending row    : Tran2.RecType = 15
+    #
+    # Sales Quotation
+    #   BusyWeb / normal item row : Tran2.RecType = 20
+    #   Native BUSY pending row    : Tran2.RecType = 21
+    #
+    # In both cases changing only the item RecType to BUSY's native pending
+    # representation restored item visibility while Tran1.ApprovalStatus
+    # remained 2 (To be Approved).
     # -------------------------------------------------------------------------
 
     switch ($VchType) {
@@ -146,10 +154,19 @@ WHERE VchCode=$VchCode
 "@)
         }
 
+        26 {
+            $fi.ExecuteQuery(@"
+UPDATE Tran2
+SET RecType=21
+WHERE VchCode=$VchCode
+  AND VchType=26
+  AND RecType=20
+"@)
+        }
+
         # The remaining BUSY Approval voucher types are intentionally left
         # unchanged until their native pending structures are verified:
         #   9  Sale
-        #   26 Sales Quotation
         #   11 Delivery Order
         #   3  Sale Return
         #   14 Receipt
