@@ -5,6 +5,7 @@
 $script:_authCache = @{}
 $script:_AUTH_CACHE_TTL = 86400
 $script:KEY = @(82,107,117,123,101,115,87,97,117,119,98,115,80,98,117,128,107,121,86,100)
+Write-Host "  [WEB-PROFILE-DELETE-V1] BusyWeb-only profile deletion loaded." -ForegroundColor DarkCyan
 
 # ===============================================================
 #  DECRYPT BUSY PASSWORD
@@ -174,7 +175,19 @@ function Get-IsSuperUser-OLEDB {
 
 function Get-HasMobileAccess-OLEDB {
     param([System.Data.OleDb.OleDbConnection]$Conn, [string]$Username)
-    return $true
+
+    if ([string]::IsNullOrWhiteSpace($Username)) { return $false }
+
+    try {
+        $safeUser = $Username.Trim().Replace("'", "''")
+        $cmd = $Conn.CreateCommand()
+        $cmd.CommandText = "SELECT COUNT(*) FROM [MobileUserPreference] WHERE [Name]='$safeUser'"
+        return ([int]$cmd.ExecuteScalar() -gt 0)
+    }
+    catch {
+        # No BusyWeb profile table/profile means no web access for a normal BUSY user.
+        return $false
+    }
 }
 
 function Get-IsSuperUser-SQL {
@@ -194,7 +207,19 @@ function Get-IsSuperUser-SQL {
 
 function Get-HasMobileAccess-SQL {
     param([System.Data.SqlClient.SqlConnection]$Conn, [string]$Username)
-    return $true
+
+    if ([string]::IsNullOrWhiteSpace($Username)) { return $false }
+
+    try {
+        $cmd = $Conn.CreateCommand()
+        $cmd.CommandText = "SELECT COUNT(*) FROM dbo.MobileUserPreference WHERE [Name]=@userName"
+        [void]$cmd.Parameters.Add("@userName", [System.Data.SqlDbType]::NVarChar, 100)
+        $cmd.Parameters["@userName"].Value = $Username.Trim()
+        return ([int]$cmd.ExecuteScalar() -gt 0)
+    }
+    catch {
+        return $false
+    }
 }
 
 function Get-CompanyUsers {
@@ -498,6 +523,277 @@ function Save-UserPermissions {
             Write-Host "   [DEBUG-PERM-ERR] Access Database Save failed: $($_.Exception.Message)" -ForegroundColor Red
             return @{ success = $false; error = $_.Exception.Message }
         } finally { if ($null -ne $conn) { try { $conn.Close() } catch {} } }
+    }
+}
+
+
+# ===============================================================
+#  WEB USER PROFILE DELETION
+#  Deletes BusyWeb configuration only. Native BUSY UserPreferences
+#  and historical voucher / approval / audit records are untouched.
+# ===============================================================
+
+function Remove-CachedWebUserSessions {
+    param(
+        [string]$UserName,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($UserName)) { return 0 }
+
+    $targetUser = $UserName.Trim().ToLowerInvariant()
+    $targetInstance = ([string]$InstanceId).Trim().ToLowerInvariant()
+    $targetCompany = ([string]$CompanyCode).Trim().ToLowerInvariant()
+    $removed = 0
+
+    foreach ($token in @($script:_authCache.Keys)) {
+        $entry = $script:_authCache[$token]
+        if ($null -eq $entry -or $null -eq $entry.user) { continue }
+
+        $cachedUser = ([string]$entry.user.name).Trim().ToLowerInvariant()
+        $cachedInstance = ([string]$entry.user.instanceId).Trim().ToLowerInvariant()
+        $cachedCompany = ([string]$entry.user.companyCode).Trim().ToLowerInvariant()
+
+        if (
+            $cachedUser -eq $targetUser -and
+            ($targetInstance -eq "" -or $cachedInstance -eq $targetInstance) -and
+            ($targetCompany -eq "" -or $cachedCompany -eq $targetCompany)
+        ) {
+            [void]$script:_authCache.Remove($token)
+            $removed++
+        }
+    }
+
+    return $removed
+}
+
+function Test-AuthOleDbTableExists {
+    param(
+        [System.Data.OleDb.OleDbConnection]$Connection,
+        [string]$TableName
+    )
+
+    try {
+        $schema = $Connection.GetSchema("Tables")
+        foreach ($row in $schema.Rows) {
+            $name = ([string]$row["TABLE_NAME"]).Trim()
+            if ($name.Equals($TableName, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        }
+    }
+    catch {}
+
+    return $false
+}
+
+function Remove-WebUserProfile {
+    param(
+        [string]$UserName,
+        [string]$InstanceId = "",
+        [string]$CompanyCode = ""
+    )
+
+    $targetUser = ([string]$UserName).Trim()
+
+    if ([string]::IsNullOrWhiteSpace($targetUser)) {
+        return @{
+            success = $false
+            httpStatus = 400
+            error = "User Name is required."
+        }
+    }
+
+    $found = Get-InstanceForCompany -CompanyCode $CompanyCode -InstanceId $InstanceId
+    if (-not $found) {
+        return @{
+            success = $false
+            httpStatus = 404
+            error = "Company not found in instances.json"
+        }
+    }
+
+    $inst = $found.instance
+    $dbType = if ($null -ne $inst.dbType) { [int]$inst.dbType } else { 0 }
+    $profileDeleted = 0
+    $workflowMappingsRemoved = 0
+    $pushSubscriptionsRemoved = 0
+    $conn = $null
+    $tx = $null
+
+    try {
+        if ($dbType -eq 1) {
+            $sqlDb = Get-SqlDatabaseName -CompanyCode $CompanyCode -InstanceId $inst.id
+            $conn = Open-SqlConnection `
+                -SqlServer $inst.sqlServer `
+                -Database $sqlDb `
+                -SqlUser $inst.sqlUser `
+                -SqlPassword $inst.sqlPassword
+
+            $check = $conn.CreateCommand()
+            $check.CommandText = "SELECT COUNT(*) FROM dbo.MobileUserPreference WHERE [Name]=@userName"
+            [void]$check.Parameters.Add("@userName", [System.Data.SqlDbType]::NVarChar, 100)
+            $check.Parameters["@userName"].Value = $targetUser
+
+            if ([int]$check.ExecuteScalar() -le 0) {
+                return @{
+                    success = $false
+                    httpStatus = 404
+                    error = "Web user profile '$targetUser' was not found."
+                }
+            }
+
+            $tx = $conn.BeginTransaction()
+
+            $mapping = $conn.CreateCommand()
+            $mapping.Transaction = $tx
+            $mapping.CommandText = @"
+IF OBJECT_ID('dbo.BusyCloudSalesmanManager', 'U') IS NOT NULL
+    DELETE FROM dbo.BusyCloudSalesmanManager
+    WHERE SalesmanUserName=@userName OR ManagerUserName=@userName
+"@
+            [void]$mapping.Parameters.Add("@userName", [System.Data.SqlDbType]::NVarChar, 100)
+            $mapping.Parameters["@userName"].Value = $targetUser
+            $workflowMappingsRemoved = [int]$mapping.ExecuteNonQuery()
+
+            $push = $conn.CreateCommand()
+            $push.Transaction = $tx
+            $push.CommandText = @"
+IF OBJECT_ID('dbo.BusyCloudPushSubscription', 'U') IS NOT NULL
+    DELETE FROM dbo.BusyCloudPushSubscription
+    WHERE UserName=@userName
+"@
+            [void]$push.Parameters.Add("@userName", [System.Data.SqlDbType]::NVarChar, 100)
+            $push.Parameters["@userName"].Value = $targetUser
+            $pushSubscriptionsRemoved = [int]$push.ExecuteNonQuery()
+
+            $delete = $conn.CreateCommand()
+            $delete.Transaction = $tx
+            $delete.CommandText = "DELETE FROM dbo.MobileUserPreference WHERE [Name]=@userName"
+            [void]$delete.Parameters.Add("@userName", [System.Data.SqlDbType]::NVarChar, 100)
+            $delete.Parameters["@userName"].Value = $targetUser
+            $profileDeleted = [int]$delete.ExecuteNonQuery()
+
+            $tx.Commit()
+            $tx = $null
+        }
+        else {
+            $dbFile = Get-MainCompanyDbPath -CompanyCode $CompanyCode
+            if ([string]::IsNullOrWhiteSpace($dbFile) -or -not (Test-Path $dbFile)) {
+                return @{
+                    success = $false
+                    httpStatus = 404
+                    error = "Main database not found"
+                }
+            }
+
+            $conn = Open-BdsConnection -DbFile $dbFile
+            $safeUser = $targetUser.Replace("'", "''")
+
+            $check = $conn.CreateCommand()
+            $check.CommandText = "SELECT COUNT(*) FROM [MobileUserPreference] WHERE [Name]='$safeUser'"
+
+            if ([int]$check.ExecuteScalar() -le 0) {
+                return @{
+                    success = $false
+                    httpStatus = 404
+                    error = "Web user profile '$targetUser' was not found."
+                }
+            }
+
+            $hasSalesmanManagerTable = Test-AuthOleDbTableExists -Connection $conn -TableName "BusyCloudSalesmanManager"
+            $hasPushSubscriptionTable = Test-AuthOleDbTableExists -Connection $conn -TableName "BusyCloudPushSubscription"
+
+            $tx = $conn.BeginTransaction()
+
+            if ($hasSalesmanManagerTable) {
+                $mapping = $conn.CreateCommand()
+                $mapping.Transaction = $tx
+                $mapping.CommandText = "DELETE FROM [BusyCloudSalesmanManager] WHERE [SalesmanUserName]='$safeUser' OR [ManagerUserName]='$safeUser'"
+                $workflowMappingsRemoved = [int]$mapping.ExecuteNonQuery()
+            }
+
+            if ($hasPushSubscriptionTable) {
+                $push = $conn.CreateCommand()
+                $push.Transaction = $tx
+                $push.CommandText = "DELETE FROM [BusyCloudPushSubscription] WHERE [UserName]='$safeUser'"
+                $pushSubscriptionsRemoved = [int]$push.ExecuteNonQuery()
+            }
+
+            $delete = $conn.CreateCommand()
+            $delete.Transaction = $tx
+            $delete.CommandText = "DELETE FROM [MobileUserPreference] WHERE [Name]='$safeUser'"
+            $profileDeleted = [int]$delete.ExecuteNonQuery()
+
+            $tx.Commit()
+            $tx = $null
+        }
+
+        if ($profileDeleted -le 0) {
+            return @{
+                success = $false
+                httpStatus = 404
+                error = "Web user profile '$targetUser' was not found."
+            }
+        }
+
+        $revokedSessions = Remove-CachedWebUserSessions `
+            -UserName $targetUser `
+            -InstanceId $inst.id `
+            -CompanyCode $CompanyCode
+
+        Write-Host (
+            "   [WEB PROFILE DELETE] {0}/{1} user='{2}' profile=1 mappings={3} pushSubscriptions={4} revokedSessions={5}" -f
+            $inst.id,
+            $CompanyCode,
+            $targetUser,
+            $workflowMappingsRemoved,
+            $pushSubscriptionsRemoved,
+            $revokedSessions
+        ) -ForegroundColor Green
+
+        return @{
+            success = $true
+            message = "Web user profile deleted successfully. The native BUSY user was not changed."
+            data = @{
+                userName = $targetUser
+                profileDeleted = $true
+                nativeBusyUserDeleted = $false
+                workflowMappingsRemoved = $workflowMappingsRemoved
+                pushSubscriptionsRemoved = $pushSubscriptionsRemoved
+                revokedSessions = $revokedSessions
+                historicalRecordsPreserved = $true
+            }
+        }
+    }
+    catch {
+        if ($tx) {
+            try { $tx.Rollback() } catch {}
+        }
+
+        Write-Host (
+            "   [WEB PROFILE DELETE FAIL] {0}/{1} user='{2}' error={3}" -f
+            $inst.id,
+            $CompanyCode,
+            $targetUser,
+            $_.Exception.Message
+        ) -ForegroundColor Red
+
+        return @{
+            success = $false
+            httpStatus = 500
+            error = $_.Exception.Message
+        }
+    }
+    finally {
+        if ($tx) {
+            try { $tx.Dispose() } catch {}
+        }
+        if ($conn) {
+            try { $conn.Close() } catch {}
+            try { $conn.Dispose() } catch {}
+        }
     }
 }
 

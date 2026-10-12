@@ -3217,6 +3217,56 @@ function Start-BUSYServer {
                     continue
                 }
 
+            } elseif ($path -eq "/busy/permissions/profile" -and $method -eq "DELETE") {
+                if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{ success=$false; error="Super User permission is required." } 403
+                    continue
+                }
+
+                $data = Read-RequestBody $request | ConvertFrom-Json
+                $targetUserName = ([string]$data.name).Trim()
+
+                if ([string]::IsNullOrWhiteSpace($targetUserName)) {
+                    Send-Response $response @{ success=$false; error="User Name is required." } 400
+                    continue
+                }
+
+                $currentAdminName = ""
+                if ($authResult -and $authResult.user) {
+                    $currentAdminName = ([string]$authResult.user.name).Trim()
+                }
+
+                if (
+                    $currentAdminName -and
+                    $currentAdminName.Equals(
+                        $targetUserName,
+                        [System.StringComparison]::OrdinalIgnoreCase
+                    )
+                ) {
+                    Send-Response $response @{
+                        success=$false
+                        error="You cannot delete your own active web user profile."
+                    } 409
+                    continue
+                }
+
+                $result = Remove-WebUserProfile `
+                    -UserName $targetUserName `
+                    -InstanceId $instanceId `
+                    -CompanyCode $companyCode
+
+                if ($result.success -eq $false) {
+                    $status = 500
+                    try {
+                        if ([int]$result.httpStatus -gt 0) {
+                            $status = [int]$result.httpStatus
+                        }
+                    } catch {}
+
+                    Send-Response $response $result $status
+                    continue
+                }
+
             } elseif ($path -eq "/busy/users" -and $method -eq "GET") {
                 if ($requireAuth -and -not (Test-IsPermissionAdminUser -User $authResult.user)) {
                     Send-Response $response @{ success=$false; error="Super User permission is required." } 403
@@ -4336,15 +4386,29 @@ function Start-BUSYServer {
                     $safeVoucherType = 0
                 }
 
-                # The report supports only:
-                # 0  = All Sale/Purchase transaction types
-                # 2  = Purchase
-                # 3  = Sale Return
-                # 9  = Sale
-                # 10 = Purchase Return
-                if ($safeVoucherType -notin @(0, 2, 3, 9, 10)) {
-                    $safeVoucherType = 0
-                }
+                    # Supported Outstanding voucher types
+                    # 0  = All
+                    # 2  = Purchase
+                    # 3  = Sale Return
+                    # 9  = Sale
+                    # 10 = Purchase Return
+                    # 14 = Receipt
+                    # 16 = Journal
+                    # 19 = Payment
+                    if (
+                        $safeVoucherType -notin @(
+                            0,
+                            2,
+                            3,
+                            9,
+                            10,
+                            14,
+                            16,
+                            19
+                        )
+                    ) {
+                        $safeVoucherType = 0
+                    }
 
                 try {
                     $safeMinAmount = [Math]::Max(
