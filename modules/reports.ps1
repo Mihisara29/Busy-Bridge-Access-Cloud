@@ -22,6 +22,15 @@ if ($null -eq $script:StockStatusFastPageCache) {
 }
 
 $script:OutstandingReportCacheSeconds = 20
+Write-Host "  [OUTSTANDING-PAYMENT-SIGN-PARITY-V11] Payment new-reference pending sign parity loaded." -ForegroundColor Green
+Write-Host "  [OUTSTANDING-NATIVE-CSV-PARITY-V10] Payment/Receipt direction + Credit Note parity loaded." -ForegroundColor Green
+Write-Host "  [OUTSTANDING-VOUCHER-DATE-V9] Voucher-date filtering loaded." -ForegroundColor Green
+Write-Host "  [OUTSTANDING-BUSY-PARITY-V8] Closed-reference pending + adjusted parity loaded." -ForegroundColor Green
+Write-Host "  [OUTSTANDING-BUSY-PARITY-V7] Method3 + signed pending + accountless BUSY refs loaded." -ForegroundColor Green
+Write-Host "  [OUTSTANDING-BUSY-PARITY-V6] Native BUSY voucher scope + RefStatus nature loaded." -ForegroundColor Green
+Write-Host "  [OUTSTANDING-NO-CONTRA-V5] Contra excluded from Outstanding processing." -ForegroundColor Green
+Write-Host "  [OUTSTANDING-CARDS-V4] Pending/adjusted financial cards loaded." -ForegroundColor Green
+Write-Host "  [OUTSTANDING-PARITY-V3] New Ref nature + voucher filter parity loaded." -ForegroundColor Green
 
 # Stock Status is much more expensive than Outstanding because BUSY method-5
 # valuation must replay inventory history chronologically. Keep a short-lived
@@ -280,6 +289,8 @@ function Remove-ExpiredStockStatusReportCache {
 # There is deliberately no hard-coded maximum. After the common sizes, the
 # list grows in 5,000-row steps for as long as the matching result requires.
 # A value of 0 is the API representation of "All".
+Write-Host "  [STOCK-ACCESS-COMPAT-V1] Access/BDS Stock Status compatibility path loaded." -ForegroundColor Green
+
 function Get-StockStatusPageSizeOptions {
     param(
         [int]$ItemCount
@@ -951,9 +962,42 @@ function Get-OutstandingReport {
     function Resolve-OutstandingNature {
         param(
             [string]$GroupName,
-            [double]$OriginalSigned
+            [double]$OriginalSigned,
+            [int]$VoucherType = 0,
+            [int]$RefStatus = 0
         )
 
+        # BUSY native special cases proved by exported Bills reports:
+        #   Payment (VchType 19) new references belong to Bills Receivable.
+        #   Receipt (VchType 14) new references belong to Bills Payable.
+        #
+        # Do this BEFORE RefStatus. Some cheque-return Payment references are
+        # stored with Status=1 even though native BUSY still lists them under
+        # Bills Receivable. Trusting RefStatus first incorrectly moved those
+        # rows to Payable and netted their negative pending values into the
+        # Payable total.
+        if ($VoucherType -eq 19) {
+            return "receivable"
+        }
+
+        if ($VoucherType -eq 14) {
+            return "payable"
+        }
+
+        # For the remaining voucher types, BUSY reference status is the best
+        # direction signal. This keeps Journal / Debit Note side handling.
+        #   Status = 2 -> Bills Receivable
+        #   Status = 1 -> Bills Payable
+        if ($RefStatus -eq 2) {
+            return "receivable"
+        }
+
+        if ($RefStatus -eq 1) {
+            return "payable"
+        }
+
+        # Compatibility fallback for old/unusual records with no reference
+        # status. Preserve the previous group/sign behaviour.
         $normalisedGroup =
             ([string]$GroupName).Trim().ToLowerInvariant()
 
@@ -964,9 +1008,7 @@ function Get-OutstandingReport {
             "trade debtor",
             "receivable"
         )) {
-            if (
-                $normalisedGroup.Contains($token)
-            ) {
+            if ($normalisedGroup.Contains($token)) {
                 return "receivable"
             }
         }
@@ -978,16 +1020,11 @@ function Get-OutstandingReport {
             "trade creditor",
             "payable"
         )) {
-            if (
-                $normalisedGroup.Contains($token)
-            ) {
+            if ($normalisedGroup.Contains($token)) {
                 return "payable"
             }
         }
 
-        # Confirmed by the exported BUSY data:
-        # sale bill references are negative;
-        # purchase bill references are positive.
         if ($OriginalSigned -lt 0) {
             return "receivable"
         }
@@ -1004,6 +1041,7 @@ function Get-OutstandingReport {
             3  { return "Sale Return" }
             4  { return "Material Receipt" }
             5  { return "Stock Transfer" }
+            6  { return "Production" }
             8  { return "Stock Journal" }
             9  { return "Sale" }
             10 { return "Purchase Return" }
@@ -1013,6 +1051,8 @@ function Get-OutstandingReport {
             14 { return "Receipt" }
             15 { return "Contra" }
             16 { return "Journal" }
+            17 { return "Debit Note" }
+            18 { return "Credit Note" }
             19 { return "Payment" }
             default { return "Voucher $Value" }
         }
@@ -1027,7 +1067,8 @@ function Get-OutstandingReport {
             3  { return "SlRt" }
             4  { return "MtRc" }
             5  { return "StTr" }
-            8  { return "StJr" }
+            6  { return "Prod" }
+            8  { return "SJrl" }
             9  { return "Sale" }
             10 { return "PrRt" }
             11 { return "MtIs" }
@@ -1036,6 +1077,8 @@ function Get-OutstandingReport {
             14 { return "Rcpt" }
             15 { return "Cntr" }
             16 { return "Jrnl" }
+            17 { return "DrNt" }
+            18 { return "CrNt" }
             19 { return "Pymt" }
             default { return "Vch$Value" }
         }
@@ -1233,7 +1276,7 @@ SELECT
     MIN(
         CASE
             WHEN T.Method = 1
-                THEN T.[Date]
+                THEN V.[Date]
             ELSE NULL
         END
     ) AS RefDate,
@@ -1262,6 +1305,22 @@ SELECT
         END
     ) AS VoucherType,
 
+    MAX(
+        CASE
+            WHEN T.Method = 1
+                THEN ISNULL(T.Status, 0)
+            ELSE 0
+        END
+    ) AS RefStatus,
+
+    MAX(
+        CASE
+            WHEN T.Method = 1
+                THEN ISNULL(T.TranType, 0)
+            ELSE 0
+        END
+    ) AS RefTranType,
+
     SUM(
         CASE
             WHEN T.Method = 1
@@ -1272,7 +1331,7 @@ SELECT
 
     SUM(
         CASE
-            WHEN T.Method = 2
+            WHEN T.Method IN (2, 3)
                 THEN ISNULL(T.Value1, 0)
             ELSE 0
         END
@@ -1280,7 +1339,7 @@ SELECT
 
     SUM(
         CASE
-            WHEN T.Method IN (1, 2)
+            WHEN T.Method IN (1, 2, 3)
                 THEN ISNULL(T.Value1, 0)
             ELSE 0
         END
@@ -1288,7 +1347,7 @@ SELECT
 
     SUM(
         CASE
-            WHEN T.Method = 2
+            WHEN T.Method IN (2, 3)
                 THEN 1
             ELSE 0
         END
@@ -1300,8 +1359,17 @@ INNER JOIN Tran1 V
 
 WHERE
     T.RecType = 1
-    AND T.Method IN (1, 2)
-    AND T.VchType IN (2, 3, 9, 10)
+    AND T.Method IN (1, 2, 3)
+    AND (
+        (
+            T.Method = 1
+            AND T.VchType IN (2, 3, 6, 8, 9, 10, 14, 16, 17, 18, 19)
+        )
+        OR (
+            T.Method IN (2, 3)
+            AND T.VchType <> 15
+        )
+    )
     AND T.RefCode <> 0
     AND ISNULL(T.[No], '') <> ''
     AND T.[Date] <= $asOfLiteral
@@ -1315,7 +1383,7 @@ GROUP BY
 HAVING
     SUM(
         CASE
-            WHEN T.Method IN (1, 2)
+            WHEN T.Method IN (1, 2, 3)
                 THEN ISNULL(T.Value1, 0)
             ELSE 0
         END
@@ -1340,7 +1408,7 @@ SELECT
     MIN(
         IIF(
             T.Method = 1,
-            T.[Date],
+            V.[Date],
             NULL
         )
     ) AS RefDate,
@@ -1369,6 +1437,30 @@ SELECT
         )
     ) AS VoucherType,
 
+    MAX(
+        IIF(
+            T.Method = 1,
+            IIF(
+                T.Status IS NULL,
+                0,
+                T.Status
+            ),
+            0
+        )
+    ) AS RefStatus,
+
+    MAX(
+        IIF(
+            T.Method = 1,
+            IIF(
+                T.TranType IS NULL,
+                0,
+                T.TranType
+            ),
+            0
+        )
+    ) AS RefTranType,
+
     SUM(
         IIF(
             T.Method = 1,
@@ -1383,7 +1475,7 @@ SELECT
 
     SUM(
         IIF(
-            T.Method = 2,
+            (T.Method = 2 OR T.Method = 3) AND T.VchType <> 15,
             IIF(
                 T.Value1 IS NULL,
                 0,
@@ -1395,7 +1487,10 @@ SELECT
 
     SUM(
         IIF(
-            T.Method = 1 OR T.Method = 2,
+            T.Method = 1 OR (
+                (T.Method = 2 OR T.Method = 3)
+                AND T.VchType <> 15
+            ),
             IIF(
                 T.Value1 IS NULL,
                 0,
@@ -1407,7 +1502,7 @@ SELECT
 
     SUM(
         IIF(
-            T.Method = 2,
+            (T.Method = 2 OR T.Method = 3) AND T.VchType <> 15,
             1,
             0
         )
@@ -1419,8 +1514,17 @@ INNER JOIN Tran1 V
 
 WHERE
     T.RecType = 1
-    AND T.Method IN (1, 2)
-    AND T.VchType IN (2, 3, 9, 10)
+    AND T.Method IN (1, 2, 3)
+    AND (
+        (
+            T.Method = 1
+            AND T.VchType IN (2, 3, 6, 8, 9, 10, 14, 16, 17, 18, 19)
+        )
+        OR (
+            (T.Method = 2 OR T.Method = 3)
+            AND T.VchType <> 15
+        )
+    )
     AND T.RefCode <> 0
     AND T.[No] IS NOT NULL
     AND T.[No] <> ''
@@ -1441,7 +1545,10 @@ GROUP BY
 HAVING
     SUM(
         IIF(
-            T.Method = 1 OR T.Method = 2,
+            T.Method = 1 OR (
+                (T.Method = 2 OR T.Method = 3)
+                AND T.VchType <> 15
+            ),
             IIF(
                 T.Value1 IS NULL,
                 0,
@@ -1605,6 +1712,12 @@ GROUP BY
         $transactions =
             [System.Collections.Generic.List[object]]::new()
 
+        # Native BUSY Ref. Amount totals include zero-pending references.
+        # These accumulators preserve their adjustment contribution while the
+        # visible web register can continue to hide zero-pending rows.
+        $closedReceivableAdjustedTotal = 0.0
+        $closedPayableAdjustedTotal = 0.0
+
         $accountTotals = @{}
         $accountPendingSignedMap = @{}
 
@@ -1643,10 +1756,22 @@ GROUP BY
                 ConvertTo-ReportInt `
                     $referenceRow.AccountCode
 
+            $voucherTypeValue =
+                ConvertTo-ReportInt `
+                    $referenceRow.VoucherType
+
+            $isNativeAccountlessReference = (
+                $accountCode -le 0 -and
+                $voucherTypeValue -in @(6, 8)
+            )
+
             if (
-                $accountCode -le 0 -or
-                -not $accountMap.ContainsKey(
-                    $accountCode
+                -not $isNativeAccountlessReference -and
+                (
+                    $accountCode -le 0 -or
+                    -not $accountMap.ContainsKey(
+                        $accountCode
+                    )
                 )
             ) {
                 $filterCounters.missingAccount++
@@ -1684,20 +1809,64 @@ GROUP BY
                 2
             )
 
-            $pendingAmount =
-                [Math]::Abs($pendingSigned)
+            # BUSY displays the pending balance from the reference direction:
+            # receivable refs are stored with the opposite sign to payable refs.
+            # Keep the sign because BUSY can show an over-adjusted bill as a
+            # negative pending amount (for example -960.00).
+            $refStatusForPending =
+                ConvertTo-ReportInt `
+                    $referenceRow.RefStatus
 
-            if (
-                -not $IncludeZero -and
-                $pendingAmount -lt 0.005
-            ) {
-                $filterCounters.zeroPending++
-                continue
+            $refTranType =
+                ConvertTo-ReportInt `
+                    $referenceRow.RefTranType
+
+            # Native BUSY parity:
+            # A Method=1 bill-reference row with TranType=1 is retained by
+            # BUSY in the Bills report, but its Pending amount is zero.
+            # The supplied native BUSY report proves this for
+            # RECLP1696-428 (RefCode 2060, Ref Amt 86,400, Pending 0).
+            $pendingAmount = if ($refTranType -eq 1) {
+                0.0
             }
+            elseif (
+                $voucherTypeValue -eq 19 -and
+                $refStatusForPending -eq 1 -and
+                $pendingSigned -lt 0
+            ) {
+                # Native BUSY Payment parity:
+                # cheque-return Payment new references can carry Status=1 and
+                # a negative stored balance, while BUSY still displays them in
+                # Bills Receivable as a positive Pending amount.
+                #
+                # V10 fixed their Receivable/Payable classification but left the
+                # stored negative sign untouched. That made Receivable smaller by
+                # the same amount instead of larger by it.
+                [Math]::Round([Math]::Abs($pendingSigned), 2)
+            }
+            elseif ($refStatusForPending -eq 2) {
+                [Math]::Round((-1.0 * $pendingSigned), 2)
+            }
+            elseif ($refStatusForPending -eq 1) {
+                [Math]::Round($pendingSigned, 2)
+            }
+            else {
+                [Math]::Round([Math]::Abs($pendingSigned), 2)
+            }
+
+            $pendingMagnitude =
+                [Math]::Abs($pendingAmount)
+
+            # Do not discard zero-pending references yet. Native BUSY includes
+            # them in Ref. Amount / adjusted totals even when the transaction
+            # register hides them. We defer the visible-row decision until all
+            # business filters have been evaluated.
+            $isZeroPending =
+                ($pendingMagnitude -lt 0.005)
 
             if (
                 $MinAmount -gt 0 -and
-                $pendingAmount -lt $MinAmount
+                $pendingMagnitude -lt $MinAmount
             ) {
                 $filterCounters.belowMinimum++
                 continue
@@ -1705,7 +1874,7 @@ GROUP BY
 
             if (
                 $MaxAmount -gt 0 -and
-                $pendingAmount -gt $MaxAmount
+                $pendingMagnitude -gt $MaxAmount
             ) {
                 $filterCounters.aboveMaximum++
                 continue
@@ -1736,8 +1905,9 @@ GROUP BY
             }
             catch {}
 
-            # From/To apply to the original Method=1 reference date.
-            # Method=2 adjustments are included according to AsOf.
+            # From/To are voucher-date filters. RefDate comes from Tran1.Date
+            # for the original Method=1 voucher. Method 2/3 reference movements
+            # remain controlled by the AsOf cutoff through Tran3.Date in SQL.
             if ($refDate.Date -lt $fromDate.Date) {
                 $filterCounters.outsideFromDate++
                 continue
@@ -1748,11 +1918,31 @@ GROUP BY
                 continue
             }
 
-            $accountData = $accountMap[$accountCode]
+            $accountData = if ($isNativeAccountlessReference) {
+                @{
+                    code = 0
+                    name = ""
+                    alias = ""
+                    groupName = ""
+                }
+            }
+            else {
+                $accountMap[$accountCode]
+            }
+
+            $voucherCode =
+                ConvertTo-ReportInt `
+                    $referenceRow.VoucherCode
+
+            $refStatus =
+                ConvertTo-ReportInt `
+                    $referenceRow.RefStatus
 
             $nature = Resolve-OutstandingNature `
                 -GroupName $accountData.groupName `
-                -OriginalSigned $originalSigned
+                -OriginalSigned $originalSigned `
+                -VoucherType $voucherTypeValue `
+                -RefStatus $refStatus
 
             if (
                 -not [string]::IsNullOrWhiteSpace($Type) -and
@@ -1796,14 +1986,6 @@ GROUP BY
                 $filterCounters.groupFilter++
                 continue
             }
-
-            $voucherCode =
-                ConvertTo-ReportInt `
-                    $referenceRow.VoucherCode
-
-            $voucherTypeValue =
-                ConvertTo-ReportInt `
-                    $referenceRow.VoucherType
 
             if (
                 $VoucherType -gt 0 -and
@@ -1876,16 +2058,19 @@ GROUP BY
             $originalAmount =
                 [Math]::Abs($originalSigned)
 
-            $adjustedAmount =
-                [Math]::Abs($adjustmentSigned)
+            # Net adjustment in the same arithmetic used by BUSY's totals.
+            $adjustedAmount = [Math]::Round(
+                $originalAmount - $pendingAmount,
+                2
+            )
 
             $partiallyAdjusted =
-                $adjustedAmount -gt 0.005 -and
-                $pendingAmount -gt 0.005
+                [Math]::Abs($adjustedAmount) -gt 0.005 -and
+                $pendingMagnitude -gt 0.005
 
             $unadjusted =
-                $adjustedAmount -lt 0.005 -and
-                $pendingAmount -gt 0.005
+                [Math]::Abs($adjustedAmount) -lt 0.005 -and
+                $pendingMagnitude -gt 0.005
 
             if (
                 -not (
@@ -1906,6 +2091,35 @@ GROUP BY
                 $agingBucket -ne $Aging
             ) {
                 $filterCounters.agingFilter++
+                continue
+            }
+
+            if (
+                -not $IncludeZero -and
+                $isZeroPending
+            ) {
+                $filterCounters.zeroPending++
+
+                # BUSY still includes a closed reference's Ref. Amount when
+                # deriving the Adjusted total:
+                #   Adjusted = Ref. Amount - Pending
+                if ($nature -eq "receivable") {
+                    $closedReceivableAdjustedTotal =
+                        [Math]::Round(
+                            $closedReceivableAdjustedTotal +
+                            $adjustedAmount,
+                            2
+                        )
+                }
+                elseif ($nature -eq "payable") {
+                    $closedPayableAdjustedTotal =
+                        [Math]::Round(
+                            $closedPayableAdjustedTotal +
+                            $adjustedAmount,
+                            2
+                        )
+                }
+
                 continue
             }
 
@@ -2266,6 +2480,58 @@ GROUP BY
             2
         )
 
+        # Financial overview card totals.
+        # Pending totals are the current open balances; adjusted totals are the
+        # amounts already settled/adjusted against the currently matched open
+        # references, split by receivable/payable nature.
+        $receivableOriginalTotal = [Math]::Round(
+            (@(
+                $allRows |
+                Where-Object {
+                    $_.nature -eq "receivable"
+                } |
+                Measure-Object `
+                    originalAmount `
+                    -Sum
+            ).Sum),
+            2
+        )
+
+        $payableOriginalTotal = [Math]::Round(
+            (@(
+                $allRows |
+                Where-Object {
+                    $_.nature -eq "payable"
+                } |
+                Measure-Object `
+                    originalAmount `
+                    -Sum
+            ).Sum),
+            2
+        )
+
+        # Match BUSY's report arithmetic:
+        # Adjusted Total = Ref. Amount Total - Pending Amount Total.
+        # This remains a NET adjustment, so references whose pending amount
+        # increased correctly reduce the adjusted total.
+        $receivableAdjustedTotal = [Math]::Round(
+            (
+                $receivableOriginalTotal -
+                $totalReceivable +
+                $closedReceivableAdjustedTotal
+            ),
+            2
+        )
+
+        $payableAdjustedTotal = [Math]::Round(
+            (
+                $payableOriginalTotal -
+                $totalPayable +
+                $closedPayableAdjustedTotal
+            ),
+            2
+        )
+
         $overdueReceivable = [Math]::Round(
             (@(
                 $allRows |
@@ -2348,6 +2614,9 @@ GROUP BY
 
         $uniqueAccounts = @(
             $allRows |
+            Where-Object {
+                (ConvertTo-ReportInt $_.accountCode) -gt 0
+            } |
             Select-Object `
                 -ExpandProperty accountCode `
                 -Unique
@@ -2356,7 +2625,8 @@ GROUP BY
         $receivableAccounts = @(
             $allRows |
             Where-Object {
-                $_.nature -eq "receivable"
+                $_.nature -eq "receivable" -and
+                (ConvertTo-ReportInt $_.accountCode) -gt 0
             } |
             Select-Object `
                 -ExpandProperty accountCode `
@@ -2366,7 +2636,8 @@ GROUP BY
         $payableAccounts = @(
             $allRows |
             Where-Object {
-                $_.nature -eq "payable"
+                $_.nature -eq "payable" -and
+                (ConvertTo-ReportInt $_.accountCode) -gt 0
             } |
             Select-Object `
                 -ExpandProperty accountCode `
@@ -2391,6 +2662,42 @@ GROUP BY
             $totalOnAccountSignedRaw,
             2
         )
+
+        try {
+            $parityGroups = @(
+                $allRows |
+                Group-Object nature, voucherTypeShortName
+            )
+
+            foreach ($parityGroup in $parityGroups) {
+                $parts = [string]$parityGroup.Name -split ", "
+                $parityNature = if ($parts.Count -gt 0) { $parts[0] } else { "" }
+                $parityType = if ($parts.Count -gt 1) { $parts[1] } else { "" }
+
+                $parityPending = [Math]::Round(
+                    (@(
+                        $parityGroup.Group |
+                        Measure-Object pendingAmount -Sum
+                    ).Sum),
+                    2
+                )
+
+                Write-Host (
+                    "  [OUTSTANDING-PARITY] nature={0} type={1} rows={2} pending={3}" -f
+                    $parityNature,
+                    $parityType,
+                    @($parityGroup.Group).Count,
+                    $parityPending
+                ) -ForegroundColor DarkCyan
+            }
+        }
+        catch {}
+
+        Write-Host (
+            "  [OUTSTANDING-CLOSED-REFS] receivableAdjusted={0}; payableAdjusted={1}" -f
+            [Math]::Round($closedReceivableAdjustedTotal, 2),
+            [Math]::Round($closedPayableAdjustedTotal, 2)
+        ) -ForegroundColor DarkCyan
 
         Stop-ReportEngineWatch `
             -Watch $summaryWatch `
@@ -2443,6 +2750,13 @@ GROUP BY
             summaryScope = "all"
 
             summary = @{
+                # Explicit card fields. Keep the legacy totals below for
+                # compatibility with the rest of the report UI.
+                receivablePendingTotal = $totalReceivable
+                receivableAdjustedTotal = $receivableAdjustedTotal
+                payablePendingTotal = $totalPayable
+                payableAdjustedTotal = $payableAdjustedTotal
+
                 totalReceivable = $totalReceivable
                 totalPayable = $totalPayable
 
@@ -2642,6 +2956,7 @@ GROUP BY
 
 # ============================================================
 # STOCK STATUS DIRECT DATABASE FAST PATH
+# [STOCK-ACCESS-COMPAT-V1] Access/BDS Stock Status uses BUSY COM fallback.
 # ============================================================
 # BUSY COM recordsets are reliable but expensive for company-wide
 # aggregate/index work. auth_native.ps1/connection helpers are loaded
@@ -3092,33 +3407,29 @@ function Get-StockStatusReport {
             }
         }
         else {
-            $directStockContext =
-                Get-StockStatusDirectAccessContext `
-                    -InstanceId $InstanceId `
-                    -CompanyCode $CompanyCode `
-                    -FinancialYearStart $fyYear
+            # STOCK-ACCESS-COMPAT-V1
+            #
+            # Access/BDS stock status must prefer the already-proven BUSY COM
+            # recordset path. Some of the optimized Stock Status queries use
+            # SQL constructs/provider behaviour that is reliable on SQL Server
+            # but can fail or return incomplete data through Jet/OLE DB.
+            #
+            # IMPORTANT:
+            # - SQL Server keeps the direct fast path.
+            # - Access/BDS keeps exactly the existing report business logic,
+            #   but all stock reads are executed through BUSY COM.
+            # - No voucher data is written here.
+            # - This is a compatibility/reliability switch, not a formula change.
+            $directStockContext = $null
+            $directStockConn = $null
 
-            if ($null -ne $directStockContext) {
-                $directStockConn =
-                    $directStockContext.connection
-
-                if (
-                    $directStockConn.State.ToString() -ne
-                    "Open"
-                ) {
-                    $directStockConn.Open()
-                }
-
-                Write-ReportEngineLog `
-                    -Stage "STOCK-DIRECT" `
-                    -Message (
-                        "Direct Access read path active; db=" +
-                        [System.IO.Path]::GetFileName(
-                            [string]$directStockContext.path
-                        )
-                    ) `
-                    -Color "Green"
-            }
+            Write-ReportEngineLog `
+                -Stage "STOCK-ACCESS" `
+                -Message (
+                    "Access/BDS detected; using BUSY COM stock-report path " +
+                    "for compatibility."
+                ) `
+                -Color "Green"
         }
 
         # Keep the raw number of stock-item masters for diagnostics/UI only.
