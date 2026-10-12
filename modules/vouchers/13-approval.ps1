@@ -185,6 +185,46 @@ WHERE VchCode=$VchCode
     }
 }
 
+
+function Set-BusyApprovedVoucherStructure {
+    param(
+        $fi,
+        [int]$VchCode,
+        [int]$VchType
+    )
+
+    # Restore Tran2 detail rows from BUSY's pending-approval representation
+    # back to the normal/approved representation.
+    #
+    # VERIFIED:
+    #   VchType 12 Sale Order       : RecType 15 -> 4
+    #   VchType 26 Sales Quotation  : RecType 21 -> 20
+    switch ($VchType) {
+        12 {
+            $fi.ExecuteQuery(@"
+UPDATE Tran2
+SET RecType=4
+WHERE VchCode=$VchCode
+  AND VchType=12
+  AND RecType=15
+"@)
+        }
+
+        26 {
+            $fi.ExecuteQuery(@"
+UPDATE Tran2
+SET RecType=20
+WHERE VchCode=$VchCode
+  AND VchType=26
+  AND RecType=21
+"@)
+        }
+
+        default { }
+    }
+}
+
+
 function Set-WebCreatedVoucherApprovalState {
     param(
         $fi,
@@ -220,7 +260,7 @@ function Set-WebCreatedVoucherApprovalState {
 
         # When BUSY approval is required, normalize only the detail structure
         # that has been empirically verified for the current voucher type.
-        # At present, only Sale Order (VchType 12) has a verified mapping.
+        # Verified mappings currently exist for Sale Order (12) and Sales Quotation (26).
         if ($approvalRequired) {
             Set-BusyPendingVoucherStructure `
                 -fi $fi `
@@ -293,6 +333,49 @@ function Invoke-BusyCloudApprovalNonQuery {
     $cmd.CommandText = $Sql
     return $cmd.ExecuteNonQuery()
 }
+
+
+function Invoke-BusyCloudApprovalRecTypeTransition {
+    param(
+        $Connection,
+        $Transaction,
+        [int]$VchCode,
+        [int]$VchType,
+        [ValidateSet('Pending','Approved')]
+        [string]$TargetState
+    )
+
+    $sql = $null
+
+    if ($TargetState -eq 'Pending') {
+        switch ($VchType) {
+            12 {
+                $sql = "UPDATE Tran2 SET RecType=15 WHERE VchCode=$VchCode AND VchType=12 AND RecType=4"
+            }
+            26 {
+                $sql = "UPDATE Tran2 SET RecType=21 WHERE VchCode=$VchCode AND VchType=26 AND RecType=20"
+            }
+        }
+    }
+    else {
+        switch ($VchType) {
+            12 {
+                $sql = "UPDATE Tran2 SET RecType=4 WHERE VchCode=$VchCode AND VchType=12 AND RecType=15"
+            }
+            26 {
+                $sql = "UPDATE Tran2 SET RecType=20 WHERE VchCode=$VchCode AND VchType=26 AND RecType=21"
+            }
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($sql)) {
+        [void](Invoke-BusyCloudApprovalNonQuery `
+            -Connection $Connection `
+            -Transaction $Transaction `
+            -Sql $sql)
+    }
+}
+
 
 function Get-VoucherApprovalQueue-Direct {
     param(
@@ -566,6 +649,16 @@ function Approve-Voucher-Direct {
         $txn=$conn.BeginTransaction()
         $updated=Invoke-BusyCloudApprovalNonQuery -Connection $conn -Transaction $txn -Sql "UPDATE Tran1 SET ApprovalStatus=1 WHERE VchCode=$VchCode AND ApprovalStatus=2"
         if([int]$updated -le 0){throw 'Voucher approval state changed before this request completed. Refresh and try again.'}
+
+        # BUSY detail rows must return from pending representation to normal
+        # representation when the voucher becomes Approved.
+        Invoke-BusyCloudApprovalRecTypeTransition `
+            -Connection $conn `
+            -Transaction $txn `
+            -VchCode $VchCode `
+            -VchType $vchType `
+            -TargetState 'Approved'
+
         [void](Invoke-BusyCloudApprovalNonQuery -Connection $conn -Transaction $txn -Sql "DELETE FROM CheckList WHERE Code=$VchCode AND Action=3")
         [void](Invoke-BusyCloudApprovalNonQuery -Connection $conn -Transaction $txn -Sql "INSERT INTO CheckList (Type,Code,Action,ActionTime,UserName,D1,D2,D3,D4,D5,Notes,ComputerName) VALUES ($checkType,$VchCode,3,$dateExpr,'$safeUser',$d1,$d2,$d3,$d4,$d5,'$safeRemarks','$safeComputer')")
         $txn.Commit();$txn=$null
@@ -638,6 +731,16 @@ function Unapprove-Voucher-Direct {
         $txn=$conn.BeginTransaction()
         $updated=Invoke-BusyCloudApprovalNonQuery -Connection $conn -Transaction $txn -Sql "UPDATE Tran1 SET ApprovalStatus=2 WHERE VchCode=$VchCode AND ApprovalStatus=1"
         if([int]$updated -le 0){throw 'Voucher approval state changed before this request completed. Refresh and try again.'}
+
+        # Moving an approved voucher back to To be Approved must also restore
+        # BUSY's pending detail-row representation.
+        Invoke-BusyCloudApprovalRecTypeTransition `
+            -Connection $conn `
+            -Transaction $txn `
+            -VchCode $VchCode `
+            -VchType $vchType `
+            -TargetState 'Pending'
+
         [void](Invoke-BusyCloudApprovalNonQuery -Connection $conn -Transaction $txn -Sql "DELETE FROM CheckList WHERE Code=$VchCode AND Action=3")
         $txn.Commit();$txn=$null
 
@@ -802,8 +905,8 @@ function Approve-Voucher-AccessCom {
         $storage=Ensure-BusyCloudVoucherApprovalAuditTable -InstanceId $InstanceId -CompanyCode $CompanyCode
         if(-not $storage.success){return @{success=$false;error="Approval audit storage is unavailable. $($storage.error)"}}
 
-        function RAF { param($R,[string]$F,$D);try{$v=$R.Fields.Item($F).Value;if($null-ne$v-and$v-ne[System.DBNull]::Value){return$v}}catch{};return$D }
-        function NumLit { param($V);try{return([double]$V).ToString("0.################",[System.Globalization.CultureInfo]::InvariantCulture)}catch{return"0"} }
+        function RAF { param($R,[string]$F,$D);try{$v=$R.Fields.Item($F).Value;if($null-ne$v-and$v-ne[System.DBNull]::Value){return $v}}catch{};return $D }
+        function NumLit { param($V);try{return([double]$V).ToString("0.################",[System.Globalization.CultureInfo]::InvariantCulture)}catch{return "0"} }
 
         $src=$fi.GetRecordset("SELECT TOP 1 Type,D1,D2,D3,D4,D5 FROM CheckList WHERE Code=$VchCode AND Action=1 ORDER BY ActionTime")
         $checkType=2;$d1="0";$d2="0";$d3="0";$d4="0";$d5="0"
@@ -817,12 +920,19 @@ function Approve-Voucher-AccessCom {
 
         $fi.ExecuteQuery("UPDATE Tran1 SET ApprovalStatus=1 WHERE VchCode=$VchCode AND ApprovalStatus=2")
         try {
+            # Pending detail rows must be restored to their normal/approved
+            # RecType values when BUSY approval completes.
+            Set-BusyApprovedVoucherStructure -fi $fi -VchCode $VchCode -VchType $vchType
+
             $fi.ExecuteQuery("DELETE FROM CheckList WHERE Code=$VchCode AND Action=3")
             $fi.ExecuteQuery("INSERT INTO CheckList (Type,Code,Action,ActionTime,UserName,D1,D2,D3,D4,D5,Notes,ComputerName) VALUES ($checkType,$VchCode,3,$nowExpr,'$safeUser',$d1,$d2,$d3,$d4,$d5,'$safeRemarks','$safeComputer')")
             $audit=Write-BusyCloudVoucherApprovalAudit -VchCode $VchCode -VchType $vchType -VchNo $vchNo -VchSeries $seriesName -VchDate $vchDate -EventType "APPROVE" -PreviousStatus 2 -NewStatus 1 -ActionBy $UserName -Remarks ([string]$Remarks).Trim() -InstanceId $InstanceId -CompanyCode $CompanyCode
             if(-not$audit.success){throw "Could not write BusyCloud approval history. $($audit.error)"}
         } catch {
-            try{$fi.ExecuteQuery("DELETE FROM CheckList WHERE Code=$VchCode AND Action=3")}catch{};try{$fi.ExecuteQuery("UPDATE Tran1 SET ApprovalStatus=2 WHERE VchCode=$VchCode")}catch{};throw
+            try { Set-BusyPendingVoucherStructure -fi $fi -VchCode $VchCode -VchType $vchType } catch {}
+            try { $fi.ExecuteQuery("DELETE FROM CheckList WHERE Code=$VchCode AND Action=3") } catch {}
+            try { $fi.ExecuteQuery("UPDATE Tran1 SET ApprovalStatus=2 WHERE VchCode=$VchCode") } catch {}
+            throw
         }
 
         return @{success=$true;message="Voucher approved successfully.";data=@{vchCode=$VchCode;vchType=$vchType;vchNo=$vchNo;approvalStatus=1;approvalStatusText="Approved";approvedBy=$UserName;approvedAt=$audit.actionTime;remarks=([string]$Remarks).Trim()}}
@@ -846,13 +956,13 @@ function Unapprove-Voucher-AccessCom {
     $fi=Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode;if(-not$fi){return @{success=$false;error="BUSY database connection failed"}}
 
     try {
-        function URF { param($R,[string]$F,$D);try{$v=$R.Fields.Item($F).Value;if($null-ne$v-and$v-ne[System.DBNull]::Value){return$v}}catch{};return$D }
-        function UNum { param($V);try{return([double]$V).ToString("0.################",[System.Globalization.CultureInfo]::InvariantCulture)}catch{return"0"} }
+        function URF { param($R,[string]$F,$D);try{$v=$R.Fields.Item($F).Value;if($null-ne$v-and$v-ne[System.DBNull]::Value){return $v}}catch{};return $D }
+        function UNum { param($V);try{return([double]$V).ToString("0.################",[System.Globalization.CultureInfo]::InvariantCulture)}catch{return "0"} }
 
         $rst=$fi.GetRecordset("SELECT VchType,VchNo,VchSeriesCode,[Date],ApprovalStatus FROM Tran1 WHERE VchCode=$VchCode");if(-not$rst-or$rst.EOF){return @{success=$false;httpStatus=404;error="Voucher not found."}}
         $vchType=[int]$rst.Fields.Item("VchType").Value;$vchNo=([string]$rst.Fields.Item("VchNo").Value).Trim();$seriesCode=[int]$rst.Fields.Item("VchSeriesCode").Value;$vchDate=$rst.Fields.Item("Date").Value;$current=[int]$rst.Fields.Item("ApprovalStatus").Value;try{$rst.Close()}catch{}
 
-        $access=Test-VoucherApprover -UserName $UserName -VchType $vchType -IsAdmin:$IsAdmin -InstanceId $InstanceId -CompanyCode $CompanyCode -ExistingFi $fi;if(-not$access.success){return$access};if(-not$access.allowed){return @{success=$false;httpStatus=403;error="You are not allowed to unapprove this voucher type."}}
+        $access=Test-VoucherApprover -UserName $UserName -VchType $vchType -IsAdmin:$IsAdmin -InstanceId $InstanceId -CompanyCode $CompanyCode -ExistingFi $fi;if(-not$access.success){return $access};if(-not$access.allowed){return @{success=$false;httpStatus=403;error="You are not allowed to unapprove this voucher type."}}
         if($current-eq0){return @{success=$false;httpStatus=409;error="Approval is not required for this voucher."}};if($current-eq2){return @{success=$true;message="Voucher is already pending approval.";data=@{vchCode=$VchCode;approvalStatus=2}}};if($current-ne1){return @{success=$false;httpStatus=409;error="Voucher is not currently approved."}}
 
         $approval=$fi.GetRecordset("SELECT TOP 1 Type,ActionTime,UserName,D1,D2,D3,D4,D5,Notes,ComputerName FROM CheckList WHERE Code=$VchCode AND Action=3 ORDER BY ActionTime DESC")
@@ -864,11 +974,16 @@ function Unapprove-Voucher-AccessCom {
 
         $fi.ExecuteQuery("UPDATE Tran1 SET ApprovalStatus=2 WHERE VchCode=$VchCode AND ApprovalStatus=1")
         try {
+            # Unapprove means the voucher is pending again, so restore the
+            # BUSY pending RecType representation.
+            Set-BusyPendingVoucherStructure -fi $fi -VchCode $VchCode -VchType $vchType
+
             $fi.ExecuteQuery("DELETE FROM CheckList WHERE Code=$VchCode AND Action=3")
             $audit=Write-BusyCloudVoucherApprovalAudit -VchCode $VchCode -VchType $vchType -VchNo $vchNo -VchSeries $seriesName -VchDate $vchDate -EventType "UNAPPROVE" -PreviousStatus 1 -NewStatus 2 -ActionBy $UserName -Remarks $reasonText -InstanceId $InstanceId -CompanyCode $CompanyCode
             if(-not$audit.success){throw "Could not write BusyCloud unapprove history. $($audit.error)"}
         } catch {
-            try{$fi.ExecuteQuery("UPDATE Tran1 SET ApprovalStatus=1 WHERE VchCode=$VchCode")}catch{}
+            try { Set-BusyApprovedVoucherStructure -fi $fi -VchCode $VchCode -VchType $vchType } catch {}
+            try { $fi.ExecuteQuery("UPDATE Tran1 SET ApprovalStatus=1 WHERE VchCode=$VchCode") } catch {}
             try {
                 $found=Get-InstanceForCompany -CompanyCode $CompanyCode -InstanceId $InstanceId;$dbType=if($found-and$null-ne$found.instance.dbType){[int]$found.instance.dbType}else{0};$dt=[datetime]$aTime;$dateExpr=if($dbType-eq1){"'"+$dt.ToString("yyyy-MM-dd HH:mm:ss.fff")+"'"}else{"#"+$dt.ToString("MM/dd/yyyy HH:mm:ss")+"#"}
                 $su=$aUser.Replace("'","''");$sn=$aNotes.Replace("'","''");$sc=$aComputer.Replace("'","''")
@@ -1135,7 +1250,7 @@ function Get-VoucherApprovalQueue-DirectV6 {
     if($normalized -eq 'history'){
         $historyUser=if($IsAdmin){''}else{$UserName}
         $h=Get-BusyCloudVoucherApprovalHistoryV6 -VchTypes @($VchType) -VchType $VchType -ActionBy $historyUser -Search $Search -FromDate $FromDate -ToDate $ToDate -Page $Page -PageSize $PageSize -InstanceId $InstanceId -CompanyCode $CompanyCode
-        if(-not $h.success){return$h}
+        if(-not $h.success){return $h}
         return @{success=$true;data=@{allowed_vch_types=@($allowedTypes);status='history';items=@($h.data);pagination=$h.pagination}}
     }
 
@@ -1209,16 +1324,16 @@ function Get-VoucherApprovalQueue-AccessComV6 {
     )
     if([string]::IsNullOrWhiteSpace($UserName)){return @{success=$false;httpStatus=401;error='Authenticated BUSY user is required.'}}
     $allowed=Get-VoucherApprovalTypesForUser -UserName $UserName -IsAdmin:$IsAdmin -InstanceId $InstanceId -CompanyCode $CompanyCode
-    if(-not $allowed.success){return$allowed};$allowedTypes=@($allowed.data|ForEach-Object{[int]$_}|Where-Object{$_ -gt 0}|Sort-Object -Unique)
+    if(-not $allowed.success){return $allowed};$allowedTypes=@($allowed.data|ForEach-Object{[int]$_}|Where-Object{$_ -gt 0}|Sort-Object -Unique)
     if($VchType -le 0){return @{success=$true;data=@{allowed_vch_types=@($allowedTypes);status=([string]$Status).Trim().ToLowerInvariant();items=@();pagination=(New-BusyCloudApprovalPagination -Page 1 -PageSize $PageSize -Total 0)}}}
     if($allowedTypes -notcontains $VchType){return @{success=$false;httpStatus=403;error="Approval processing is not enabled for voucher type $VchType, or you are not an approver for it."}}
     $normalized=([string]$Status).Trim().ToLowerInvariant();if($normalized -notin @('pending','approved','history')){return @{success=$false;httpStatus=400;error='status must be pending, approved, or history.'}}
     if($Page -lt 1){$Page=1};if($PageSize -notin @(0,50,100,200,300,500)){$PageSize=50}
-    if($normalized -eq 'history'){$historyUser=if($IsAdmin){''}else{$UserName};$h=Get-BusyCloudVoucherApprovalHistoryV6 -VchTypes @($VchType) -VchType $VchType -ActionBy $historyUser -Search $Search -FromDate $FromDate -ToDate $ToDate -Page $Page -PageSize $PageSize -InstanceId $InstanceId -CompanyCode $CompanyCode;if(-not $h.success){return$h};return @{success=$true;data=@{allowed_vch_types=@($allowedTypes);status='history';items=@($h.data);pagination=$h.pagination}}}
+    if($normalized -eq 'history'){$historyUser=if($IsAdmin){''}else{$UserName};$h=Get-BusyCloudVoucherApprovalHistoryV6 -VchTypes @($VchType) -VchType $VchType -ActionBy $historyUser -Search $Search -FromDate $FromDate -ToDate $ToDate -Page $Page -PageSize $PageSize -InstanceId $InstanceId -CompanyCode $CompanyCode;if(-not $h.success){return $h};return @{success=$true;data=@{allowed_vch_types=@($allowedTypes);status='history';items=@($h.data);pagination=$h.pagination}}}
 
     $approvalStatus=if($normalized -eq 'approved'){1}else{2};$fi=Connect-BUSY -InstanceId $InstanceId -CompanyCode $CompanyCode;if(-not $fi){return @{success=$false;error='BUSY database connection failed'}}
     try{
-        function Read-ApprovalFieldV6{param($R,[string]$F,$D);try{$v=$R.Fields.Item($F).Value;if($null -ne $v -and $v -ne [System.DBNull]::Value){return$v}}catch{};return$D}
+        function Read-ApprovalFieldV6{param($R,[string]$F,$D);try{$v=$R.Fields.Item($F).Value;if($null -ne $v -and $v -ne [System.DBNull]::Value){return $v}}catch{};return $D}
         $masterMap=@{};$m=$fi.GetRecordset('SELECT Code,Name FROM Master1');if($m){while(-not $m.EOF){try{$c=[int]$m.Fields.Item('Code').Value;if($c -gt 0){$masterMap[$c]=[string]$m.Fields.Item('Name').Value}}catch{};$m.MoveNext()};try{$m.Close()}catch{}}
         $from=Convert-BusyCloudApprovalFilterDate $FromDate;$to=Convert-BusyCloudApprovalFilterDate $ToDate;$dateSql='';if($from){$dateSql += " AND [Date]>=#"+$from.ToString('MM/dd/yyyy')+'#'};if($to){$dateSql += " AND [Date]<#"+$to.AddDays(1).ToString('MM/dd/yyyy')+'#'}
         $rst=$fi.GetRecordset("SELECT VchCode,VchType,VchNo,[Date],VchSeriesCode,MasterCode1,VchAmtBaseCur,VchSalePurcAmt,ApprovalStatus FROM Tran1 WHERE VchType=$VchType AND ApprovalStatus=$approvalStatus$dateSql ORDER BY VchCode DESC")
