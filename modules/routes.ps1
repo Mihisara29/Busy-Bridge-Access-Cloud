@@ -11,11 +11,42 @@ function Send-Response {
     param($response, $data, $statusCode = $null)
     try {
         if ($null -ne $statusCode) { $response.StatusCode = $statusCode }
+        $serializeWatch = $null
+        if ($null -ne $script:LedgerHttpTiming) { $serializeWatch = [System.Diagnostics.Stopwatch]::StartNew() }
         $json   = $data | ConvertTo-Json -Depth 10
         $buffer = [System.Text.Encoding]::UTF8.GetBytes($json)
+        if ($null -ne $serializeWatch) { $serializeWatch.Stop() }
+        $sendWatch = $null
+        if ($null -ne $script:LedgerHttpTiming) {
+            $script:LedgerHttpTiming.HttpStatus = [int]$response.StatusCode
+            $sendWatch = [System.Diagnostics.Stopwatch]::StartNew()
+        }
         $response.OutputStream.Write($buffer, 0, $buffer.Length)
         $response.OutputStream.Close()
-    } catch { }
+        if ($null -ne $sendWatch) {
+            $sendWatch.Stop()
+            $script:LedgerHttpTiming.SerializerMs = [long]$serializeWatch.ElapsedMilliseconds
+            $script:LedgerHttpTiming.SendMs = [long]$sendWatch.ElapsedMilliseconds
+            $script:LedgerHttpTiming.ResponseBytes = $buffer.Length
+        }
+    } catch {
+        if ($null -ne $script:LedgerHttpTiming) {
+            Write-Host ('[LEDGER-HTTP] RESPONSE ERROR: ' + $_.Exception.Message) -ForegroundColor Red
+        }
+    } finally {
+        if ($null -ne $script:LedgerHttpTiming) {
+            $perf = $script:LedgerHttpTiming
+            $perf.Watch.Stop()
+            Write-Host ('[LEDGER-HTTP] {0}  {1}  status={2}  total={3:N0} ms ({4:N2} s)' -f `
+                (Get-Date -Format 'HH:mm:ss.fff'), $perf.Path, $perf.HttpStatus,
+                $perf.Watch.ElapsedMilliseconds, ($perf.Watch.ElapsedMilliseconds / 1000.0)) -ForegroundColor Magenta
+            Write-Host ('[LEDGER-HTTP]    JSON serialize+encode : {0:N0} ms' -f $perf.SerializerMs) -ForegroundColor Gray
+            Write-Host ('[LEDGER-HTTP]    HTTP output write    : {0:N0} ms' -f $perf.SendMs) -ForegroundColor Gray
+            Write-Host ('[LEDGER-HTTP]    Payload bytes        : {0:N0}' -f $perf.ResponseBytes) -ForegroundColor Gray
+            Write-Host '[LEDGER-HTTP] Browser wait also includes network transfer and JSON parsing. Use the benchmark script.' -ForegroundColor DarkGray
+            $script:LedgerHttpTiming = $null
+        }
+    }
 }
 
 function Get-QueryStringValue {
@@ -1608,6 +1639,18 @@ function Start-BUSYServer {
         $path   = $request.Url.LocalPath
         $method = $request.HttpMethod
         Write-Host "[$method] $path" -ForegroundColor Yellow
+        # Per-request server wall-clock timer; reset for every request.
+        $script:LedgerHttpTiming = $null
+        if ($method -eq 'GET' -and $path -match '^/busy/reports/account-ledger(?:/(?:group|all|warm-openings))?$') {
+            $script:LedgerHttpTiming = [pscustomobject]@{
+                Path = $path
+                Watch = [System.Diagnostics.Stopwatch]::StartNew()
+                SerializerMs = [long]0
+                SendMs = [long]0
+                ResponseBytes = [int]0
+                HttpStatus = [int]200
+            }
+        }
 
         try {
             $result = $null
@@ -4323,7 +4366,133 @@ function Start-BUSYServer {
                 $data = Read-RequestBody $request | ConvertFrom-Json
                 if (-not $data.name -or -not $data.group) { $result = @{success=$false;error="name and group required"}; $response.StatusCode=400 } else { $result = Update-Account -Data $data -InstanceId $instanceId -CompanyCode $companyCode }
 
-} elseif ($path -eq "/busy/reports/outstanding" -and $method -eq "GET") {
+} elseif ($path -eq "/busy/reports/account-ledger/warm-openings" -and $method -eq "GET") {
+                $batchRaw = Get-QueryStringValue $request.QueryString "batchSize" "60"
+                $batchSize = 60
+                if (-not [int]::TryParse($batchRaw, [ref]$batchSize) -or $batchSize -lt 1 -or $batchSize -gt 100) {
+                    $result = @{ success = $false; error = "batchSize must be between 1 and 100" }
+                    $response.StatusCode = 400
+                } else {
+                    $result = Get-AccountLedgerWarmOpenings `
+                        -BatchSize $batchSize -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+                    if (-not $result.success) { $response.StatusCode = 400 }
+                }
+
+            } elseif ($path -eq "/busy/reports/account-ledger/all" -and $method -eq "GET") {
+                $fromStr = Get-QueryStringValue $request.QueryString "from" ""
+                $toStr = Get-QueryStringValue $request.QueryString "to" ""
+                $pdcStr = (Get-QueryStringValue $request.QueryString "includePdc" "true").Trim().ToLowerInvariant()
+                $inclusion = Get-QueryStringValue $request.QueryString "accountsToInclude" "moved-or-closing"
+                $refreshStr = (Get-QueryStringValue $request.QueryString "refreshOpenings" "false").Trim().ToLowerInvariant()
+                $pageStr = Get-QueryStringValue $request.QueryString "page" "1"
+                $sizeStr = Get-QueryStringValue $request.QueryString "pageSize" "20"
+                $serverPaging = (Get-QueryStringValue $request.QueryString "serverPaging" "false").Trim().ToLowerInvariant() -in @("true", "1")
+                $pageValue = 1
+                $sizeValue = 20
+                if (-not [int]::TryParse($pageStr, [ref]$pageValue)) { $pageValue = 1 }
+                if (-not [int]::TryParse($sizeStr, [ref]$sizeValue)) { $sizeValue = 20 }
+                if ($pdcStr -notin @("true", "false", "1", "0")) {
+                    $result = @{ success = $false; error = "includePdc must be true or false" }
+                    $response.StatusCode = 400
+                } elseif ($refreshStr -notin @("true", "false", "1", "0")) {
+                    $result = @{ success = $false; error = "refreshOpenings must be true or false" }
+                    $response.StatusCode = 400
+                } else {
+                    $result = Get-AccountLedgerAllReport `
+                        -From $fromStr -To $toStr `
+                        -IncludePdc ($pdcStr -in @("true", "1")) `
+                        -AccountsToInclude $inclusion `
+                        -RefreshOpenings ($refreshStr -in @("true", "1")) `
+                        -UseDatabasePaging $serverPaging `
+                        -Page $pageValue -PageSize $sizeValue `
+                        -InstanceId $instanceId -CompanyCode $companyCode
+                    if (-not $result.success) { $response.StatusCode = 400 }
+                }
+
+            } elseif ($path -eq "/busy/reports/account-ledger/group" -and $method -eq "GET") {
+                $groupCodeStr = Get-QueryStringValue $request.QueryString "groupCode" "0"
+                $groupName = Get-QueryStringValue $request.QueryString "group" ""
+                $fromStr = Get-QueryStringValue $request.QueryString "from" ""
+                $toStr = Get-QueryStringValue $request.QueryString "to" ""
+                $pdcStr = Get-QueryStringValue $request.QueryString "includePdc" "true"
+                $childStr = Get-QueryStringValue $request.QueryString "includeChildGroups" "true"
+                $inclusion = Get-QueryStringValue $request.QueryString "accountsToInclude" "moved-or-closing"
+                $pageStr = Get-QueryStringValue $request.QueryString "page" "1"
+                $sizeStr = Get-QueryStringValue $request.QueryString "pageSize" "20"
+                $serverPaging = (Get-QueryStringValue $request.QueryString "serverPaging" "false").Trim().ToLowerInvariant() -in @("true", "1")
+
+                $groupCodeValue = 0
+                $pageValue = 1
+                $sizeValue = 20
+                $null = [int]::TryParse($groupCodeStr, [ref]$groupCodeValue)
+                if (-not [int]::TryParse($pageStr, [ref]$pageValue)) { $pageValue = 1 }
+                if (-not [int]::TryParse($sizeStr, [ref]$sizeValue)) { $sizeValue = 20 }
+                $pdcStr = $pdcStr.Trim().ToLowerInvariant()
+                $childStr = $childStr.Trim().ToLowerInvariant()
+                if ($groupCodeValue -le 0 -and [string]::IsNullOrWhiteSpace($groupName)) {
+                    $result = @{ success = $false; error = "groupCode or group is required" }
+                    $response.StatusCode = 400
+                } elseif ($pdcStr -notin @("true", "false", "1", "0")) {
+                    $result = @{ success = $false; error = "includePdc must be true or false" }
+                    $response.StatusCode = 400
+                } elseif ($childStr -notin @("true", "false", "1", "0")) {
+                    $result = @{ success = $false; error = "includeChildGroups must be true or false" }
+                    $response.StatusCode = 400
+                } else {
+                    $result = Get-AccountLedgerGroupReport `
+                        -GroupCode $groupCodeValue `
+                        -Group $groupName `
+                        -From $fromStr `
+                        -To $toStr `
+                        -IncludeChildGroups ($childStr -in @("true", "1")) `
+                        -IncludePdc ($pdcStr -in @("true", "1")) `
+                        -AccountsToInclude $inclusion `
+                        -Page $pageValue `
+                        -UseDatabasePaging $serverPaging `
+                        -PageSize $sizeValue `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+                    if (-not $result.success) { $response.StatusCode = 400 }
+                }
+
+            } elseif ($path -eq "/busy/reports/account-ledger" -and $method -eq "GET") {
+                $accountCodeString = Get-QueryStringValue $request.QueryString "accountCode" "0"
+                $accountName = Get-QueryStringValue $request.QueryString "account" ""
+                $fromString = Get-QueryStringValue $request.QueryString "from" ""
+                $toString = Get-QueryStringValue $request.QueryString "to" ""
+                $pdcString = Get-QueryStringValue $request.QueryString "includePdc" "true"
+                $pageString = Get-QueryStringValue $request.QueryString "page" "1"
+                $pageSizeString = Get-QueryStringValue $request.QueryString "pageSize" "100"
+
+                $accountCodeNumber = 0
+                $pageNumber = 1
+                $pageSizeNumber = 100
+                $null = [int]::TryParse($accountCodeString, [ref]$accountCodeNumber)
+                if (-not [int]::TryParse($pageString, [ref]$pageNumber)) { $pageNumber = 1 }
+                if (-not [int]::TryParse($pageSizeString, [ref]$pageSizeNumber)) { $pageSizeNumber = 100 }
+                $pdcNormalized = $pdcString.Trim().ToLowerInvariant()
+                if ($pdcNormalized -notin @("true", "false", "1", "0")) {
+                    $response.StatusCode = 400
+                    $result = @{ success = $false; error = "includePdc must be true or false" }
+                } elseif ($accountCodeNumber -le 0 -and [string]::IsNullOrWhiteSpace($accountName)) {
+                    $response.StatusCode = 400
+                    $result = @{ success = $false; error = "accountCode or account is required" }
+                } else {
+                    $result = Get-AccountLedgerReport `
+                        -AccountCode $accountCodeNumber `
+                        -Account $accountName `
+                        -From $fromString `
+                        -To $toString `
+                        -IncludePdc ($pdcNormalized -in @("true", "1")) `
+                        -Page $pageNumber `
+                        -PageSize $pageSizeNumber `
+                        -InstanceId $instanceId `
+                        -CompanyCode $companyCode
+                    if (-not $result.success) { $response.StatusCode = 400 }
+                }
+
+            } elseif ($path -eq "/busy/reports/outstanding" -and $method -eq "GET") {
                 $fromVal = Get-QueryStringValue $request.QueryString "from" ""
                 $toVal = Get-QueryStringValue $request.QueryString "to" ""
                 $asOfVal = Get-QueryStringValue $request.QueryString "asOf" ""
