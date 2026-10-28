@@ -1,0 +1,13 @@
+{
+  "name": "busyweb-whatsapp-portless-worker",
+  "private": true,
+  "version": "1.0.0",
+  "description": "WhatsApp Web file-queue worker. No HTTP listener.",
+  "scripts": {
+    "start": "node worker.js"
+  },
+  "dependencies": {
+    "whatsapp-web.js": "^1.34.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
