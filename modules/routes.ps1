@@ -1,3 +1,5 @@
+. "$PSScriptRoot\executive_jobs.ps1"
+. "$PSScriptRoot\dashboard.ps1"
 # modules/routes.ps1
 # HTTP Route Handlers — Targeted Native Auth & Audit Trail Integration
 
@@ -1638,6 +1640,17 @@ function Start-BUSYServer {
 
         $path   = $request.Url.LocalPath
         $method = $request.HttpMethod
+        # BUSYWEB_REPORT_GUARD_8085_V1
+        if ($script:BusyBridgeServiceMode -eq 'Reports') {
+            $isReportRead = ($method -eq 'GET' -and (
+                $path -eq '/health' -or $path -eq '/auth/me' -or
+                $path -match '^/busy/(?:reports|dashboard)(?:/|$)'
+            ))
+            if (-not $isReportRead) {
+                Send-Response $response @{success=$false;error='This listener serves read-only reports only.'} 404
+                continue
+            }
+        }
         Write-Host "[$method] $path" -ForegroundColor Yellow
         # Per-request server wall-clock timer; reset for every request.
         $script:LedgerHttpTiming = $null
@@ -1809,6 +1822,11 @@ function Start-BUSYServer {
             $cfg          = Get-Config
             $requireAuth  = $true
 
+            # Reports listener must never accept the internal bridge-secret bypass.
+            if ($script:BusyBridgeServiceMode -eq 'Reports' -and (-not $instanceId -or -not $companyCode)) {
+                Send-Response $response @{success=$false;error='Authenticated report company scope is required.'} 400
+                continue
+            }
             if ($bridgeSecret -eq $cfg.BRIDGE_SECRET -and -not $instanceId) {
                 $requireAuth = $false
                 $instanceId  = $cfg.INSTANCE_ID
@@ -1828,8 +1846,178 @@ function Start-BUSYServer {
                 }
             }
 
-            # --- COMPANY SETTINGS ---
-            if ($path -eq "/busy/company" -and $method -eq "GET") {
+            # BUSYWEB_WHATSAPP_PORTLESS_V1: only Main, authenticated BUSY Super Admin.
+            if ($path -match '^/busy/whatsapp(?:/|$)') {
+                if ($script:BusyBridgeServiceMode -eq 'Reports' -or $Port -ne 8081) {
+                    Send-Response $response @{success=$false;error='WhatsApp actions are Main API only.'} 404
+                    continue
+                }
+                if (-not $requireAuth -or $null -eq $authResult -or $null -eq $authResult.user -or
+                    -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{success=$false;error='WhatsApp sending requires a BUSY Super Admin.'} 403
+                    continue
+                }
+                try {
+                    if ($path -eq '/busy/whatsapp/status' -and $method -eq 'GET') {
+                        $wa=Get-BusyWhatsAppConnectionStatus
+                    } elseif ($path -eq '/busy/whatsapp/job' -and $method -eq 'GET') {
+                        $wa=Get-BusyWhatsAppStoredStatus -JobId ([string]$request.QueryString['jobId']) -InstanceId $instanceId -CompanyCode $companyCode -UserName ([string]$authResult.user.name)
+                    } elseif ($path -eq '/busy/whatsapp/recipient' -and $method -eq 'POST') {
+                        $b=Read-BusyWhatsAppBoundedBody -Request $request -MaxBytes 8192 | ConvertFrom-Json -ErrorAction Stop
+                        $wa=Get-BusyWhatsAppRecipient -Body $b -InstanceId $instanceId -CompanyCode $companyCode
+                    } elseif ($path -eq '/busy/whatsapp/send' -and $method -eq 'POST') {
+                        $b=Read-BusyWhatsAppBoundedBody -Request $request -MaxBytes 12000000 | ConvertFrom-Json -ErrorAction Stop
+                        $wa=Add-BusyWhatsAppInvoiceJob -Body $b -InstanceId $instanceId -CompanyCode $companyCode -UserName ([string]$authResult.user.name)
+                    } else {
+                        $wa=@{success=$false;error='WhatsApp endpoint not found';httpStatus=404}
+                    }
+                    Send-Response $response $wa $(if($wa.httpStatus){[int]$wa.httpStatus}else{200})
+                } catch {
+                    Write-Warning ('[WA] Request rejected: '+$_.Exception.Message)
+                    Send-Response $response @{success=$false;error=$_.Exception.Message} 400
+                }
+                continue
+            }
+
+            # BUSYWEB_DASHBOARD_PERMISSIONS_V1_START
+            # Per-user/per-company dashboard access. All writes remain on Main 8081.
+            if ($path -eq '/busy/dashboard-permissions/my' -and $method -eq 'GET') {
+                if (-not $requireAuth -or $null -eq $authResult -or $null -eq $authResult.user) {
+                    Send-Response $response @{success=$false;error='Authenticated user required.'} 403
+                    continue
+                }
+                try {
+                    $grants = Get-BusyDashboardGrants -InstanceId $instanceId -CompanyCode $companyCode -User $authResult.user
+                    $result = @{success=$true;data=@{grants=$grants}}
+                } catch {
+                    Send-Response $response @{success=$false;error='Dashboard permissions unavailable; access denied.'} 503
+                    continue
+                }
+
+            } elseif ($path -eq '/busy/dashboard-permissions/users' -and $method -eq 'GET') {
+                if (-not $requireAuth -or -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{success=$false;error='Super User permission required.'} 403
+                    continue
+                }
+                $result = Get-CompanyUsers -InstanceId $instanceId -CompanyCode $companyCode
+
+            } elseif ($path -eq '/busy/dashboard-permissions/user' -and $method -eq 'GET') {
+                if (-not $requireAuth -or -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{success=$false;error='Super User permission required.'} 403
+                    continue
+                }
+                $targetName = (Get-QueryStringValue $request.QueryString 'name' '').Trim()
+                try {
+                    $record = Read-BusyDashboardGrantRecord -InstanceId $instanceId -CompanyCode $companyCode -UserName $targetName
+                    $grants = New-BusyDashboardGrants
+                    if ($null -ne $record) {
+                        foreach ($key in $script:BusyDashboardPermissionKeys) {
+                            $raw = Get-BusyDashboardValue $record.grants $key $false
+                            $grants[$key] = ($raw -is [bool] -and $raw -eq $true)
+                        }
+                    }
+                    $recordVersion = if ($null -eq $record) { '' } else { [string]$record.version }
+                    $result = @{success=$true;data=@{name=$targetName;grants=$grants;version=$recordVersion}}
+                } catch {
+                    Send-Response $response @{success=$false;error='Could not read company dashboard permissions.'} 400
+                    continue
+                }
+
+            } elseif ($path -eq '/busy/dashboard-permissions/user' -and $method -eq 'POST') {
+                if (-not $requireAuth -or -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    Send-Response $response @{success=$false;error='Super User permission required.'} 403
+                    continue
+                }
+                if ($request.ContentLength64 -gt 16384) {
+                    Send-Response $response @{success=$false;error='Permission update too large.'} 413
+                    continue
+                }
+                try {
+                    $body = Read-RequestBody $request | ConvertFrom-Json
+                    $targetName = ([string]$body.name).Trim()
+                    $knownResult = Get-CompanyUsers -InstanceId $instanceId -CompanyCode $companyCode
+                    if (-not $knownResult.success) { throw 'Could not verify company user directory.' }
+                    $verifiedName = @($knownResult.data | Where-Object { ([string]$_).Equals($targetName,[StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1)
+                    if ($verifiedName.Count -ne 1) {
+                        Send-Response $response @{success=$false;error='Target user not found in this BUSY company.'} 400
+                        continue
+                    }
+                    $result = Set-BusyDashboardGrants -InstanceId $instanceId -CompanyCode $companyCode `
+                        -UserName ([string]$verifiedName[0]) -Submitted $body.grants `
+                        -ExpectedVersion ([string]$body.version) -UpdatedBy ([string]$authResult.user.name)
+                    if (-not $result.success) {
+                        Send-Response $response $result ([int]$result.httpStatus)
+                        continue
+                    }
+                } catch {
+                    Write-Warning ('[DASH-PERMS] Save failed: ' + $_.Exception.Message)
+                    Send-Response $response @{success=$false;error='Dashboard permissions could not be saved.'} 500
+                    continue
+                }
+
+            # --- EXECUTIVE DASHBOARD (per-section, filtered BEFORE response serialization) ---
+            } elseif (($path -eq '/busy/dashboard/core' -or $path -eq '/busy/dashboard/exposure') -and $method -eq 'GET') {
+                if (-not $requireAuth -or $null -eq $authResult -or $null -eq $authResult.user) {
+                    Send-Response $response @{success=$false;error='Authenticated Dashboard access required.'} 403
+                    continue
+                }
+                try {
+                    $grants = Get-BusyDashboardGrants -InstanceId $instanceId -CompanyCode $companyCode -User $authResult.user
+                } catch {
+                    Send-Response $response @{success=$false;error='Dashboard grants unavailable; access denied.'} 503
+                    continue
+                }
+                $section = if ($path -eq '/busy/dashboard/core') { 'core' } else { 'exposure' }
+                $requestedKeys = if ($section -eq 'core') {
+                    @('netSales','netPurchases','receipts','payments','performance','distribution')
+                } else { @('inventoryLandscape','workingCapital') }
+                if (-not (Test-BusyDashboardAny -Grants $grants -Keys $requestedKeys)) {
+                    Send-Response $response @{success=$false;error='Not permitted to access this dashboard section.'} 403
+                    continue
+                }
+                $asOf = Get-QueryStringValue $request.QueryString 'asOf' ''
+                $refresh = Get-QueryStringValue $request.QueryString 'refresh' 'false'
+                $jobResponse = Get-ExecutiveDashboardAsync -InstanceId $instanceId -CompanyCode $companyCode `
+                    -AsOf $asOf -Section $section -ForceRefresh ($refresh -eq 'true')
+                $response.StatusCode = [int]$jobResponse.httpStatus
+                $result = if ($jobResponse.httpStatus -eq 200) {
+                    if (Test-BusyDashboardAdmin $authResult.user) { $jobResponse.data }
+                    else { Protect-BusyDashboardResult -Section $section -Payload $jobResponse.data -Grants $grants }
+                } elseif ($jobResponse.httpStatus -eq 202) { $jobResponse.data }
+                else { @{success=$false;error=$jobResponse.error} }
+
+            } elseif ($path -eq '/busy/dashboard/insights' -and $method -eq 'GET') {
+                if (-not $requireAuth -or $null -eq $authResult -or $null -eq $authResult.user) {
+                    Send-Response $response @{success=$false;error='Authenticated Dashboard access required.'} 403
+                    continue
+                }
+                try {
+                    $grants = Get-BusyDashboardGrants -InstanceId $instanceId -CompanyCode $companyCode -User $authResult.user
+                } catch {
+                    Send-Response $response @{success=$false;error='Dashboard grants unavailable; access denied.'} 503
+                    continue
+                }
+                if (-not (Test-BusyDashboardAny -Grants $grants -Keys @('customerIntelligence','productIntelligence'))) {
+                    Send-Response $response @{success=$false;error='Not permitted to access sales insights.'} 403
+                    continue
+                }
+                $insightPeriod = Get-QueryStringValue $request.QueryString 'period' 'mtd'
+                if ($insightPeriod -notin @('today','mtd')) {
+                    Send-Response $response @{success=$false;error='period must be today or mtd.'} 400
+                    continue
+                }
+                $insightAsOf = Get-QueryStringValue $request.QueryString 'asOf' ''
+                $insightRefresh = Get-QueryStringValue $request.QueryString 'refresh' 'false'
+                $jobResponse = Get-ExecutiveDashboardAsync -InstanceId $instanceId -CompanyCode $companyCode `
+                    -AsOf $insightAsOf -Section ('insights_'+$insightPeriod) -ForceRefresh ($insightRefresh -eq 'true')
+                $response.StatusCode = [int]$jobResponse.httpStatus
+                $result = if ($jobResponse.httpStatus -eq 200) {
+                    if (Test-BusyDashboardAdmin $authResult.user) { $jobResponse.data }
+                    else { Protect-BusyDashboardResult -Section 'insights' -Payload $jobResponse.data -Grants $grants }
+                } elseif ($jobResponse.httpStatus -eq 202) { $jobResponse.data }
+                else { @{success=$false;error=$jobResponse.error} }
+            # BUSYWEB_DASHBOARD_PERMISSIONS_V1_END
+            } elseif ($path -eq "/busy/company" -and $method -eq "GET") {
                 $result = Get-CompanyDetails -InstanceId $instanceId -CompanyCode $companyCode
 
             # --- VOUCHER MANAGEMENT ---
@@ -2807,8 +2995,29 @@ function Start-BUSYServer {
                 }
 
             } elseif ($path -eq "/busy/column-config" -and $method -eq "POST") {
-                $data = Read-RequestBody $request | ConvertFrom-Json
-                $result = Save-ColumnConfig -Data $data -InstanceId $instanceId -CompanyCode $companyCode
+                if (-not $requireAuth -or $null -eq $authResult -or -not (Test-IsPermissionAdminUser -User $authResult.user)) {
+                    $response.StatusCode = 403
+                    $result = @{ success = $false; error = "Only a BUSY Super Admin can update voucher UI settings." }
+                } else {
+                    $rawColumnBody = Read-RequestBody $request
+                    if ([string]::IsNullOrWhiteSpace($rawColumnBody)) {
+                        $response.StatusCode = 400
+                        $result = @{ success = $false; error = "Voucher UI settings body required." }
+                    } else {
+                        try {
+                            $data = $rawColumnBody | ConvertFrom-Json -ErrorAction Stop
+                            if ([int]$data.vch_type -le 0 -or ([int]$data.device_type -notin @(0, 1))) {
+                                $response.StatusCode = 400
+                                $result = @{ success = $false; error = "Valid voucher type and device_type (0 or 1) required." }
+                            } else {
+                                $result = Save-ColumnConfig -Data $data -InstanceId $instanceId -CompanyCode $companyCode
+                            }
+                        } catch {
+                            $response.StatusCode = 400
+                            $result = @{ success = $false; error = "Invalid voucher settings payload." }
+                        }
+                    }
+                }
 
             # --- SALESMAN TRANSACTION LOCATION POLICY (AUTHENTICATED USER) ---
             # Safe minimal endpoint used by voucher-entry screens. A user with
@@ -4492,7 +4701,10 @@ function Start-BUSYServer {
                     if (-not $result.success) { $response.StatusCode = 400 }
                 }
 
-            } elseif ($path -eq "/busy/reports/outstanding" -and $method -eq "GET") {
+            } elseif ($path -eq "/busy/reports/outstanding/party-options" -and $method -eq "GET") {
+                $result = Get-OutstandingPartyOptions -InstanceId $instanceId -CompanyCode $companyCode
+                if (-not $result.success) { $response.StatusCode = 400 }
+            } elseif (($path -in @("/busy/reports/outstanding", "/busy/reports/outstanding/summary", "/busy/reports/outstanding/table", "/busy/reports/outstanding/aging", "/busy/reports/outstanding/aging/details")) -and $method -eq "GET") {
                 $fromVal = Get-QueryStringValue $request.QueryString "from" ""
                 $toVal = Get-QueryStringValue $request.QueryString "to" ""
                 $asOfVal = Get-QueryStringValue $request.QueryString "asOf" ""
@@ -4501,6 +4713,12 @@ function Start-BUSYServer {
                 $accountVal = Get-QueryStringValue $request.QueryString "account" ""
                 $searchVal = Get-QueryStringValue $request.QueryString "search" ""
                 $groupVal = Get-QueryStringValue $request.QueryString "group" ""
+                $accountCodeVal = Get-QueryStringValue $request.QueryString "accountCode" "0"
+                $groupCodeVal = Get-QueryStringValue $request.QueryString "groupCode" "0"
+                $safeAccountCode = 0
+                $safeGroupCode = 0
+                try { $safeAccountCode = [Math]::Max(0, [int]$accountCodeVal) } catch { }
+                try { $safeGroupCode = [Math]::Max(0, [int]$groupCodeVal) } catch { }
                 $statusVal = Get-QueryStringValue $request.QueryString "status" "all"
                 $agingVal = Get-QueryStringValue $request.QueryString "aging" "all"
 
@@ -4677,26 +4895,60 @@ function Start-BUSYServer {
                     "sortBy='$sortByVal'; direction='$sortDirectionVal'"
                 ) -ForegroundColor DarkCyan
 
-                $result = Get-OutstandingReport `
-                    -From $fromVal `
-                    -To $toVal `
-                    -AsOf $asOfVal `
-                    -Type $typeVal `
-                    -Account $accountVal `
-                    -Search $searchVal `
-                    -Group $groupVal `
-                    -Status $statusVal `
-                    -Aging $agingVal `
-                    -VoucherType $safeVoucherType `
-                    -MinAmount $safeMinAmount `
-                    -MaxAmount $safeMaxAmount `
-                    -IncludeZero $includeZero `
-                    -Page $safePage `
-                    -PageSize $safePageSize `
-                    -SortBy $sortByVal `
-                    -SortDirection $sortDirectionVal `
-                    -InstanceId $instanceId `
-                    -CompanyCode $companyCode
+                $outstandingArgs = @{
+                    From = $fromVal
+                    To = $toVal
+                    AsOf = $asOfVal
+                    Type = $typeVal
+                    Account = $accountVal
+                    AccountCode = $safeAccountCode
+                    Search = $searchVal
+                    Group = $groupVal
+                    GroupCode = $safeGroupCode
+                    Status = $statusVal
+                    Aging = $agingVal
+                    VoucherType = $safeVoucherType
+                    MinAmount = $safeMinAmount
+                    MaxAmount = $safeMaxAmount
+                    IncludeZero = $includeZero
+                    Page = $safePage
+                    PageSize = $safePageSize
+                    SortBy = $sortByVal
+                    SortDirection = $sortDirectionVal
+                    InstanceId = $instanceId
+                    CompanyCode = $companyCode
+                }
+                if ($path -eq "/busy/reports/outstanding") {
+                    # Original route stays supported for full CSV and old clients.
+                    $result = Get-OutstandingReport @outstandingArgs
+                }
+                elseif ($path -in @("/busy/reports/outstanding/aging", "/busy/reports/outstanding/aging/details")) {
+                    $agingMode = if ($path.EndsWith('/details')) { 'details' } else { 'matrix' }
+                    $cellAccountRaw = Get-QueryStringValue $request.QueryString 'cellAccountCode' '0'
+                    $cellAccount = 0
+                    try { $cellAccount = [Math]::Max(0, [int]$cellAccountRaw) } catch { }
+                    $snapshotForAging = Get-QueryStringValue $request.QueryString 'snapshotId' ''
+                    if ($snapshotForAging.Length -gt 80) { $snapshotForAging = '' }
+                    $natureForAging = Get-QueryStringValue $request.QueryString 'nature' ''
+                    $bucketForAging = Get-QueryStringValue $request.QueryString 'bucket' ''
+                    $result = Get-OutstandingAgingReport -Mode $agingMode `
+                        -From $fromVal -To $toVal -AsOf $asOfVal `
+                        -Search $searchVal -Account $accountVal -Group $groupVal `
+                        -AccountCode $safeAccountCode -GroupCode $safeGroupCode `
+                        -VoucherType $safeVoucherType -MinAmount $safeMinAmount -MaxAmount $safeMaxAmount `
+                        -InstanceId $instanceId -CompanyCode $companyCode `
+                        -SnapshotId $snapshotForAging -CellAccountCode $cellAccount `
+                        -Nature $natureForAging -Bucket $bucketForAging `
+                        -Page $safePage -PageSize $safePageSize
+                }
+                else {
+                    $mode = if ($path.EndsWith("/summary")) { "summary" } else { "table" }
+                    $refreshVal = Get-QueryStringValue $request.QueryString "refresh" "false"
+                    $forceRefresh = ($refreshVal -eq "true" -or $refreshVal -eq "1")
+                    $snapshotVal = Get-QueryStringValue $request.QueryString "snapshotId" ""
+                    if ($snapshotVal.Length -gt 80) { $snapshotVal = "" }
+                    $result = Get-OutstandingSeparatedReport @outstandingArgs -Mode $mode -ForceRefresh $forceRefresh -ExpectedSnapshotId $snapshotVal
+                }
 
             } elseif (
                 (

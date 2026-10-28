@@ -8,8 +8,12 @@
 # ─────────────────────────────────────────────────────────────
 
 param(
-    [int]$Port = 8081
+    [int]$Port = 8081,
+    [ValidateSet("Main", "Reports")]
+    [string]$ServiceMode = "Main"
 )
+# BUSYWEB_REPORT_PORT_SPLIT_V1
+$script:BusyBridgeServiceMode = $ServiceMode
 
 $moduleDir = Join-Path $PSScriptRoot "modules"
 
@@ -180,6 +184,26 @@ Set-StrictMode -Off
 # Load routes last because routes depend on all other functions.
 # ============================================================
 
+# Executive reports are isolated and must be present before routes are loaded.
+. (Load-Module "dashboard.ps1")
+Write-Host "  Loaded: dashboard.ps1" -ForegroundColor Gray
+. (Load-Module "executive_insights.ps1")
+Write-Host "  Loaded: executive_insights.ps1" -ForegroundColor Gray
+. (Load-Module "executive_jobs.ps1")
+Write-Host "  Loaded: executive_jobs.ps1" -ForegroundColor Gray
+. (Load-Module "executive_automation.ps1")
+Write-Host "  Loaded: executive_automation.ps1" -ForegroundColor Gray
+if (-not (Get-Command Get-ExecutiveDashboardAsync -CommandType Function -ErrorAction SilentlyContinue)) {
+    throw 'Executive job manager did not define Get-ExecutiveDashboardAsync.'
+}
+if (-not (Get-Command Get-ExecutiveSalesInsights -CommandType Function -ErrorAction SilentlyContinue)) {
+    throw 'Executive insights module did not define Get-ExecutiveSalesInsights.'
+}
+. (Load-Module "dashboard_permissions.ps1")
+Write-Host "  Loaded: dashboard_permissions.ps1" -ForegroundColor Gray
+. (Load-Module "whatsapp_jobs.ps1")
+Write-Host "  Loaded: whatsapp_jobs.ps1" -ForegroundColor Gray
+
 . (Load-Module "routes.ps1")
 Write-Host "  Loaded: routes.ps1" -ForegroundColor Gray
 
@@ -270,6 +294,7 @@ Write-Host `
     -ForegroundColor Green
 
 
+if ($ServiceMode -eq 'Main') {
 # ============================================================
 # BUSYCLOUD APPROVAL STORAGE INITIALIZATION
 #
@@ -374,6 +399,11 @@ else {
         -ForegroundColor DarkYellow
 }
 
+
+
+} else {
+    Write-Host "  [REPORTS 8085] Skipping approval migrations and Web Push startup." -ForegroundColor DarkCyan
+}
 
 # ============================================================
 # START SERVER
