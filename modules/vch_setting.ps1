@@ -4878,3 +4878,100 @@ function Get-EnabledVoucherApprovalTypes {
 }
 
 Write-Host "  [APPROVAL-POLICY] Independent BUSY/Web flags v7.2 loaded." -ForegroundColor DarkCyan
+
+# BUSYWEB-VOUCHER-UX-V1
+# The new options are deliberately stored outside BUSY's Config columns.
+# RecType=201 is a native table: unverified C4/C5 reuse could collide with
+# a future BUSY update. This sidecar only stores UI preferences, scoped by
+# instance, company, voucher type, and device (0 desktop / 1 mobile).
+$script:BusyWebColumnConfigGetBeforeUX = ${function:Get-ColumnConfig}
+$script:BusyWebColumnConfigSaveBeforeUX = ${function:Save-ColumnConfig}
+$script:BusyWebVoucherUXStoreRoot = Join-Path (Split-Path -Parent $PSScriptRoot) 'voucher-ui-settings'
+
+function Get-BusyWebVoucherUXPath {
+    param([string]$InstanceId, [string]$CompanyCode, [int]$VchType, [int]$DeviceType)
+    if ([string]::IsNullOrWhiteSpace($InstanceId) -or [string]::IsNullOrWhiteSpace($CompanyCode)) {
+        throw 'Company and instance are required for voucher settings.'
+    }
+    if ($VchType -le 0 -or $DeviceType -notin @(0,1)) { throw 'Invalid voucher type or device.' }
+    $identity = ("{0}|{1}|{2}|{3}" -f $InstanceId.Trim().ToLowerInvariant(), $CompanyCode.Trim().ToLowerInvariant(), $VchType, $DeviceType)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($identity)
+        $hex = [System.BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()
+    } finally { $sha.Dispose() }
+    return Join-Path $script:BusyWebVoucherUXStoreRoot ($hex + '.json')
+}
+
+function Get-BusyWebVoucherUXOptions {
+    param([string]$InstanceId, [string]$CompanyCode, [int]$VchType, [int]$DeviceType)
+    $path = Get-BusyWebVoucherUXPath -InstanceId $InstanceId -CompanyCode $CompanyCode -VchType $VchType -DeviceType $DeviceType
+    $options = @{ auto_narration_from_vch_no = $false; show_party_address_in_search = $false }
+    if (-not (Test-Path -LiteralPath $path)) { return $options }
+    $data = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+    $options.auto_narration_from_vch_no = ($data.auto_narration_from_vch_no -eq $true)
+    $options.show_party_address_in_search = ($data.show_party_address_in_search -eq $true)
+    return $options
+}
+
+function Set-BusyWebVoucherUXOptions {
+    param($Data, [string]$InstanceId, [string]$CompanyCode)
+    $vchType = [int]$Data.vch_type
+    $deviceType = [int]$Data.device_type
+    $path = Get-BusyWebVoucherUXPath -InstanceId $InstanceId -CompanyCode $CompanyCode -VchType $vchType -DeviceType $deviceType
+    $parent = Split-Path $path -Parent
+    if (-not (Test-Path -LiteralPath $parent)) {
+        [void](New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop)
+    }
+    $previous = Get-BusyWebVoucherUXOptions -InstanceId $InstanceId -CompanyCode $CompanyCode -VchType $vchType -DeviceType $deviceType
+    # Older settings clients do not send these fields. Preserve the previous
+    # values instead of clearing them during a stock/column setting change.
+    $new = @{
+        auto_narration_from_vch_no = $previous.auto_narration_from_vch_no
+        show_party_address_in_search = $previous.show_party_address_in_search
+    }
+    $properties = @($Data.PSObject.Properties.Name)
+    if ($properties -contains 'auto_narration_from_vch_no') {
+        $new.auto_narration_from_vch_no = ($Data.auto_narration_from_vch_no -eq $true -or ([string]$Data.auto_narration_from_vch_no).Trim().ToLowerInvariant() -eq 'true')
+    }
+    if ($properties -contains 'show_party_address_in_search') {
+        $new.show_party_address_in_search = ($Data.show_party_address_in_search -eq $true -or ([string]$Data.show_party_address_in_search).Trim().ToLowerInvariant() -eq 'true')
+    }
+    $tmp = $path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    try {
+        $new | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $tmp -Encoding UTF8 -ErrorAction Stop
+        Move-Item -LiteralPath $tmp -Destination $path -Force -ErrorAction Stop
+    } finally {
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Get-ColumnConfig {
+    param([int]$VchType, [int]$DeviceType, [string]$InstanceId = '', [string]$CompanyCode = '')
+    $result = & $script:BusyWebColumnConfigGetBeforeUX -VchType $VchType -DeviceType $DeviceType -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if ($null -eq $result -or $result.success -ne $true) { return $result }
+    try {
+        $extra = Get-BusyWebVoucherUXOptions -InstanceId $InstanceId -CompanyCode $CompanyCode -VchType $VchType -DeviceType $DeviceType
+        # Hashtable from original Get-ColumnConfig (including COM fallback).
+        $result.data['auto_narration_from_vch_no'] = [bool]$extra.auto_narration_from_vch_no
+        $result.data['show_party_address_in_search'] = [bool]$extra.show_party_address_in_search
+        return $result
+    } catch {
+        Write-Warning ('[VOUCHER-UX] Unable to read options: ' + $_.Exception.Message)
+        return @{ success = $false; error = 'Voucher UI options could not be read safely.' }
+    }
+}
+
+function Save-ColumnConfig {
+    param($Data, [string]$InstanceId = '', [string]$CompanyCode = '')
+    # Preserve ALL existing native/fast Config logic unchanged.
+    $result = & $script:BusyWebColumnConfigSaveBeforeUX -Data $Data -InstanceId $InstanceId -CompanyCode $CompanyCode
+    if ($null -eq $result -or $result.success -ne $true) { return $result }
+    try {
+        Set-BusyWebVoucherUXOptions -Data $Data -InstanceId $InstanceId -CompanyCode $CompanyCode
+    } catch {
+        Write-Warning ('[VOUCHER-UX] Unable to save options: ' + $_.Exception.Message)
+        return @{ success = $false; error = 'Native settings saved, but voucher UI preferences could not be stored. Check file permissions.' }
+    }
+    return $result
+}

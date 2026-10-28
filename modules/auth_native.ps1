@@ -1,4 +1,4 @@
-# modules/auth_native.ps1
+﻿# modules/auth_native.ps1
 # Unified Authentication & Parallel Scan Module (Production Version)
 # Supports SQL (DbType=1) and Access (DbType=0) databases
 
@@ -365,6 +365,7 @@ function Sync-CachedUserPermissions {
             $cachedUser.permissions = @{} + $permissionCopy
             $entry.user = $cachedUser
             $script:_authCache[$token] = $entry
+            [void](Save-BusySharedAuthSession -Token $token -Entry $entry)
         }
     }
 }
@@ -561,6 +562,7 @@ function Remove-CachedWebUserSessions {
             ($targetCompany -eq "" -or $cachedCompany -eq $targetCompany)
         ) {
             [void]$script:_authCache.Remove($token)
+            Remove-BusySharedAuthSession -Token $token
             $removed++
         }
     }
@@ -918,33 +920,36 @@ function Invoke-BusyLogin {
             return @{ success = $false; error = "Invalid credentials." }
         }
 
-        $hasMobileAccess = $false
-        $assignedRole    = "user"
+        # BUSYWEB_LOGIN_NO_MOBILE_GATE_V1
+        # Native BUSY credentials are verified above; the old "Allow access to Mobile"
+        # flag is NOT required to sign in to BusyWeb. Role and feature permissions stay intact.
+        $assignedRole = "user"
 
         if ($matchedUser.ToLower() -eq "sa") {
-            $hasMobileAccess = $true; $assignedRole = "superadmin"
+            $assignedRole = "superadmin"
         } elseif ($isAccessDb) {
-            $bdsConn = $null
+            $roleConn = $null
             try {
-                $bdsConn = Open-BdsConnection -DbFile $dbFile
-                $isSuperUser = Get-IsSuperUser-OLEDB -Conn $bdsConn -Username $matchedUser
-                if ($isSuperUser) {
-                    $hasMobileAccess = $true; $assignedRole = "superadmin"
-                } else { $hasMobileAccess = Get-HasMobileAccess-OLEDB -Conn $bdsConn -Username $matchedUser }
-            } finally { if ($null -ne $bdsConn) { try { $bdsConn.Close() } catch {} } }
+                $roleConn = Open-BdsConnection -DbFile $dbFile
+                if (Get-IsSuperUser-OLEDB -Conn $roleConn -Username $matchedUser) {
+                    $assignedRole = "superadmin"
+                }
+            } finally {
+                if ($null -ne $roleConn) { try { $roleConn.Close() } catch {} }
+            }
         } else {
-            $sqlConn = $null
+            $roleConn = $null
             try {
-                $dbName  = Get-SqlDatabaseName -CompanyCode $CompanyCode -InstanceId $InstanceId
-                $sqlConn = Open-SqlConnection -SqlServer $targetInst.sqlServer -Database $dbName -SqlUser $targetInst.sqlUser -SqlPassword $targetInst.sqlPassword
-                $isSuperUser = Get-IsSuperUser-SQL -Conn $sqlConn -Username $matchedUser
-                if ($isSuperUser) {
-                    $hasMobileAccess = $true; $assignedRole = "superadmin"
-                } else { $hasMobileAccess = Get-HasMobileAccess-SQL -Conn $sqlConn -Username $matchedUser }
-            } finally { if ($null -ne $sqlConn) { try { $sqlConn.Close() } catch {} } }
+                $roleDbName = Get-SqlDatabaseName -CompanyCode $CompanyCode -InstanceId $InstanceId
+                $roleConn = Open-SqlConnection -SqlServer $targetInst.sqlServer -Database $roleDbName -SqlUser $targetInst.sqlUser -SqlPassword $targetInst.sqlPassword
+                if (Get-IsSuperUser-SQL -Conn $roleConn -Username $matchedUser) {
+                    $assignedRole = "superadmin"
+                }
+            } finally {
+                if ($null -ne $roleConn) { try { $roleConn.Close() } catch {} }
+            }
         }
 
-        if (-not $hasMobileAccess) { return @{ success = $false; error = "MOBILE_ACCESS_DENIED" } }
 
 # Default: NO transaction access. Only superadmins get full access by
 # default; everyone else must be granted access explicitly via
@@ -990,6 +995,9 @@ if ($assignedRole -ne "superadmin") {
         $token   = [guid]::NewGuid().ToString()
         $userDoc = @{ uid = $matchedUser; name = $matchedUser; role = $assignedRole; companyCode = $CompanyCode; companyName = $CompanyName; instanceId = $InstanceId; instanceName = $targetInst.displayName; permissions = $permissions }
         $script:_authCache[$token] = @{ user = $userDoc; expiry = (Get-Date).AddSeconds($script:_AUTH_CACHE_TTL) }
+        if (-not (Save-BusySharedAuthSession -Token $token -Entry $script:_authCache[$token])) {
+            return @{ success=$false; error='Could not persist secure report session; contact administrator.' }
+        }
 
         Write-Host " [BUSY-LOGIN] Login successful for user: $matchedUser on company: $CompanyName ($InstanceId)" -ForegroundColor Green
         return @{ success = $true; token = $token; user = $userDoc }
@@ -1002,19 +1010,67 @@ if ($assignedRole -ne "superadmin") {
 # ===============================================================
 #  AUTH CHECK
 # ===============================================================
+# BUSYWEB_DPAPI_ASSEMBLY_FIX_V1
+Add-Type -AssemblyName System.Security -ErrorAction Stop
+# BUSYWEB_SHARED_AUTH_8085_V1
+# Sessions use DPAPI CurrentUser. Both PowerShell APIs MUST run under same Windows account.
+$script:BusySharedAuthRoot = Join-Path (Split-Path $PSScriptRoot -Parent) 'auth-sessions'
+function Get-BusySharedAuthPath {
+    param([string]$Token)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $key = ([BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Token)))).Replace('-','').ToLowerInvariant()
+        return Join-Path $script:BusySharedAuthRoot ($key + '.session')
+    } finally { $sha.Dispose() }
+}
+function Save-BusySharedAuthSession {
+    param([string]$Token,$Entry)
+    try {
+        if (-not [System.IO.Directory]::Exists($script:BusySharedAuthRoot)) { [System.IO.Directory]::CreateDirectory($script:BusySharedAuthRoot) | Out-Null }
+        $json = @{user=$Entry.user;expiryUtc=([datetime]$Entry.expiry).ToUniversalTime().ToString('o')} | ConvertTo-Json -Depth 16 -Compress
+        $cipher=[System.Security.Cryptography.ProtectedData]::Protect([System.Text.Encoding]::UTF8.GetBytes($json),$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+        $dest=Get-BusySharedAuthPath -Token $Token
+        $tmp=$dest+'.'+[guid]::NewGuid().ToString('N')+'.tmp'
+        [System.IO.File]::WriteAllBytes($tmp,$cipher)
+        if ([System.IO.File]::Exists($dest)) { [System.IO.File]::Replace($tmp,$dest,$null) }
+        else { [System.IO.File]::Move($tmp,$dest) }
+        return $true
+    } catch { Write-Warning ('[AUTH-SHARE] '+$_.Exception.Message); return $false }
+}
+function Read-BusySharedAuthSession {
+    param([string]$Token)
+    try {
+        $file=Get-BusySharedAuthPath -Token $Token
+        if (-not [System.IO.File]::Exists($file)) { return $null }
+        $bytes=[System.Security.Cryptography.ProtectedData]::Unprotect([System.IO.File]::ReadAllBytes($file),$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+        $session=[System.Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+        return @{user=$session.user;expiry=[datetime]::Parse([string]$session.expiryUtc).ToLocalTime()}
+    } catch { return $null }
+}
+function Remove-BusySharedAuthSession {
+    param([string]$Token)
+    try { Remove-Item -LiteralPath (Get-BusySharedAuthPath -Token $Token) -Force -ErrorAction SilentlyContinue } catch {}
+}
 function Invoke-AuthCheck {
     param($Request, [string]$InstanceId = "", [string]$CompanyCode = "")
     $authHeader = $Request.Headers["Authorization"]
     if (-not $authHeader -or -not $authHeader.StartsWith("Bearer ")) { return @{ allowed = $false; reason = "Missing or invalid token" } }
     $token = $authHeader.Substring(7)
-    if ($script:_authCache.ContainsKey($token)) {
-        $entry = $script:_authCache[$token]
-        if ((Get-Date) -lt $entry.expiry) {
-            if ($CompanyCode -and $entry.user.companyCode -ne $CompanyCode) { return @{ allowed = $false; reason = "Token is not valid for company" } }
-            return @{ allowed = $true; user = $entry.user }
-        } else { $script:_authCache.Remove($token); return @{ allowed = $false; reason = "Token expired" } }
+    $entry=$null
+    if ($script:BusyBridgeServiceMode -eq 'Reports') {
+        $entry=Read-BusySharedAuthSession -Token $token
+    } elseif ($script:_authCache.ContainsKey($token)) {
+        $entry=$script:_authCache[$token]
     }
-    return @{ allowed = $false; reason = "Invalid token" }
+    if ($null -eq $entry) { return @{ allowed=$false; reason='Invalid token' } }
+    if ((Get-Date) -ge ([datetime]$entry.expiry)) {
+        if ($script:BusyBridgeServiceMode -ne 'Reports') { [void]$script:_authCache.Remove($token) }
+        Remove-BusySharedAuthSession -Token $token
+        return @{allowed=$false;reason='Token expired'}
+    }
+    if ($CompanyCode -and [string]$entry.user.companyCode -ne $CompanyCode) { return @{allowed=$false;reason='Token is not valid for company'} }
+    if ($InstanceId -and [string]$entry.user.instanceId -ne $InstanceId) { return @{allowed=$false;reason='Token is not valid for instance'} }
+    return @{allowed=$true;user=$entry.user}
 }
 
 # ===============================================================
