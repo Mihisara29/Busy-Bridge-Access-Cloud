@@ -3,3 +3,39 @@ service-account-key.json
 logs/ 
 
 *.bds
+
+# BusyWeb WhatsApp local runtime
+/whatsapp/
+/whatsapp-worker/node_modules/
+/whatsapp-worker/.wwebjs_cache/
+/whatsapp-worker/.wwebjs_auth/
+/whatsapp-worker/.env
+/whatsapp-worker/.env.local
+
+# BusyWeb backend runtime protection
+
+# Authentication and environment
+**/.env
+**/.env.*
+!**/.env.example
+/auth-sessions/
+
+# Generated dashboard and voucher data
+/dashboard-permissions/
+/voucher-ui-settings/
+/report-jobs/
+
+# Runtime and backup data
+/maintenance-backups/
+/modules/backup/
+/runtime/
+/Start-BusyWeb-Local.ps1.backup-*
+
+# Local executive automation configuration
+/config/executive-automation.json
+/config/*.bak
+
+# Generated accounting and process data
+/cache/stock-status/
+/data/approval_audit/
+/data/push/worker.pid
